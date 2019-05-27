@@ -20,14 +20,16 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/logging"
 	"github.com/smallstep/cli/crypto/tlsutil"
+	"github.com/smallstep/nosql"
 )
 
 // Authority is the interface implemented by a CA authority.
 type Authority interface {
 	// NOTE: Authorize will be deprecated in future releases. Please use the
-	// context specific Authoirize[Sign|Revoke|etc.] methods.
+	// context specific AuthorizeSign method.
 	Authorize(ott string) ([]provisioner.SignOption, error)
 	AuthorizeSign(ott string) ([]provisioner.SignOption, error)
 	GetTLSOptions() *tlsutil.TLSOptions
@@ -40,6 +42,7 @@ type Authority interface {
 	GetEncryptedKey(kid string) (string, error)
 	GetRoots() (federation []*x509.Certificate, err error)
 	GetFederation() ([]*x509.Certificate, error)
+	GetDatabase() db.AuthDB
 }
 
 // TimeDuration is an alias of provisioner.TimeDuration
@@ -227,13 +230,16 @@ type FederationResponse struct {
 
 // caHandler is the type used to implement the different CA HTTP endpoints.
 type caHandler struct {
-	Authority Authority
+	Authority   Authority
+	acmeHandler *acmeHandler
 }
 
 // New creates a new RouterHandler with the CA endpoints.
 func New(authority Authority) RouterHandler {
 	return &caHandler{
 		Authority: authority,
+		acmeHandler: newACMEHandler(authority.GetDatabase().(nosql.DB),
+			"ca.smallstep.com", "acme", nil),
 	}
 }
 
@@ -249,6 +255,26 @@ func (h *caHandler) Route(r Router) {
 	r.MethodFunc("GET", "/federation", h.Federation)
 	// For compatibility with old code:
 	r.MethodFunc("POST", "/re-sign", h.Renew)
+
+	ah := h.acmeHandler
+	// Standard ACME API
+	r.MethodFunc("GET", "/acme/nonce", ah.addNonce(ah.GetNonce))
+	r.MethodFunc("GET", "/acme/directory", ah.addNonce(ah.GetDirectory))
+
+	extractPayloadByJWK := func(next nextHTTP) nextHTTP {
+		return ah.addNonce(ah.verifyContentType(ah.parseJWS(ah.validateJWS(ah.extractJWK(ah.verifyAndExtractJWSPayload(next))))))
+	}
+	extractPayloadByKid := func(next nextHTTP) nextHTTP {
+		return ah.addNonce(ah.verifyContentType(ah.parseJWS(ah.validateJWS(ah.lookupJWK(ah.verifyAndExtractJWSPayload(next))))))
+	}
+
+	r.MethodFunc("POST", ah.Dir.NewAccount, extractPayloadByJWK(ah.NewAccount))
+	r.MethodFunc("POST", ah.Dir.GetAccount("{accID}", false), extractPayloadByKid(ah.UpdateAccount))
+	r.MethodFunc("POST", ah.Dir.NewOrder, extractPayloadByKid(ah.NewOrder))
+	r.MethodFunc("POST", ah.Dir.GetOrder("{ordID}", false), extractPayloadByKid(ah.GetOrder))
+	//r.MethodFunc("POST", ah.Dir.GetFinalize("{ordID}"), extractPayloadByKid(ah.Finalize))
+	r.MethodFunc("POST", ah.Dir.GetAuthz("{authzID}", false), extractPayloadByKid(ah.GetAuthz))
+	r.MethodFunc("POST", ah.Dir.GetAuthz("{chID}", false), extractPayloadByKid(ah.GetAuthz))
 }
 
 // Health is an HTTP handler that returns the status of the server.
