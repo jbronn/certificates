@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/crypto/randutil"
 	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/nosql"
 )
@@ -25,8 +24,10 @@ type Challenge interface {
 	GetType() string
 	GetStatus() string
 	GetID() string
+	GetAuthzID() string
+	GetToken() string
 	GetAccountID() string
-	ToACME(nosql.DB, *Directory) (*acmeChallenge, error)
+	ToACME(nosql.DB, *Directory) (interface{}, error)
 }
 
 // ChallengeOptions is the type used to created a new Challenge.
@@ -36,7 +37,8 @@ type ChallengeOptions struct {
 	Identifier Identifier
 }
 
-type baseChallenge struct {
+// BaseChallenge is the base Challenge type that others build from.
+type BaseChallenge struct {
 	ID         string    `json:"id"`
 	AccountID  string    `json:"accountID"`
 	AuthzID    string    `json:"authzID"`
@@ -48,17 +50,17 @@ type baseChallenge struct {
 	Created    time.Time
 }
 
-func newBaseChallenge(accountID, authzID string) (*baseChallenge, error) {
-	id, err := randutil.ASCII(idLen)
+func newBaseChallenge(accountID, authzID string) (*BaseChallenge, error) {
+	id, err := randID()
 	if err != nil {
 		return nil, errors.Wrap(err, "error generating random id for ACME challenge")
 	}
-	token, err := randutil.ASCII(tokLen)
+	token, err := randID()
 	if err != nil {
 		return nil, errors.Wrap(err, "error generating token for ACME challenge")
 	}
 
-	return &baseChallenge{
+	return &BaseChallenge{
 		ID:        id,
 		AccountID: accountID,
 		AuthzID:   authzID,
@@ -68,43 +70,49 @@ func newBaseChallenge(accountID, authzID string) (*baseChallenge, error) {
 	}, nil
 }
 
-// GetID returns the id of the baseChallenge.
-func (bc *baseChallenge) GetID() string {
+// GetID returns the id of the BaseChallenge.
+func (bc *BaseChallenge) GetID() string {
 	return bc.ID
 }
 
-// GetAccountID returns the account id of the baseChallenge.
-func (bc *baseChallenge) GetAccountID() string {
+// GetAuthzID returns the Authz ID of the BaseChallenge.
+func (bc *BaseChallenge) GetAuthzID() string {
+	return bc.AuthzID
+}
+
+// GetAccountID returns the account id of the BaseChallenge.
+func (bc *BaseChallenge) GetAccountID() string {
 	return bc.AccountID
 }
 
-// GetType returns the type of the baseChallenge.
-func (bc *baseChallenge) GetType() string {
+// GetType returns the type of the BaseChallenge.
+func (bc *BaseChallenge) GetType() string {
 	return bc.Type
 }
 
-// GetStatus returns the status of the baseChallenge.
-func (bc *baseChallenge) GetStatus() string {
+// GetStatus returns the status of the BaseChallenge.
+func (bc *BaseChallenge) GetStatus() string {
 	return bc.Status
 }
 
-// GetToken returns the token of the baseChallenge.
-func (bc *baseChallenge) GetToken() string {
+// GetToken returns the token of the BaseChallenge.
+func (bc *BaseChallenge) GetToken() string {
 	return bc.Token
 }
 
-// GetValidated returns the token of the baseChallenge.
-func (bc *baseChallenge) GetValidated() time.Time {
+// GetValidated returns the token of the BaseChallenge.
+func (bc *BaseChallenge) GetValidated() time.Time {
 	return bc.Validated
 }
 
 // ToACME converts the internal Challenge type into the public acmeChallenge
 // type for presentation in the ACME protocol.
-func (bc *baseChallenge) ToACME(db nosql.DB, dir *Directory) (*acmeChallenge, error) {
+func (bc *BaseChallenge) ToACME(db nosql.DB, dir *Directory) (interface{}, error) {
 	ac := &acmeChallenge{
 		Type:   bc.GetType(),
 		Status: bc.GetStatus(),
-		Token:  bc.GetStatus(),
+		Token:  bc.GetToken(),
+		URL:    dir.GetChallenge(bc.GetID(), true),
 	}
 	if !bc.Validated.IsZero() {
 		ac.Validated = bc.Validated.Format(time.RFC3339)
@@ -116,7 +124,7 @@ func (bc *baseChallenge) ToACME(db nosql.DB, dir *Directory) (*acmeChallenge, er
 // otherwise 'old' should be a pointer to the acme challenge as it was at the
 // start of the request. This method will fail if the value currently found
 // in the bucket/row does not match the value of 'old'.
-func (bc *baseChallenge) save(db nosql.DB, old Challenge) error {
+func (bc *BaseChallenge) save(db nosql.DB, old Challenge) error {
 	newB, err := json.Marshal(bc)
 	if err != nil {
 		return errors.Wrap(err, "error marshaling new acme challenge")
@@ -125,7 +133,7 @@ func (bc *baseChallenge) save(db nosql.DB, old Challenge) error {
 	if old == nil {
 		oldB = nil
 	} else {
-		oldB, err = json.Marshal(bc)
+		oldB, err = json.Marshal(old)
 		if err != nil {
 			return errors.Wrap(err, "error marshaling old acme challenge")
 		}
@@ -136,14 +144,19 @@ func (bc *baseChallenge) save(db nosql.DB, old Challenge) error {
 	case err != nil:
 		return errors.Wrap(err, "error saving acme challenge")
 	case !swapped:
-		return errors.Wrap(err, "acme challenge has changed since last read")
+		return errors.New("acme challenge has changed since last read")
 	default:
 		return nil
 	}
 }
 
+func (bc *BaseChallenge) clone() *BaseChallenge {
+	u := *bc
+	return &u
+}
+
 // updateAuthz updates the parent Authz of the challenge.
-func (bc *baseChallenge) updateAuthz(db nosql.DB) error {
+func (bc *BaseChallenge) updateAuthz(db nosql.DB) error {
 	authz, err := GetAuthz(db, bc.AuthzID)
 	if err != nil {
 		return err
@@ -157,7 +170,7 @@ func (bc *baseChallenge) updateAuthz(db nosql.DB) error {
 // unmarshalChallenge unmarshals a challenge type into the correct sub-type.
 func unmarshalChallenge(data []byte) (Challenge, error) {
 	var getType struct {
-		Type string `json:"identifier"`
+		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(data, &getType); err != nil {
 		return nil, errors.Wrap(err, "error unmarshaling authz type")
@@ -183,7 +196,7 @@ func unmarshalChallenge(data []byte) (Challenge, error) {
 
 // HTTP01Challenge represents an http-01 acme challenge.
 type HTTP01Challenge struct {
-	*baseChallenge
+	*BaseChallenge
 }
 
 // NewHTTP01Challenge returns a new acme http-01 challenge.
@@ -206,6 +219,12 @@ func NewHTTP01Challenge(db nosql.DB, ops ChallengeOptions) (Challenge, error) {
 // satisfactorily validated, the 'status' and 'validated' attributes are
 // updated.
 func (hc *HTTP01Challenge) Validate(db nosql.DB, jwk *jose.JSONWebKey) (Challenge, bool, error) {
+	// If already valid or invalid then return without performing validation.
+	if hc.GetStatus() == statusValid {
+		return hc, true, nil
+	} else if hc.GetStatus() == statusInvalid {
+		return hc, false, nil
+	}
 	url := fmt.Sprintf("http://%s/.well-known/acme-challenge/%s", hc.Identifier, hc.Token)
 
 	resp, err := http.Get(url)
@@ -219,35 +238,21 @@ func (hc *HTTP01Challenge) Validate(db nosql.DB, jwk *jose.JSONWebKey) (Challeng
 	if err != nil {
 		return nil, false, errors.Wrapf(err, "error reading response body for url %s", url)
 	}
-	auth := string(body)
+	keyAuth := strings.Trim(string(body), "\r\n")
 
-	prefix := hc.Token + "."
-	if !strings.HasPrefix(auth, prefix) {
-		// TODO store problem cause on the challenge
-		return nil, false, nil
-	}
-	keyAuth := strings.TrimPrefix(auth, prefix)
-
-	thumbprint, err := jwk.Thumbprint(crypto.SHA256)
+	expected, err := keyAuthorization(hc.Token, jwk)
 	if err != nil {
-		return nil, false, errors.Wrap(err, "error generating JWK thumbprint")
+		// TODO better error
+		return hc, false, err
 	}
-	if keyAuth != base64.RawURLEncoding.EncodeToString(thumbprint) {
+	if keyAuth != expected {
 		// TODO store the error cause on the challenge.
-		return nil, false, errors.New("keyAuthorization does not match")
+		return nil, false, errors.Errorf("keyAuthorization does not match; expected %s, but got %s", expected, keyAuth)
 	}
 
 	// Update and store the challenge.
-	_upd := *hc
-	upd := &_upd
-	upd.Status = statusValid
-	upd.Validated = time.Now().UTC()
-
+	upd := &HTTP01Challenge{hc.BaseChallenge.clone()}
 	if err := upd.save(db, hc); err != nil {
-		return nil, false, err
-	}
-	// Update the status on the Authz.
-	if err := upd.updateAuthz(db); err != nil {
 		return nil, false, err
 	}
 	return upd, true, nil
@@ -255,7 +260,7 @@ func (hc *HTTP01Challenge) Validate(db nosql.DB, jwk *jose.JSONWebKey) (Challeng
 
 // DNS01Challenge represents an dns-01 acme challenge.
 type DNS01Challenge struct {
-	*baseChallenge
+	*BaseChallenge
 }
 
 // NewDNS01Challenge returns a new acme dns-01 challenge.
@@ -317,16 +322,11 @@ func (dc *DNS01Challenge) Validate(db nosql.DB, jwk *jose.JSONWebKey) (Challenge
 	}
 
 	// Update and store the challenge.
-	_upd := *dc
-	upd := &_upd
+	upd := &DNS01Challenge{dc.BaseChallenge.clone()}
 	upd.Status = statusValid
 	upd.Validated = time.Now().UTC()
 
 	if err := upd.save(db, dc); err != nil {
-		return nil, false, err
-	}
-	// Update the status on the Authz.
-	if err := upd.updateAuthz(db); err != nil {
 		return nil, false, err
 	}
 	return upd, true, nil
@@ -353,4 +353,5 @@ type acmeChallenge struct {
 	Status    string `json:"status"`
 	Token     string `json:"token"`
 	Validated string `json:"validated,omitempty"`
+	URL       string `json:"url"`
 }

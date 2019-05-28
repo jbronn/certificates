@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/crypto/randutil"
 	"github.com/smallstep/nosql"
 )
 
@@ -22,10 +21,11 @@ type Authz interface {
 	GetExpiry() time.Time
 	IsWildcard() bool
 	UpdateStatus(db nosql.DB) (Authz, error)
-	ToACME(nosql.DB, *Directory) (*acmeAuthz, error)
+	ToACME(nosql.DB, *Directory) (interface{}, error)
 }
 
-type baseAuthz struct {
+// BaseAuthz is the base authz type that others build from.
+type BaseAuthz struct {
 	ID         string     `json:"id"`
 	AccountID  string     `json:"accountID"`
 	Identifier Identifier `json:"identifier"`
@@ -36,13 +36,13 @@ type baseAuthz struct {
 	Created    time.Time
 }
 
-func newBaseAuthz(accID string, identifier Identifier) (*baseAuthz, error) {
-	id, err := randutil.ASCII(idLen)
+func newBaseAuthz(accID string, identifier Identifier) (*BaseAuthz, error) {
+	id, err := randID()
 	if err != nil {
 		return nil, errors.Wrap(err, "error generating random id for ACME challenge")
 	}
 
-	ba := &baseAuthz{
+	ba := &BaseAuthz{
 		ID:         id,
 		AccountID:  accID,
 		Status:     statusPending,
@@ -63,44 +63,44 @@ func newBaseAuthz(accID string, identifier Identifier) (*baseAuthz, error) {
 }
 
 // GetID returns the ID of the authz.
-func (ba *baseAuthz) GetID() string {
+func (ba *BaseAuthz) GetID() string {
 	return ba.ID
 }
 
 // GetAccountID returns the Account ID that created the authz.
-func (ba *baseAuthz) GetAccountID() string {
+func (ba *BaseAuthz) GetAccountID() string {
 	return ba.AccountID
 }
 
 // GetType returns the type of the authz.
-func (ba *baseAuthz) GetType() string {
+func (ba *BaseAuthz) GetType() string {
 	return ba.Identifier.Type
 }
 
 // GetIdentifier returns the identifier for the authz.
-func (ba *baseAuthz) GetIdentifier() Identifier {
+func (ba *BaseAuthz) GetIdentifier() Identifier {
 	return ba.Identifier
 }
 
 // GetStatus returns the status of the authz.
-func (ba *baseAuthz) GetStatus() string {
+func (ba *BaseAuthz) GetStatus() string {
 	return ba.Status
 }
 
 // IsWildcard returns true if the authz identifier has a '*', false otherwise.
-func (ba *baseAuthz) IsWildcard() bool {
+func (ba *BaseAuthz) IsWildcard() bool {
 	return ba.Wildcard
 }
 
 // GetExpiry returns the expiration time of the authz.
-func (ba *baseAuthz) GetExpiry() time.Time {
+func (ba *BaseAuthz) GetExpiry() time.Time {
 	return ba.Expires
 }
 
 // ToACME converts the internal Authz type into the public acmeAuthz type for
 // presentation in the ACME protocol.
-func (ba *baseAuthz) ToACME(db nosql.DB, dir *Directory) (*acmeAuthz, error) {
-	var chs = make([]*acmeChallenge, len(ba.Challenges))
+func (ba *BaseAuthz) ToACME(db nosql.DB, dir *Directory) (interface{}, error) {
+	var chs = make([]interface{}, len(ba.Challenges))
 	for i, chID := range ba.Challenges {
 		ch, err := GetChallenge(db, chID)
 		if err != nil {
@@ -120,7 +120,7 @@ func (ba *baseAuthz) ToACME(db nosql.DB, dir *Directory) (*acmeAuthz, error) {
 	}, nil
 }
 
-func (ba *baseAuthz) save(db nosql.DB, old Authz) error {
+func (ba *BaseAuthz) save(db nosql.DB, old Authz) error {
 	var (
 		err        error
 		oldB, newB []byte
@@ -146,7 +146,9 @@ func (ba *baseAuthz) save(db nosql.DB, old Authz) error {
 	}
 }
 
-func (ba *baseAuthz) UpdateStatus(db nosql.DB) (Authz, error) {
+// UpdateStatus attempts to update the status on a BaseAuthz and stores the
+// updating object if necessary.
+func (ba *BaseAuthz) UpdateStatus(db nosql.DB) (Authz, error) {
 	_newAuthz := *ba
 	newAuthz := &_newAuthz
 
@@ -172,19 +174,13 @@ func (ba *baseAuthz) UpdateStatus(db nosql.DB) (Authz, error) {
 			break
 		}
 
-		acc, err := GetAccountByID(db, ba.AccountID)
-		if err != nil {
-			return ba, err
-		}
-
 		var isValid = true
 		for _, chID := range ba.Challenges {
 			ch, err := GetChallenge(db, chID)
 			if err != nil {
 				return ba, err
 			}
-			ch, status, err := ch.Validate(db, acc.Key)
-			if status {
+			if ch.GetStatus() == statusValid {
 				isValid = true
 				break
 			}
@@ -227,7 +223,7 @@ func unmarshalAuthz(data []byte) (Authz, error) {
 
 // DNSAuthz represents a dns acme authorization.
 type DNSAuthz struct {
-	*baseAuthz
+	*BaseAuthz
 }
 
 // NewAuthz returns a new acme authorization object based on the identifier
@@ -290,9 +286,9 @@ func GetAuthz(db nosql.DB, id string) (Authz, error) {
 // acmeAuthz is a subset of the Authz type containing only those attributes
 // required for responses in the ACME protocol.
 type acmeAuthz struct {
-	Identifier Identifier       `json:"identifier"`
-	Status     string           `json:"status"`
-	Expires    string           `json:"expires"`
-	Challenges []*acmeChallenge `json:"challenges"`
-	Wildcard   bool             `json:"wildcard"`
+	Identifier Identifier    `json:"identifier"`
+	Status     string        `json:"status"`
+	Expires    string        `json:"expires"`
+	Challenges []interface{} `json:"challenges"`
+	Wildcard   bool          `json:"wildcard"`
 }

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/crypto/randutil"
+	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/nosql"
 )
 
@@ -38,7 +38,7 @@ type OrderOptions struct {
 
 // NewOrder returns a new Order type.
 func NewOrder(db nosql.DB, ops OrderOptions) (*Order, error) {
-	id, err := randutil.ASCII(idLen)
+	id, err := randID()
 	if err != nil {
 		return nil, errors.Wrap(err, "error generating random id for ACME challenge")
 	}
@@ -75,11 +75,16 @@ func NewOrder(db nosql.DB, ops OrderOptions) (*Order, error) {
 	if err != nil {
 		return nil, err
 	}
-	newOrderIDs := append(orderIDs, o.ID)
-	oldb, err := json.Marshal(orderIDs)
-	if err != nil {
-		return nil, errors.Wrap(err, "error marshaling old order IDs slice")
+	var oldb []byte
+	if len(orderIDs) == 0 {
+		oldb = nil
+	} else {
+		oldb, err = json.Marshal(orderIDs)
+		if err != nil {
+			return nil, errors.Wrap(err, "error marshaling old order IDs slice")
+		}
 	}
+	newOrderIDs := append(orderIDs, o.ID)
 	newb, err := json.Marshal(newOrderIDs)
 	if err != nil {
 		return nil, errors.Wrap(err, "error marshaling new order IDs slice")
@@ -89,7 +94,7 @@ func NewOrder(db nosql.DB, ops OrderOptions) (*Order, error) {
 	case err != nil:
 		return nil, errors.Wrapf(err, "error storing order IDs for account %s", o.AccountID)
 	case !swapped:
-		return nil, errors.Wrapf(err, "error storing order IDs for account %s; order IDs changed since last read", o.AccountID)
+		return nil, errors.Errorf("error storing order IDs for account %s; order IDs changed since last read", o.AccountID)
 	default:
 		return o, nil
 	}
@@ -167,7 +172,7 @@ func (o *Order) UpdateStatus(db nosql.DB) (*Order, error) {
 		}
 
 		if allValid {
-			newOrder.Status = statusValid
+			newOrder.Status = statusReady
 			break
 		}
 		// Still pending, so do nothing.
@@ -182,7 +187,7 @@ func (o *Order) UpdateStatus(db nosql.DB) (*Order, error) {
 
 // Finalize signs a certificate if the necessary conditions for Order completion
 // have been met.
-func (o *Order) Finalize(db nosql.DB, csr x509.CertificateRequest) (*Order, error) {
+func (o *Order) Finalize(db nosql.DB, csr *x509.CertificateRequest, auth Authority) (*Order, error) {
 	var err error
 	if o, err = o.UpdateStatus(db); err != nil {
 		return o, err
@@ -191,7 +196,8 @@ func (o *Order) Finalize(db nosql.DB, csr x509.CertificateRequest) (*Order, erro
 	case statusInvalid:
 		return o, errors.Errorf("order %s has been abandoned", o.ID)
 	case statusValid:
-		return o, errors.Errorf("order %s is already valid", o.ID)
+		break
+		//return o, errors.Errorf("order %s is already valid", o.ID)
 	case statusPending:
 		return o, errors.Errorf("order %s is not ready", o.ID)
 	case statusReady:
@@ -201,7 +207,7 @@ func (o *Order) Finalize(db nosql.DB, csr x509.CertificateRequest) (*Order, erro
 	}
 
 	// Validate identifier names against CSR alternative names //
-	var csrNames map[string]int
+	csrNames := make(map[string]int)
 	if csr.Subject.CommonName != "" {
 		csrNames[csr.Subject.CommonName] = 1
 	}
@@ -209,7 +215,7 @@ func (o *Order) Finalize(db nosql.DB, csr x509.CertificateRequest) (*Order, erro
 		csrNames[n] = 1
 	}
 
-	var orderNames map[string]int
+	orderNames := make(map[string]int)
 	for _, n := range o.Identifiers {
 		orderNames[n.Value] = 1
 	}
@@ -219,11 +225,16 @@ func (o *Order) Finalize(db nosql.DB, csr x509.CertificateRequest) (*Order, erro
 		return o, errors.Errorf("CSR names do not match order identifiers exactly")
 	}
 
-	// Create a new certificate
-	// TODO
+	// Create and store a new certificate.
+	serverCrt, _, err := auth.Sign(csr, provisioner.Options{
+		NotBefore: provisioner.NewTimeDuration(o.NotBefore),
+		NotAfter:  provisioner.NewTimeDuration(o.NotAfter),
+	})
+
 	_newOrder := *o
 	newOrder := &_newOrder
-	newOrder.Certificate = "boogers"
+	newOrder.Certificate = serverCrt.SerialNumber.String()
+	newOrder.Status = statusValid
 	if err := newOrder.save(db, o); err != nil {
 		return o, err
 	}
@@ -248,7 +259,9 @@ func GetOrder(db nosql.DB, id string) (*Order, error) {
 // account.
 func GetOrderIDsByAccount(db nosql.DB, id string) ([]string, error) {
 	b, err := db.Get(ordersByAccountIDTable, []byte(id))
-	if err != nil {
+	if nosql.IsErrNotFound(err) {
+		return []string{}, nil
+	} else if err != nil {
 		// TODO return a proper API error indicating bad request.
 		return nil, errors.WithStack(err)
 	}

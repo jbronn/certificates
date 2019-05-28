@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/crypto/randutil"
 	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/nosql"
 )
@@ -27,9 +26,9 @@ type AccountOptions struct {
 
 // NewAccount returns a new acme account type.
 func NewAccount(db nosql.DB, ops AccountOptions) (*Account, error) {
-	id, err := randutil.ASCII(idLen)
+	id, err := randID()
 	if err != nil {
-		return nil, errors.Wrap(err, "error generating random id for ACME account")
+		return nil, err
 	}
 
 	a := &Account{

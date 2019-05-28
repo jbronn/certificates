@@ -238,8 +238,8 @@ type caHandler struct {
 func New(authority Authority) RouterHandler {
 	return &caHandler{
 		Authority: authority,
-		acmeHandler: newACMEHandler(authority.GetDatabase().(nosql.DB),
-			"ca.smallstep.com", "acme", nil),
+		acmeHandler: newACMEHandler(authority, authority.GetDatabase().(nosql.DB),
+			"ca.smallstep.com:8080", "acme", nil),
 	}
 }
 
@@ -258,23 +258,25 @@ func (h *caHandler) Route(r Router) {
 
 	ah := h.acmeHandler
 	// Standard ACME API
-	r.MethodFunc("GET", "/acme/nonce", ah.addNonce(ah.GetNonce))
-	r.MethodFunc("GET", "/acme/directory", ah.addNonce(ah.GetDirectory))
+	r.MethodFunc("GET", ah.Dir.NewNonce, ah.addNonce(ah.GetNonce))
+	r.MethodFunc("GET", ah.Dir.Directory, ah.addNonce(ah.GetDirectory))
 
 	extractPayloadByJWK := func(next nextHTTP) nextHTTP {
-		return ah.addNonce(ah.verifyContentType(ah.parseJWS(ah.validateJWS(ah.extractJWK(ah.verifyAndExtractJWSPayload(next))))))
+		return ah.addNonce(ah.addDirectory(ah.verifyContentType(ah.parseJWS(ah.validateJWS(ah.extractJWK(ah.verifyAndExtractJWSPayload(next)))))))
 	}
 	extractPayloadByKid := func(next nextHTTP) nextHTTP {
-		return ah.addNonce(ah.verifyContentType(ah.parseJWS(ah.validateJWS(ah.lookupJWK(ah.verifyAndExtractJWSPayload(next))))))
+		return ah.addNonce(ah.addDirectory(ah.verifyContentType(ah.parseJWS(ah.validateJWS(ah.lookupJWK(ah.verifyAndExtractJWSPayload(next)))))))
 	}
 
 	r.MethodFunc("POST", ah.Dir.NewAccount, extractPayloadByJWK(ah.NewAccount))
 	r.MethodFunc("POST", ah.Dir.GetAccount("{accID}", false), extractPayloadByKid(ah.UpdateAccount))
 	r.MethodFunc("POST", ah.Dir.NewOrder, extractPayloadByKid(ah.NewOrder))
 	r.MethodFunc("POST", ah.Dir.GetOrder("{ordID}", false), extractPayloadByKid(ah.GetOrder))
+	r.MethodFunc("POST", ah.Dir.GetFinalize("{ordID}", false), extractPayloadByKid(ah.FinalizeOrder))
 	//r.MethodFunc("POST", ah.Dir.GetFinalize("{ordID}"), extractPayloadByKid(ah.Finalize))
 	r.MethodFunc("POST", ah.Dir.GetAuthz("{authzID}", false), extractPayloadByKid(ah.GetAuthz))
-	r.MethodFunc("POST", ah.Dir.GetAuthz("{chID}", false), extractPayloadByKid(ah.GetAuthz))
+	r.MethodFunc("POST", ah.Dir.GetChallenge("{chID}", false), extractPayloadByKid(ah.GetChallenge))
+	r.MethodFunc("POST", ah.Dir.GetCertificate("{certID}", false), extractPayloadByKid(ah.GetCertificate))
 }
 
 // Health is an HTTP handler that returns the status of the server.

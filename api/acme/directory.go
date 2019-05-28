@@ -10,6 +10,7 @@ type Directory struct {
 	NewAuthz   string
 	RevokeCert string
 	KeyChange  string
+	Directory  string
 	prefix     string
 	dns        string
 	ops        *DirectoryOptions
@@ -29,6 +30,7 @@ type DirectoryOptions struct {
 	RevokeCert  string
 	KeyChange   string
 	Certificate string
+	Directory   string
 }
 
 var defaultDirOptions = DirectoryOptions{
@@ -44,6 +46,7 @@ var defaultDirOptions = DirectoryOptions{
 	RevokeCert:  "revoke-cert",
 	KeyChange:   "key-change",
 	Certificate: "cert",
+	Directory:   "directory",
 }
 
 // NewDirectory returns a new Direcotyr type.
@@ -62,6 +65,7 @@ func NewDirectory(dns, prefix string, ops *DirectoryOptions) *Directory {
 		NewAuthz:   fmt.Sprintf("/%s/%s", prefix, ops.NewAuthz),
 		RevokeCert: fmt.Sprintf("/%s/%s", prefix, ops.RevokeCert),
 		KeyChange:  fmt.Sprintf("/%s/%s", prefix, ops.KeyChange),
+		Directory:  fmt.Sprintf("/%s/%s", prefix, ops.Directory),
 	}
 }
 
@@ -115,6 +119,15 @@ func (d *Directory) GetOrdersByAccount(id string, abs bool) string {
 // GetCertificate returns the location for retrieving a Certificate by ID.
 func (d *Directory) GetCertificate(id string, abs bool) string {
 	p := fmt.Sprintf("/%s/%s/%s", d.prefix, d.ops.Certificate, id)
+	if abs {
+		p = fmt.Sprintf("https://%s%s", d.dns, p)
+	}
+	return p
+}
+
+// GetDirectory returns the location for retrieving the directory index.
+func (d *Directory) GetDirectory(abs bool) string {
+	p := fmt.Sprintf("/%s/%s", d.prefix, d.ops.Directory)
 	if abs {
 		p = fmt.Sprintf("https://%s%s", d.dns, p)
 	}

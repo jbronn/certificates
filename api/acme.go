@@ -2,10 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -16,7 +20,12 @@ import (
 	"github.com/smallstep/nosql"
 )
 
+func link(url, typ string) string {
+	return fmt.Sprintf("<%s>;\"%s\"", url, typ)
+}
+
 type acmeHandler struct {
+	auth   Authority
 	db     nosql.DB
 	Dir    *acme.Directory
 	domain string
@@ -24,9 +33,9 @@ type acmeHandler struct {
 }
 
 // newACMEHandler returns a new acmeHandler type.
-func newACMEHandler(db nosql.DB, domain, prefix string, dirOpts *acme.DirectoryOptions) *acmeHandler {
+func newACMEHandler(auth Authority, db nosql.DB, domain, prefix string, dirOpts *acme.DirectoryOptions) *acmeHandler {
 	dir := acme.NewDirectory(domain, prefix, dirOpts)
-	return &acmeHandler{db, dir, domain, prefix}
+	return &acmeHandler{auth, db, dir, domain, prefix}
 }
 
 type contextKey string
@@ -114,6 +123,26 @@ func (n *NewOrderRequest) Validate() error {
 	return nil
 }
 
+// FinalizeRequest captures the body for a Finalize order request.
+type FinalizeRequest struct {
+	CSR string
+	csr *x509.CertificateRequest
+}
+
+// Validate validates a finalize request body.
+func (f *FinalizeRequest) Validate() error {
+	var err error
+	csrBytes, err := base64.RawURLEncoding.DecodeString(f.CSR)
+	if err != nil {
+		return InternalServerError(errors.Wrap(err, "error base64url decoding csr"))
+	}
+	f.csr, err = x509.ParseCertificateRequest(csrBytes)
+	if err != nil {
+		return BadRequest(errors.Wrap(err, "unable to parse csr"))
+	}
+	return nil
+}
+
 type payloadInfo struct {
 	value       []byte
 	isPostAsGet bool
@@ -133,7 +162,6 @@ func jwkFromContext(r *http.Request) (val *jose.JSONWebKey, ok bool) {
 	return
 }
 func jwsFromContext(r *http.Request) (val *jose.JSONWebSignature, ok bool) {
-	fmt.Printf("r.Context() = %+v\n", r.Context())
 	val, ok = r.Context().Value(jwsContextKey).(*jose.JSONWebSignature)
 	return
 }
@@ -149,6 +177,17 @@ func (a *acmeHandler) addNonce(next nextHTTP) nextHTTP {
 		}
 		w.Header().Set("Replay-Nonce", nonce)
 		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+		return
+	}
+}
+
+// addDirectory adds a Link response reader with the directory index url.
+// Go http does not support multiple headers with the same name so this header
+// may be overwritten by another 'Link' downstream.
+func (a *acmeHandler) addDirectory(next nextHTTP) nextHTTP {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", link(a.Dir.GetDirectory(true), "index"))
 		next(w, r)
 		return
 	}
@@ -244,13 +283,14 @@ func (a *acmeHandler) validateJWS(next nextHTTP) nextHTTP {
 		}
 
 		// Check that the JWS url matches the requested url.
-		url, ok := hdr.ExtraHeaders["url"].(string)
-		if !ok || len(url) == 0 {
+		jwsURL, ok := hdr.ExtraHeaders["url"].(string)
+		if !ok || len(jwsURL) == 0 {
 			WriteError(w, BadRequest(errors.Errorf("JWS missing url protected header")))
 			return
 		}
-		if url != r.URL.String() {
-			WriteError(w, BadRequest(errors.Errorf("protected url header in JWS does not match request url")))
+		reqURL := &url.URL{Scheme: "https", Host: r.Host, Path: r.URL.Path}
+		if jwsURL != reqURL.String() {
+			WriteError(w, BadRequest(errors.Errorf("url header in JWS (%s) does not match request url (%s)", jwsURL, reqURL)))
 			return
 		}
 
@@ -271,6 +311,7 @@ func (a *acmeHandler) validateJWS(next nextHTTP) nextHTTP {
 // Make sure to parse and validate the JWS before running this middleware.
 func (a *acmeHandler) extractJWK(next nextHTTP) nextHTTP {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		jws, ok := jwsFromContext(r)
 		if !ok || jws == nil {
 			WriteError(w, InternalServerError(errors.Errorf("jws not in request context")))
@@ -281,7 +322,7 @@ func (a *acmeHandler) extractJWK(next nextHTTP) nextHTTP {
 			WriteError(w, BadRequest(errors.Errorf("expected jwk in protected header")))
 			return
 		}
-		ctx := context.WithValue(r.Context(), jwkContextKey, jwk)
+		ctx = context.WithValue(ctx, jwkContextKey, jwk)
 
 		acc, err := acme.GetAccountByKeyID(a.db, jwk.KeyID)
 		switch {
@@ -295,7 +336,7 @@ func (a *acmeHandler) extractJWK(next nextHTTP) nextHTTP {
 				WriteError(w, Unauthorized(errors.New("acme account is not active")))
 				return
 			}
-			ctx = context.WithValue(r.Context(), accContextKey, acc)
+			ctx = context.WithValue(ctx, accContextKey, acc)
 		}
 
 		next(w, r.WithContext(ctx))
@@ -308,23 +349,21 @@ func (a *acmeHandler) extractJWK(next nextHTTP) nextHTTP {
 // Make sure to parse and validate the JWS before running this middleware.
 func (a *acmeHandler) lookupJWK(next nextHTTP) nextHTTP {
 	return func(w http.ResponseWriter, r *http.Request) {
-
+		ctx := r.Context()
 		jws, ok := jwsFromContext(r)
 		if !ok || jws == nil {
 			WriteError(w, InternalServerError(errors.Errorf("jws not in request context")))
 			return
 		}
 
-		url := "https://ca.smallstep.com:8080/account/"
+		kidPrefix := a.Dir.GetAccount("", true)
 		kid := jws.Signatures[0].Protected.KeyID
-		if !strings.HasPrefix(kid, url) {
-			WriteError(w, BadRequest(errors.Errorf("expected jwk in protected header")))
+		if !strings.HasPrefix(kid, kidPrefix) {
+			WriteError(w, BadRequest(errors.Errorf("kid does not have required prefix; expected %s, but got %s", kidPrefix, kid)))
 			return
 		}
 
-		accID := strings.TrimPrefix(kid, url)
-		ctx := r.Context()
-
+		accID := strings.TrimPrefix(kid, kidPrefix)
 		acc, err := acme.GetAccountByID(a.db, accID)
 		switch {
 		case nosql.IsErrNotFound(err):
@@ -356,7 +395,7 @@ func (a *acmeHandler) verifyAndExtractJWSPayload(next nextHTTP) nextHTTP {
 			WriteError(w, InternalServerError(errors.Errorf("jws not in request context")))
 			return
 		}
-		jwk, ok := r.Context().Value(jwkContextKey).(*jose.JSONWebKey)
+		jwk, ok := jwkFromContext(r)
 		if !ok || jwk == nil {
 			WriteError(w, InternalServerError(errors.Errorf("jwk not in request context")))
 			return
@@ -369,7 +408,7 @@ func (a *acmeHandler) verifyAndExtractJWSPayload(next nextHTTP) nextHTTP {
 		ctx := context.WithValue(r.Context(), payloadContextKey, &payloadInfo{
 			value:       payload,
 			isPostAsGet: string(payload) == "",
-			isEmptyJSON: string(payload) == "{}",
+			isEmptyJSON: string(payload) == "{}\n",
 		})
 		next(w, r.WithContext(ctx))
 		return
@@ -597,9 +636,72 @@ func (a *acmeHandler) GetOrder(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, InternalServerError(errors.Wrapf(err, "error converting order to acmeOrder")))
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Location", a.Dir.GetOrder(order.ID, true))
 	JSON(w, out)
+	w.WriteHeader(http.StatusOK)
+	return
+}
+
+// FinalizeOrder attemptst to finalize an order and create a certificate.
+func (a *acmeHandler) FinalizeOrder(w http.ResponseWriter, r *http.Request) {
+	acc, ok := accountFromContext(r)
+	if !ok || acc == nil {
+		// Account does not exist //
+		WriteError(w, Unauthorized(errors.Errorf("account not found")))
+		return
+	}
+	if !acc.IsValid() {
+		WriteError(w, Unauthorized(errors.Errorf("account is not valid")))
+		return
+	}
+
+	payload, ok := payloadFromContext(r)
+	if !ok || payload == nil {
+		WriteError(w, InternalServerError(errors.Errorf("payload not in request context")))
+		return
+	}
+
+	var fr FinalizeRequest
+	if err := json.Unmarshal(payload.value, &fr); err != nil {
+		WriteError(w, BadRequest(errors.Wrap(err, "unable to parse body of finalize request")))
+		return
+	}
+
+	if err := fr.Validate(); err != nil {
+		WriteError(w, err)
+		return
+	}
+
+	oid := chi.URLParam(r, "ordID")
+	order, err := acme.GetOrder(a.db, oid)
+	if err != nil {
+		WriteError(w, InternalServerError(errors.Wrapf(err, "error retrieving order %s", oid)))
+		return
+	}
+
+	if order.AccountID != acc.ID {
+		WriteError(w, Unauthorized(errors.Wrap(err, "account is not the owner of the order")))
+		return
+	}
+
+	if order, err = order.UpdateStatus(a.db); err != nil {
+		WriteError(w, InternalServerError(errors.Wrap(err, "error updating order status")))
+		return
+	}
+
+	if order, err = order.Finalize(a.db, fr.csr, a.auth); err != nil {
+		WriteError(w, InternalServerError(errors.Wrap(err, "error finalizing order")))
+		return
+	}
+
+	out, err := order.ToACME(a.db, a.Dir)
+	if err != nil {
+		WriteError(w, InternalServerError(errors.Wrapf(err, "error converting order to acmeOrder")))
+		return
+	}
+	w.Header().Set("Location", a.Dir.GetOrder(order.ID, true))
+	JSON(w, out)
+	w.WriteHeader(http.StatusOK)
 	return
 }
 
@@ -630,12 +732,12 @@ func (a *acmeHandler) GetAuthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if authz.GetAccountID() != acc.ID {
-		WriteError(w, Unauthorized(errors.Wrap(err, "account is not the owner of the authz")))
+		WriteError(w, Unauthorized(errors.New("account is not the owner of the authz")))
 		return
 	}
 
-	if !payload.isPostAsGet {
-		WriteError(w, InternalServerError(errors.Wrap(err, "unimplemented")))
+	if authz, err = authz.UpdateStatus(a.db); err != nil {
+		WriteError(w, InternalServerError(errors.Wrap(err, "error attempting to update account status")))
 		return
 	}
 
@@ -644,9 +746,9 @@ func (a *acmeHandler) GetAuthz(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, InternalServerError(errors.Wrapf(err, "error converting order to acmeOrder")))
 		return
 	}
-	w.WriteHeader(http.StatusCreated)
-	w.Header().Set("Location", a.Dir.GetOrder(authz.GetID(), true))
 	JSON(w, out)
+	w.Header().Set("Location", a.Dir.GetAuthz(authz.GetID(), true))
+	w.WriteHeader(http.StatusOK)
 	return
 }
 
@@ -658,11 +760,6 @@ func (a *acmeHandler) GetChallenge(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, Unauthorized(errors.Errorf("account not found")))
 		return
 	}
-	if !acc.IsValid() {
-		WriteError(w, Unauthorized(errors.Errorf("account is not valid")))
-		return
-	}
-
 	payload, ok := payloadFromContext(r)
 	if !ok || payload == nil {
 		WriteError(w, InternalServerError(errors.Errorf("payload not in request context")))
@@ -707,8 +804,46 @@ func (a *acmeHandler) GetChallenge(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, InternalServerError(errors.Wrapf(err, "error converting order to acmeOrder")))
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Link", link(a.Dir.GetAuthz(ch.GetAuthzID(), true), "up"))
 	w.Header().Set("Location", a.Dir.GetChallenge(ch.GetID(), true))
 	JSON(w, out)
+	w.WriteHeader(http.StatusOK)
+	return
+}
+
+// GetCertificate ACME api for retrieving a Certificate.
+func (a *acmeHandler) GetCertificate(w http.ResponseWriter, r *http.Request) {
+	acc, ok := accountFromContext(r)
+	if !ok || acc == nil {
+		// Account does not exist //
+		WriteError(w, Unauthorized(errors.Errorf("account not found")))
+		return
+	}
+	payload, ok := payloadFromContext(r)
+	if !ok || payload == nil {
+		WriteError(w, InternalServerError(errors.Errorf("payload not in request context")))
+		return
+	}
+
+	if !(payload.isPostAsGet) {
+		WriteError(w, BadRequest(errors.Errorf("unexpected payload")))
+		return
+	}
+
+	// Load the challenge.
+	certID := chi.URLParam(r, "certID")
+	crtBytes, err := a.db.Get([]byte("x509_certs"), []byte(certID))
+	if err != nil {
+		WriteError(w, InternalServerError(errors.Wrap(err, "db get cert error")))
+		return
+	}
+	block := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: crtBytes,
+	}
+
+	w.Header().Set("Content-Type", "application/pem-certificate-chain; charset=utf-8")
+	w.Write(pem.EncodeToMemory(block))
+	w.WriteHeader(http.StatusOK)
 	return
 }
