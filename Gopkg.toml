@@ -45,8 +45,9 @@ required = [
   name = "github.com/go-chi/chi"
 
 [[override]]
-  branch = "master"
+  branch = "hjsj"
   name = "github.com/smallstep/cli"
+  source = "github.com/jbronn/cli"
 
 [[constraint]]
   branch = "master"
