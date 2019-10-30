@@ -24,11 +24,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi"
+	"github.com/pkg/errors"
+	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/logging"
 	"github.com/smallstep/cli/crypto/tlsutil"
 	"github.com/smallstep/cli/jose"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -150,7 +153,7 @@ func parseCertificate(data string) *x509.Certificate {
 }
 
 func parseCertificateRequest(data string) *x509.CertificateRequest {
-	block, _ := pem.Decode([]byte(csrPEM))
+	block, _ := pem.Decode([]byte(data))
 	if block == nil {
 		panic("failed to parse certificate request PEM")
 	}
@@ -385,13 +388,13 @@ func TestSignRequest_Validate(t *testing.T) {
 		NotAfter  time.Time
 	}
 	tests := []struct {
-		name    string
-		fields  fields
-		wantErr bool
+		name   string
+		fields fields
+		err    error
 	}{
-		{"missing csr", fields{CertificateRequest{}, "foobarzar", time.Time{}, time.Time{}}, true},
-		{"invalid csr", fields{CertificateRequest{bad}, "foobarzar", time.Time{}, time.Time{}}, true},
-		{"missing ott", fields{CertificateRequest{csr}, "", time.Time{}, time.Time{}}, true},
+		{"missing csr", fields{CertificateRequest{}, "foobarzar", time.Time{}, time.Time{}}, errors.New("missing csr")},
+		{"invalid csr", fields{CertificateRequest{bad}, "foobarzar", time.Time{}, time.Time{}}, errors.New("invalid csr")},
+		{"missing ott", fields{CertificateRequest{csr}, "", time.Time{}, time.Time{}}, errors.New("missing ott")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -401,8 +404,12 @@ func TestSignRequest_Validate(t *testing.T) {
 				NotAfter:  NewTimeDuration(tt.fields.NotAfter),
 				NotBefore: NewTimeDuration(tt.fields.NotBefore),
 			}
-			if err := s.Validate(); (err != nil) != tt.wantErr {
-				t.Errorf("SignRequest.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			if err := s.Validate(); err != nil {
+				if assert.NotNil(t, tt.err) {
+					assert.HasPrefix(t, err.Error(), tt.err.Error())
+				}
+			} else {
+				assert.Nil(t, tt.err)
 			}
 		})
 	}
@@ -418,7 +425,7 @@ type mockProvisioner struct {
 	getEncryptedKey  func() (string, string, bool)
 	init             func(provisioner.Config) error
 	authorizeRevoke  func(ott string) error
-	authorizeSign    func(ott string) ([]provisioner.SignOption, error)
+	authorizeSign    func(ctx context.Context, ott string) ([]provisioner.SignOption, error)
 	authorizeRenewal func(*x509.Certificate) error
 }
 
@@ -474,9 +481,9 @@ func (m *mockProvisioner) AuthorizeRevoke(ott string) error {
 	return m.err
 }
 
-func (m *mockProvisioner) AuthorizeSign(ott string) ([]provisioner.SignOption, error) {
+func (m *mockProvisioner) AuthorizeSign(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 	if m.authorizeSign != nil {
-		return m.authorizeSign(ott)
+		return m.authorizeSign(ctx, ott)
 	}
 	return m.ret1.([]provisioner.SignOption), m.err
 }
@@ -495,8 +502,11 @@ type mockAuthority struct {
 	getTLSOptions                func() *tlsutil.TLSOptions
 	root                         func(shasum string) (*x509.Certificate, error)
 	sign                         func(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) (*x509.Certificate, *x509.Certificate, error)
+	signSSH                      func(key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
+	signSSHAddUser               func(key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error)
 	renew                        func(cert *x509.Certificate) (*x509.Certificate, *x509.Certificate, error)
 	loadProvisionerByCertificate func(cert *x509.Certificate) (provisioner.Interface, error)
+	loadProvisionerByID          func(provID string) (provisioner.Interface, error)
 	getProvisioners              func(nextCursor string, limit int) (provisioner.List, string, error)
 	revoke                       func(*authority.RevokeOptions) error
 	getEncryptedKey              func(kid string) (string, error)
@@ -505,7 +515,7 @@ type mockAuthority struct {
 }
 
 // TODO: remove once Authorize is deprecated.
-func (m *mockAuthority) Authorize(ott string) ([]provisioner.SignOption, error) {
+func (m *mockAuthority) Authorize(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 	return m.AuthorizeSign(ott)
 }
 
@@ -537,6 +547,20 @@ func (m *mockAuthority) Sign(cr *x509.CertificateRequest, opts provisioner.Optio
 	return m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate), m.err
 }
 
+func (m *mockAuthority) SignSSH(key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
+	if m.signSSH != nil {
+		return m.signSSH(key, opts, signOpts...)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+
+func (m *mockAuthority) SignSSHAddUser(key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error) {
+	if m.signSSHAddUser != nil {
+		return m.signSSHAddUser(key, cert)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+
 func (m *mockAuthority) Renew(cert *x509.Certificate) (*x509.Certificate, *x509.Certificate, error) {
 	if m.renew != nil {
 		return m.renew(cert)
@@ -554,6 +578,13 @@ func (m *mockAuthority) GetProvisioners(nextCursor string, limit int) (provision
 func (m *mockAuthority) LoadProvisionerByCertificate(cert *x509.Certificate) (provisioner.Interface, error) {
 	if m.loadProvisionerByCertificate != nil {
 		return m.loadProvisionerByCertificate(cert)
+	}
+	return m.ret1.(provisioner.Interface), m.err
+}
+
+func (m *mockAuthority) LoadProvisionerByID(provID string) (provisioner.Interface, error) {
+	if m.loadProvisionerByID != nil {
+		return m.loadProvisionerByID(provID)
 	}
 	return m.ret1.(provisioner.Interface), m.err
 }

@@ -1,12 +1,14 @@
 package authority
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -102,7 +104,8 @@ func TestSign(t *testing.T) {
 	assert.FatalError(t, err)
 	token, err := generateToken("smallstep test", "step-cli", "https://test.ca.smallstep.com/sign", []string{"test.smallstep.com"}, time.Now(), key)
 	assert.FatalError(t, err)
-	extraOpts, err := a.Authorize(token)
+	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SignMethod)
+	extraOpts, err := a.Authorize(ctx, token)
 	assert.FatalError(t, err)
 
 	type signTest struct {
@@ -123,7 +126,7 @@ func TestSign(t *testing.T) {
 				signOpts:  signOpts,
 				err: &apiError{errors.New("sign: invalid certificate request"),
 					http.StatusBadRequest,
-					context{"csr": csr, "signOptions": signOpts},
+					apiCtx{"csr": csr, "signOptions": signOpts},
 				},
 			}
 		},
@@ -137,7 +140,7 @@ func TestSign(t *testing.T) {
 				signOpts:  signOpts,
 				err: &apiError{errors.New("sign: invalid extra option type string"),
 					http.StatusInternalServerError,
-					context{"csr": csr, "signOptions": signOpts},
+					apiCtx{"csr": csr, "signOptions": signOpts},
 				},
 			}
 		},
@@ -152,7 +155,7 @@ func TestSign(t *testing.T) {
 				signOpts:  signOpts,
 				err: &apiError{errors.New("sign: default ASN1DN template cannot be nil"),
 					http.StatusInternalServerError,
-					context{"csr": csr, "signOptions": signOpts},
+					apiCtx{"csr": csr, "signOptions": signOpts},
 				},
 			}
 		},
@@ -167,7 +170,7 @@ func TestSign(t *testing.T) {
 				signOpts:  signOpts,
 				err: &apiError{errors.New("sign: error creating new leaf certificate"),
 					http.StatusInternalServerError,
-					context{"csr": csr, "signOptions": signOpts},
+					apiCtx{"csr": csr, "signOptions": signOpts},
 				},
 			}
 		},
@@ -184,7 +187,7 @@ func TestSign(t *testing.T) {
 				signOpts:  _signOpts,
 				err: &apiError{errors.New("sign: requested duration of 25h0m0s is more than the authorized maximum certificate duration of 24h0m0s"),
 					http.StatusUnauthorized,
-					context{"csr": csr, "signOptions": _signOpts},
+					apiCtx{"csr": csr, "signOptions": _signOpts},
 				},
 			}
 		},
@@ -199,7 +202,34 @@ func TestSign(t *testing.T) {
 				signOpts:  signOpts,
 				err: &apiError{errors.New("sign: certificate request does not contain the valid DNS names - got [test.smallstep.com smallstep test], want [test.smallstep.com]"),
 					http.StatusUnauthorized,
-					context{"csr": csr, "signOptions": signOpts},
+					apiCtx{"csr": csr, "signOptions": signOpts},
+				},
+			}
+		},
+		"fail rsa key too short": func(t *testing.T) *signTest {
+			shortRSAKeyPEM := `-----BEGIN CERTIFICATE REQUEST-----
+MIIBdDCB2wIBADAOMQwwCgYDVQQDEwNmb28wgaIwDQYJKoZIhvcNAQEBBQADgZAA
+MIGMAoGEAK8dks7oV6kcIFEaWna7CDGYPAE8IL7rNi+ruQ1dIYz+JtxT7OPjbCn/
+t5iqni96+35iS/8CvMtEuquOMTMSWOWwlurrbTbLqCazuz/g233o8udxSxhny3cY
+wHogp4cXCX6cFll6DeUnoCEuTTSIu8IBHbK48VfNw4V4gGz6cp/H93HrAgMBAAGg
+ITAfBgkqhkiG9w0BCQ4xEjAQMA4GA1UdEQQHMAWCA2ZvbzANBgkqhkiG9w0BAQsF
+AAOBhABCZsYM+Kgje68Z9Fjl2+cBwtQHvZDarh+cz6W1SchinZ1T0aNQvSj/otOe
+ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
+2FbarLt9jN2aJLAYQPwtSeGTAZ74tLOPRPnTP6aMfFNg4XCR0uveHA==
+-----END CERTIFICATE REQUEST-----`
+			block, _ := pem.Decode([]byte(shortRSAKeyPEM))
+			assert.FatalError(t, err)
+			csr, err := x509.ParseCertificateRequest(block.Bytes)
+			assert.FatalError(t, err)
+
+			return &signTest{
+				auth:      a,
+				csr:       csr,
+				extraOpts: extraOpts,
+				signOpts:  signOpts,
+				err: &apiError{errors.New("sign: rsa key in CSR must be at least 2048 bits (256 bytes)"),
+					http.StatusUnauthorized,
+					apiCtx{"csr": csr, "signOptions": signOpts},
 				},
 			}
 		},
@@ -210,7 +240,7 @@ func TestSign(t *testing.T) {
 				storeCertificate: func(crt *x509.Certificate) error {
 					return &apiError{errors.New("force"),
 						http.StatusInternalServerError,
-						context{"csr": csr, "signOptions": signOpts}}
+						apiCtx{"csr": csr, "signOptions": signOpts}}
 				},
 			}
 			return &signTest{
@@ -220,7 +250,7 @@ func TestSign(t *testing.T) {
 				signOpts:  signOpts,
 				err: &apiError{errors.New("sign: error storing certificate in db: force"),
 					http.StatusInternalServerError,
-					context{"csr": csr, "signOptions": signOpts},
+					apiCtx{"csr": csr, "signOptions": signOpts},
 				},
 			}
 		},
@@ -373,7 +403,7 @@ func TestRenew(t *testing.T) {
 				auth: _a,
 				crt:  crt,
 				err: &apiError{errors.New("error renewing certificate from existing server certificate"),
-					http.StatusInternalServerError, context{}},
+					http.StatusInternalServerError, apiCtx{}},
 			}, nil
 		},
 		"fail-unauthorized": func() (*renewTest, error) {
@@ -568,7 +598,7 @@ func TestRevoke(t *testing.T) {
 	validAudience := []string{"https://test.ca.smallstep.com/revoke"}
 	now := time.Now().UTC()
 	getCtx := func() map[string]interface{} {
-		return context{
+		return apiCtx{
 			"serialNumber": "sn",
 			"reasonCode":   reasonCode,
 			"reason":       reason,
@@ -592,7 +622,6 @@ func TestRevoke(t *testing.T) {
 	tests := map[string]func() test{
 		"error/token/authorizeRevoke error": func() test {
 			a := testAuthority(t)
-			a.db = new(db.NoopDB)
 			ctx := getCtx()
 			ctx["ott"] = "foo"
 			return test{
@@ -609,8 +638,6 @@ func TestRevoke(t *testing.T) {
 		},
 		"error/nil-db": func() test {
 			a := testAuthority(t)
-			a.db = new(db.NoopDB)
-
 			cl := jwt.Claims{
 				Subject:   "sn",
 				Issuer:    validIssuer,
@@ -640,7 +667,12 @@ func TestRevoke(t *testing.T) {
 		},
 		"error/db-revoke": func() test {
 			a := testAuthority(t)
-			a.db = &MockAuthDB{err: errors.New("force")}
+			a.db = &MockAuthDB{
+				useToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				err: errors.New("force"),
+			}
 
 			cl := jwt.Claims{
 				Subject:   "sn",
@@ -671,7 +703,12 @@ func TestRevoke(t *testing.T) {
 		},
 		"error/already-revoked": func() test {
 			a := testAuthority(t)
-			a.db = &MockAuthDB{err: db.ErrAlreadyExists}
+			a.db = &MockAuthDB{
+				useToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				err: db.ErrAlreadyExists,
+			}
 
 			cl := jwt.Claims{
 				Subject:   "sn",
@@ -702,7 +739,11 @@ func TestRevoke(t *testing.T) {
 		},
 		"ok/token": func() test {
 			a := testAuthority(t)
-			a.db = &MockAuthDB{}
+			a.db = &MockAuthDB{
+				useToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+			}
 
 			cl := jwt.Claims{
 				Subject:   "sn",

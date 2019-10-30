@@ -1,6 +1,8 @@
 package provisioner
 
 import (
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/cli/crypto/x509util"
+	"golang.org/x/crypto/ed25519"
 )
 
 // Options contains the options that can be passed to the Sign method.
@@ -55,7 +58,12 @@ func (v profileWithOption) Option(Options) x509util.WithOption {
 type profileDefaultDuration time.Duration
 
 func (v profileDefaultDuration) Option(so Options) x509util.WithOption {
-	return x509util.WithNotBeforeAfterDuration(so.NotBefore.Time(), so.NotAfter.Time(), time.Duration(v))
+	notBefore := so.NotBefore.Time()
+	if notBefore.IsZero() {
+		notBefore = time.Now()
+	}
+	notAfter := so.NotAfter.RelativeTime(notBefore)
+	return x509util.WithNotBeforeAfterDuration(notBefore, notAfter, time.Duration(v))
 }
 
 // emailOnlyIdentity is a CertificateRequestValidator that checks that the only
@@ -73,7 +81,7 @@ func (e emailOnlyIdentity) Valid(req *x509.CertificateRequest) error {
 	case len(req.EmailAddresses) == 0:
 		return errors.New("certificate request does not contain any email address")
 	case len(req.EmailAddresses) > 1:
-		return errors.New("certificate request does not contain too many email addresses")
+		return errors.New("certificate request contains too many email addresses")
 	case req.EmailAddresses[0] == "":
 		return errors.New("certificate request cannot contain an empty email address")
 	case req.EmailAddresses[0] != string(e):
@@ -81,6 +89,23 @@ func (e emailOnlyIdentity) Valid(req *x509.CertificateRequest) error {
 	default:
 		return nil
 	}
+}
+
+// defaultPublicKeyValidator validates the public key of a certificate request.
+type defaultPublicKeyValidator struct{}
+
+// Valid checks that certificate request common name matches the one configured.
+func (v defaultPublicKeyValidator) Valid(req *x509.CertificateRequest) error {
+	switch k := req.PublicKey.(type) {
+	case *rsa.PublicKey:
+		if k.Size() < 256 {
+			return errors.New("rsa key in CSR must be at least 2048 bits (256 bytes)")
+		}
+	case *ecdsa.PublicKey, ed25519.PublicKey:
+	default:
+		return errors.Errorf("unrecognized public key of type '%T' in CSR", k)
+	}
+	return nil
 }
 
 // commonNameValidator validates the common name of a certificate request.
@@ -95,6 +120,21 @@ func (v commonNameValidator) Valid(req *x509.CertificateRequest) error {
 		return errors.Errorf("certificate request does not contain the valid common name, got %s, want %s", req.Subject.CommonName, v)
 	}
 	return nil
+}
+
+// commonNameSliceValidator validates thats the common name of a certificate request is present in the slice.
+type commonNameSliceValidator []string
+
+func (v commonNameSliceValidator) Valid(req *x509.CertificateRequest) error {
+	if req.Subject.CommonName == "" {
+		return errors.New("certificate request cannot contain an empty common name")
+	}
+	for _, cn := range v {
+		if req.Subject.CommonName == cn {
+			return nil
+		}
+	}
+	return errors.Errorf("certificate request does not contain the valid common name, got %s, want %s", req.Subject.CommonName, v)
 }
 
 // dnsNamesValidator validates the DNS names SAN of a certificate request.
@@ -133,6 +173,26 @@ func (v ipAddressesValidator) Valid(req *x509.CertificateRequest) error {
 	}
 	if !reflect.DeepEqual(want, got) {
 		return errors.Errorf("IP Addresses claim failed - got %v, want %v", req.IPAddresses, v)
+	}
+	return nil
+}
+
+// emailAddressesValidator validates the email address SANs of a certificate request.
+type emailAddressesValidator []string
+
+// Valid checks that certificate request IP Addresses match those configured in
+// the bootstrap (token) flow.
+func (v emailAddressesValidator) Valid(req *x509.CertificateRequest) error {
+	want := make(map[string]bool)
+	for _, s := range v {
+		want[s] = true
+	}
+	got := make(map[string]bool)
+	for _, s := range req.EmailAddresses {
+		got[s] = true
+	}
+	if !reflect.DeepEqual(want, got) {
+		return errors.Errorf("certificate request does not contain the valid Email Addresses - got %v, want %v", req.EmailAddresses, v)
 	}
 	return nil
 }
@@ -180,29 +240,32 @@ var (
 )
 
 type stepProvisionerASN1 struct {
-	Type         int
-	Name         []byte
-	CredentialID []byte
+	Type          int
+	Name          []byte
+	CredentialID  []byte
+	KeyValuePairs []string `asn1:"optional,omitempty"`
 }
 
 type provisionerExtensionOption struct {
-	Type         int
-	Name         string
-	CredentialID string
+	Type          int
+	Name          string
+	CredentialID  string
+	KeyValuePairs []string
 }
 
-func newProvisionerExtensionOption(typ Type, name, credentialID string) *provisionerExtensionOption {
+func newProvisionerExtensionOption(typ Type, name, credentialID string, keyValuePairs ...string) *provisionerExtensionOption {
 	return &provisionerExtensionOption{
-		Type:         int(typ),
-		Name:         name,
-		CredentialID: credentialID,
+		Type:          int(typ),
+		Name:          name,
+		CredentialID:  credentialID,
+		KeyValuePairs: keyValuePairs,
 	}
 }
 
 func (o *provisionerExtensionOption) Option(Options) x509util.WithOption {
 	return func(p x509util.Profile) error {
 		crt := p.Subject()
-		ext, err := createProvisionerExtension(o.Type, o.Name, o.CredentialID)
+		ext, err := createProvisionerExtension(o.Type, o.Name, o.CredentialID, o.KeyValuePairs...)
 		if err != nil {
 			return err
 		}
@@ -211,11 +274,12 @@ func (o *provisionerExtensionOption) Option(Options) x509util.WithOption {
 	}
 }
 
-func createProvisionerExtension(typ int, name, credentialID string) (pkix.Extension, error) {
+func createProvisionerExtension(typ int, name, credentialID string, keyValuePairs ...string) (pkix.Extension, error) {
 	b, err := asn1.Marshal(stepProvisionerASN1{
-		Type:         typ,
-		Name:         []byte(name),
-		CredentialID: []byte(credentialID),
+		Type:          typ,
+		Name:          []byte(name),
+		CredentialID:  []byte(credentialID),
+		KeyValuePairs: keyValuePairs,
 	})
 	if err != nil {
 		return pkix.Extension{}, errors.Wrapf(err, "error marshaling provisioner extension")

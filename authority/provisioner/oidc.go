@@ -1,9 +1,13 @@
 package provisioner
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -33,12 +37,13 @@ func (c openIDConfiguration) Validate() error {
 // openIDPayload represents the fields on the id_token JWT payload.
 type openIDPayload struct {
 	jose.Claims
-	AtHash          string `json:"at_hash"`
-	AuthorizedParty string `json:"azp"`
-	Email           string `json:"email"`
-	EmailVerified   bool   `json:"email_verified"`
-	Hd              string `json:"hd"`
-	Nonce           string `json:"nonce"`
+	AtHash          string   `json:"at_hash"`
+	AuthorizedParty string   `json:"azp"`
+	Email           string   `json:"email"`
+	EmailVerified   bool     `json:"email_verified"`
+	Hd              string   `json:"hd"`
+	Nonce           string   `json:"nonce"`
+	Groups          []string `json:"groups"`
 }
 
 // OIDC represents an OAuth 2.0 OpenID Connect provider.
@@ -52,6 +57,8 @@ type OIDC struct {
 	ConfigurationEndpoint string   `json:"configurationEndpoint"`
 	Admins                []string `json:"admins,omitempty"`
 	Domains               []string `json:"domains,omitempty"`
+	Groups                []string `json:"groups,omitempty"`
+	ListenAddress         string   `json:"listenAddress,omitempty"`
 	Claims                *Claims  `json:"claims,omitempty"`
 	configuration         openIDConfiguration
 	keyStore              *keyStore
@@ -130,13 +137,27 @@ func (o *OIDC) Init(config Config) (err error) {
 		return errors.New("configurationEndpoint cannot be empty")
 	}
 
+	// Validate listenAddress if given
+	if o.ListenAddress != "" {
+		if _, _, err := net.SplitHostPort(o.ListenAddress); err != nil {
+			return errors.Wrap(err, "error parsing listenAddress")
+		}
+	}
+
 	// Update claims with global ones
 	if o.claimer, err = NewClaimer(o.Claims, config.Claims); err != nil {
 		return err
 	}
 
 	// Decode and validate openid-configuration endpoint
-	if err := getAndDecode(o.ConfigurationEndpoint, &o.configuration); err != nil {
+	u, err := url.Parse(o.ConfigurationEndpoint)
+	if err != nil {
+		return errors.Wrapf(err, "error parsing %s", o.ConfigurationEndpoint)
+	}
+	if !strings.Contains(u.Path, "/.well-known/openid-configuration") {
+		u.Path = path.Join(u.Path, "/.well-known/openid-configuration")
+	}
+	if err := getAndDecode(u.String(), &o.configuration); err != nil {
 		return err
 	}
 	if err := o.configuration.Validate(); err != nil {
@@ -184,6 +205,22 @@ func (o *OIDC) ValidatePayload(p openIDPayload) error {
 		}
 		if !found {
 			return errors.New("failed to validate payload: email is not allowed")
+		}
+	}
+
+	// Filter by oidc group claim
+	if len(o.Groups) > 0 {
+		var found bool
+		for _, group := range o.Groups {
+			for _, g := range p.Groups {
+				if g == group {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return errors.New("validation failed: invalid group")
 		}
 	}
 
@@ -241,11 +278,20 @@ func (o *OIDC) AuthorizeRevoke(token string) error {
 }
 
 // AuthorizeSign validates the given token.
-func (o *OIDC) AuthorizeSign(token string) ([]SignOption, error) {
+func (o *OIDC) AuthorizeSign(ctx context.Context, token string) ([]SignOption, error) {
 	claims, err := o.authorizeToken(token)
 	if err != nil {
 		return nil, err
 	}
+
+	// Check for the sign ssh method, default to sign X.509
+	if m := MethodFromContext(ctx); m == SignSSHMethod {
+		if o.claimer.IsSSHCAEnabled() == false {
+			return nil, errors.Errorf("ssh ca is disabled for provisioner %s", o.GetID())
+		}
+		return o.authorizeSSHSign(claims)
+	}
+
 	// Admins should be able to authorize any SAN
 	if o.IsAdmin(claims.Email) {
 		return []SignOption{
@@ -255,12 +301,18 @@ func (o *OIDC) AuthorizeSign(token string) ([]SignOption, error) {
 		}, nil
 	}
 
-	return []SignOption{
-		emailOnlyIdentity(claims.Email),
+	so := []SignOption{
+		defaultPublicKeyValidator{},
 		profileDefaultDuration(o.claimer.DefaultTLSCertDuration()),
 		newProvisionerExtensionOption(TypeOIDC, o.Name, o.ClientID),
 		newValidityValidator(o.claimer.MinTLSCertDuration(), o.claimer.MaxTLSCertDuration()),
-	}, nil
+	}
+	// Admins should be able to authorize any SAN
+	if o.IsAdmin(claims.Email) {
+		return so, nil
+	}
+
+	return append(so, emailOnlyIdentity(claims.Email)), nil
 }
 
 // AuthorizeRenewal returns an error if the renewal is disabled.
@@ -269,6 +321,44 @@ func (o *OIDC) AuthorizeRenewal(cert *x509.Certificate) error {
 		return errors.Errorf("renew is disabled for provisioner %s", o.GetID())
 	}
 	return nil
+}
+
+// authorizeSSHSign returns the list of SignOption for a SignSSH request.
+func (o *OIDC) authorizeSSHSign(claims *openIDPayload) ([]SignOption, error) {
+	signOptions := []SignOption{
+		// set the key id to the token subject
+		sshCertificateKeyIDModifier(claims.Email),
+	}
+
+	name := SanitizeSSHUserPrincipal(claims.Email)
+	if !sshUserRegex.MatchString(name) {
+		return nil, errors.Errorf("invalid principal '%s' from email address '%s'", name, claims.Email)
+	}
+
+	// Admin users will default to user + name but they can be changed by the
+	// user options. Non-admins are only able to sign user certificates.
+	defaults := SSHOptions{
+		CertType:   SSHUserCert,
+		Principals: []string{name},
+	}
+
+	if !o.IsAdmin(claims.Email) {
+		signOptions = append(signOptions, sshCertificateOptionsValidator(defaults))
+	}
+
+	// Default to a user with name as principal if not set
+	signOptions = append(signOptions, sshCertificateDefaultsModifier(defaults))
+
+	return append(signOptions,
+		// set the default extensions
+		&sshDefaultExtensionModifier{},
+		// checks the validity bounds, and set the validity if has not been set
+		&sshCertificateValidityModifier{o.claimer},
+		// validate public key
+		&sshDefaultPublicKeyValidator{},
+		// require all the fields in the SSH certificate
+		&sshCertificateDefaultValidator{},
+	), nil
 }
 
 func getAndDecode(uri string, v interface{}) error {

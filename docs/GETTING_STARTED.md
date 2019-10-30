@@ -1,6 +1,6 @@
 # Getting Started
 
-Demonstrates setting up your own PKI and certificate authority using `step ca`
+Demonstrates setting up your own public key infrastructure (PKI) and certificate authority (CA) using `step ca`
 and getting certificates using the `step` command line tool and SDK.
 
 Check out [Getting started with docker](docker.md) to run [step certificates](https://github.com/smallstep/certificates)
@@ -26,6 +26,9 @@ information for a range of network activities.
 Provisioners are people or code that are registered with the CA and authorized
 to issue "provisioning tokens". Provisioning tokens are single use tokens that
 can be used to authenticate with the CA and get a certificate.
+
+See [provisioners.md](provisioners.md) for more information on the supported
+provisioners and its options.
 
 ## Initializing PKI and configuring the Certificate Authority
 
@@ -361,7 +364,7 @@ $ bin/step ca provisioner list
 ```
 
 Now let's `reload` the CA. You will need to re-enter your intermediate
-password unless it's in your `ca.json` or your are using `--password-file`.
+password unless it's in your `ca.json` or you are using `--password-file`.
 
 ```
 $ ps aux | grep step-ca   # to get the PID
@@ -606,4 +609,3 @@ are features that we plan to implement, but are not yet available. In the mean
 time short lived certificates are a decent alternative.
 * Keep your hosts secure by enforcing AuthN and AuthZ for every connection. SSH
 access is a big one.
-

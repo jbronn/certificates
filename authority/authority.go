@@ -1,28 +1,32 @@
 package authority
 
 import (
+	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/crypto/x509util"
 )
 
-const legacyAuthority = "step-certificate-authority"
+const (
+	legacyAuthority = "step-certificate-authority"
+)
 
 // Authority implements the Certificate Authority internal interface.
 type Authority struct {
 	config               *Config
 	rootX509Certs        []*x509.Certificate
 	intermediateIdentity *x509util.Identity
-	validateOnce         bool
+	sshCAUserCertSignKey crypto.Signer
+	sshCAHostCertSignKey crypto.Signer
 	certificates         *sync.Map
-	ottMap               *sync.Map
 	startTime            time.Time
 	provisioners         *provisioner.Collection
 	db                   db.AuthDB
@@ -30,8 +34,19 @@ type Authority struct {
 	initOnce bool
 }
 
+// Option sets options to the Authority.
+type Option func(*Authority)
+
+// WithDatabase sets an already initialized authority database to a new
+// authority. This option is intended to be use on graceful reloads.
+func WithDatabase(db db.AuthDB) Option {
+	return func(a *Authority) {
+		a.db = db
+	}
+}
+
 // New creates and initiates a new Authority type.
-func New(config *Config) (*Authority, error) {
+func New(config *Config, opts ...Option) (*Authority, error) {
 	err := config.Validate()
 	if err != nil {
 		return nil, err
@@ -40,8 +55,10 @@ func New(config *Config) (*Authority, error) {
 	var a = &Authority{
 		config:       config,
 		certificates: new(sync.Map),
-		ottMap:       new(sync.Map),
 		provisioners: provisioner.NewCollection(config.getAudiences()),
+	}
+	for _, opt := range opts {
+		opt(a)
 	}
 	if err := a.init(); err != nil {
 		return nil, err
@@ -57,11 +74,12 @@ func (a *Authority) init() error {
 	}
 
 	var err error
-
-	// Initialize step-ca Database if defined in configuration.
-	// If a.config.DB is nil then a noopDB will be returned.
-	if a.db, err = db.New(a.config.DB); err != nil {
-		return err
+	// Initialize step-ca Database if it's not already initialized with WithDB.
+	// If a.config.DB is nil then a simple, barebones in memory DB will be used.
+	if a.db == nil {
+		if a.db, err = db.New(a.config.DB); err != nil {
+			return err
+		}
 	}
 
 	// Load the root certificates and add them to the certificate store
@@ -104,6 +122,22 @@ func (a *Authority) init() error {
 		}
 	}
 
+	// Decrypt and load SSH keys
+	if a.config.SSH != nil {
+		if a.config.SSH.HostKey != "" {
+			a.sshCAHostCertSignKey, err = parseCryptoSigner(a.config.SSH.HostKey, a.config.Password)
+			if err != nil {
+				return err
+			}
+		}
+		if a.config.SSH.UserKey != "" {
+			a.sshCAUserCertSignKey, err = parseCryptoSigner(a.config.SSH.UserKey, a.config.Password)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	// Store all the provisioners
 	for _, p := range a.config.AuthorityConfig.Provisioners {
 		if err := a.provisioners.Store(p); err != nil {
@@ -120,7 +154,29 @@ func (a *Authority) init() error {
 	return nil
 }
 
+// GetDatabase returns the authority database. If the configuration does not
+// define a database, GetDatabase will return a db.SimpleDB instance.
+func (a *Authority) GetDatabase() db.AuthDB {
+	return a.db
+}
+
 // Shutdown safely shuts down any clients, databases, etc. held by the Authority.
 func (a *Authority) Shutdown() error {
 	return a.db.Shutdown()
+}
+
+func parseCryptoSigner(filename, password string) (crypto.Signer, error) {
+	var opts []pemutil.Options
+	if password != "" {
+		opts = append(opts, pemutil.WithPassword([]byte(password)))
+	}
+	key, err := pemutil.Read(filename, opts...)
+	if err != nil {
+		return nil, err
+	}
+	signer, ok := key.(crypto.Signer)
+	if !ok {
+		return nil, errors.Errorf("key %s of type %T cannot be used for signing operations", filename, key)
+	}
+	return signer, nil
 }

@@ -1,6 +1,10 @@
 package provisioner
 
 import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
 	"strings"
@@ -77,6 +81,7 @@ func TestOIDC_Init(t *testing.T) {
 		Claims                *Claims
 		Admins                []string
 		Domains               []string
+		ListenAddress         string
 	}
 	type args struct {
 		config Config
@@ -87,16 +92,21 @@ func TestOIDC_Init(t *testing.T) {
 		args    args
 		wantErr bool
 	}{
-		{"ok", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/openid-configuration", nil, nil, nil}, args{config}, false},
-		{"ok-admins", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/openid-configuration", nil, []string{"foo@smallstep.com"}, nil}, args{config}, false},
-		{"ok-domains", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/openid-configuration", nil, nil, []string{"smallstep.com"}}, args{config}, false},
-		{"ok-no-secret", fields{"oidc", "name", "client-id", "", srv.URL + "/openid-configuration", nil, nil, nil}, args{config}, false},
-		{"no-name", fields{"oidc", "", "client-id", "client-secret", srv.URL + "/openid-configuration", nil, nil, nil}, args{config}, true},
-		{"no-type", fields{"", "name", "client-id", "client-secret", srv.URL + "/openid-configuration", nil, nil, nil}, args{config}, true},
-		{"no-client-id", fields{"oidc", "name", "", "client-secret", srv.URL + "/openid-configuration", nil, nil, nil}, args{config}, true},
-		{"no-configuration", fields{"oidc", "name", "client-id", "client-secret", "", nil, nil, nil}, args{config}, true},
-		{"bad-configuration", fields{"oidc", "name", "client-id", "client-secret", srv.URL, nil, nil, nil}, args{config}, true},
-		{"bad-claims", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/openid-configuration", badClaims, nil, nil}, args{config}, true},
+		{"ok", fields{"oidc", "name", "client-id", "client-secret", srv.URL, nil, nil, nil, ""}, args{config}, false},
+		{"ok-admins", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/.well-known/openid-configuration", nil, []string{"foo@smallstep.com"}, nil, ""}, args{config}, false},
+		{"ok-domains", fields{"oidc", "name", "client-id", "client-secret", srv.URL, nil, nil, []string{"smallstep.com"}, ""}, args{config}, false},
+		{"ok-listen-port", fields{"oidc", "name", "client-id", "client-secret", srv.URL, nil, nil, nil, ":10000"}, args{config}, false},
+		{"ok-listen-host-port", fields{"oidc", "name", "client-id", "client-secret", srv.URL, nil, nil, nil, "127.0.0.1:10000"}, args{config}, false},
+		{"ok-no-secret", fields{"oidc", "name", "client-id", "", srv.URL, nil, nil, nil, ""}, args{config}, false},
+		{"no-name", fields{"oidc", "", "client-id", "client-secret", srv.URL, nil, nil, nil, ""}, args{config}, true},
+		{"no-type", fields{"", "name", "client-id", "client-secret", srv.URL, nil, nil, nil, ""}, args{config}, true},
+		{"no-client-id", fields{"oidc", "name", "", "client-secret", srv.URL, nil, nil, nil, ""}, args{config}, true},
+		{"no-configuration", fields{"oidc", "name", "client-id", "client-secret", "", nil, nil, nil, ""}, args{config}, true},
+		{"bad-configuration", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/random", nil, nil, nil, ""}, args{config}, true},
+		{"bad-claims", fields{"oidc", "name", "client-id", "client-secret", srv.URL + "/.well-known/openid-configuration", badClaims, nil, nil, ""}, args{config}, true},
+		{"bad-parse-url", fields{"oidc", "name", "client-id", "client-secret", ":", nil, nil, nil, ""}, args{config}, true},
+		{"bad-get-url", fields{"oidc", "name", "client-id", "client-secret", "https://", nil, nil, nil, ""}, args{config}, true},
+		{"bad-listen-address", fields{"oidc", "name", "client-id", "client-secret", srv.URL, nil, nil, nil, "127.0.0.1"}, args{config}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -107,9 +117,12 @@ func TestOIDC_Init(t *testing.T) {
 				ConfigurationEndpoint: tt.fields.ConfigurationEndpoint,
 				Claims:                tt.fields.Claims,
 				Admins:                tt.fields.Admins,
+				Domains:               tt.fields.Domains,
+				ListenAddress:         tt.fields.ListenAddress,
 			}
 			if err := p.Init(tt.args.config); (err != nil) != tt.wantErr {
 				t.Errorf("OIDC.Init() error = %v, wantErr %v", err, tt.wantErr)
+				return
 			}
 			if tt.wantErr == false {
 				assert.Len(t, 2, p.keyStore.keySet.Keys)
@@ -276,9 +289,9 @@ func TestOIDC_AuthorizeSign(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := tt.prov.AuthorizeSign(tt.args.token)
+			ctx := NewContextWithMethod(context.Background(), SignMethod)
+			got, err := tt.prov.AuthorizeSign(ctx, tt.args.token)
 			if (err != nil) != tt.wantErr {
-				fmt.Println(tt)
 				t.Errorf("OIDC.Authorize() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
@@ -289,7 +302,127 @@ func TestOIDC_AuthorizeSign(t *testing.T) {
 				if tt.name == "admin" {
 					assert.Len(t, 3, got)
 				} else {
-					assert.Len(t, 4, got)
+					assert.Len(t, 5, got)
+				}
+			}
+		})
+	}
+}
+
+func TestOIDC_AuthorizeSign_SSH(t *testing.T) {
+	tm, fn := mockNow()
+	defer fn()
+
+	srv := generateJWKServer(2)
+	defer srv.Close()
+
+	var keys jose.JSONWebKeySet
+	assert.FatalError(t, getAndDecode(srv.URL+"/private", &keys))
+
+	// Create test provisioners
+	p1, err := generateOIDC()
+	assert.FatalError(t, err)
+	p2, err := generateOIDC()
+	assert.FatalError(t, err)
+	p3, err := generateOIDC()
+	assert.FatalError(t, err)
+	// Admin + Domains
+	p3.Admins = []string{"name@smallstep.com", "root@example.com"}
+	p3.Domains = []string{"smallstep.com"}
+
+	// Update configuration endpoints and initialize
+	config := Config{Claims: globalProvisionerClaims}
+	p1.ConfigurationEndpoint = srv.URL + "/.well-known/openid-configuration"
+	p2.ConfigurationEndpoint = srv.URL + "/.well-known/openid-configuration"
+	p3.ConfigurationEndpoint = srv.URL + "/.well-known/openid-configuration"
+	assert.FatalError(t, p1.Init(config))
+	assert.FatalError(t, p2.Init(config))
+	assert.FatalError(t, p3.Init(config))
+
+	t1, err := generateSimpleToken("the-issuer", p1.ClientID, &keys.Keys[0])
+	assert.FatalError(t, err)
+	// Admin email not in domains
+	okAdmin, err := generateToken("subject", "the-issuer", p3.ClientID, "root@example.com", []string{}, time.Now(), &keys.Keys[0])
+	assert.FatalError(t, err)
+	// Invalid email
+	failEmail, err := generateToken("subject", "the-issuer", p3.ClientID, "", []string{}, time.Now(), &keys.Keys[0])
+	assert.FatalError(t, err)
+
+	key, err := generateJSONWebKey()
+	assert.FatalError(t, err)
+
+	signer, err := generateJSONWebKey()
+	assert.FatalError(t, err)
+
+	pub := key.Public().Key
+	rsa2048, err := rsa.GenerateKey(rand.Reader, 2048)
+	assert.FatalError(t, err)
+	rsa1024, err := rsa.GenerateKey(rand.Reader, 1024)
+	assert.FatalError(t, err)
+
+	userDuration := p1.claimer.DefaultUserSSHCertDuration()
+	hostDuration := p1.claimer.DefaultHostSSHCertDuration()
+	expectedUserOptions := &SSHOptions{
+		CertType: "user", Principals: []string{"name"},
+		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(userDuration)),
+	}
+	expectedAdminOptions := &SSHOptions{
+		CertType: "user", Principals: []string{"root"},
+		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(userDuration)),
+	}
+	expectedHostOptions := &SSHOptions{
+		CertType: "host", Principals: []string{"smallstep.com"},
+		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
+	}
+
+	type args struct {
+		token   string
+		sshOpts SSHOptions
+		key     interface{}
+	}
+	tests := []struct {
+		name        string
+		prov        *OIDC
+		args        args
+		expected    *SSHOptions
+		wantErr     bool
+		wantSignErr bool
+	}{
+		{"ok", p1, args{t1, SSHOptions{}, pub}, expectedUserOptions, false, false},
+		{"ok-rsa2048", p1, args{t1, SSHOptions{}, rsa2048.Public()}, expectedUserOptions, false, false},
+		{"ok-user", p1, args{t1, SSHOptions{CertType: "user"}, pub}, expectedUserOptions, false, false},
+		{"ok-principals", p1, args{t1, SSHOptions{Principals: []string{"name"}}, pub}, expectedUserOptions, false, false},
+		{"ok-options", p1, args{t1, SSHOptions{CertType: "user", Principals: []string{"name"}}, pub}, expectedUserOptions, false, false},
+		{"admin", p3, args{okAdmin, SSHOptions{}, pub}, expectedAdminOptions, false, false},
+		{"admin-user", p3, args{okAdmin, SSHOptions{CertType: "user"}, pub}, expectedAdminOptions, false, false},
+		{"admin-principals", p3, args{okAdmin, SSHOptions{Principals: []string{"root"}}, pub}, expectedAdminOptions, false, false},
+		{"admin-options", p3, args{okAdmin, SSHOptions{CertType: "user", Principals: []string{"name"}}, pub}, expectedUserOptions, false, false},
+		{"admin-host", p3, args{okAdmin, SSHOptions{CertType: "host", Principals: []string{"smallstep.com"}}, pub}, expectedHostOptions, false, false},
+		{"fail-rsa1024", p1, args{t1, SSHOptions{}, rsa1024.Public()}, expectedUserOptions, false, true},
+		{"fail-user-host", p1, args{t1, SSHOptions{CertType: "host"}, pub}, nil, false, true},
+		{"fail-user-principals", p1, args{t1, SSHOptions{Principals: []string{"root"}}, pub}, nil, false, true},
+		{"fail-email", p3, args{failEmail, SSHOptions{}, pub}, nil, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewContextWithMethod(context.Background(), SignSSHMethod)
+			got, err := tt.prov.AuthorizeSign(ctx, tt.args.token)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("OIDC.Authorize() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil {
+				assert.Nil(t, got)
+			} else if assert.NotNil(t, got) {
+				cert, err := signSSHCertificate(tt.args.key, tt.args.sshOpts, got, signer.Key.(crypto.Signer))
+				if (err != nil) != tt.wantSignErr {
+					t.Errorf("SignSSH error = %v, wantSignErr %v", err, tt.wantSignErr)
+				} else {
+					if tt.wantSignErr {
+						assert.Nil(t, cert)
+					} else {
+						assert.NoError(t, validateSSHCertificate(cert, tt.expected))
+					}
 				}
 			}
 		})
@@ -385,47 +518,6 @@ func TestOIDC_AuthorizeRenewal(t *testing.T) {
 		})
 	}
 }
-
-/*
-func TestOIDC_AuthorizeRevoke(t *testing.T) {
-	srv := generateJWKServer(2)
-	defer srv.Close()
-
-	var keys jose.JSONWebKeySet
-	assert.FatalError(t, getAndDecode(srv.URL+"/private", &keys))
-
-	// Create test provisioners
-	p1, err := generateOIDC()
-	assert.FatalError(t, err)
-
-	// Update configuration endpoints and initialize
-	config := Config{Claims: globalProvisionerClaims}
-	p1.ConfigurationEndpoint = srv.URL + "/.well-known/openid-configuration"
-	assert.FatalError(t, p1.Init(config))
-
-	t1, err := generateSimpleToken("the-issuer", p1.ClientID, &keys.Keys[0])
-	assert.FatalError(t, err)
-
-	type args struct {
-		token string
-	}
-	tests := []struct {
-		name    string
-		prov    *OIDC
-		args    args
-		wantErr bool
-	}{
-		{"disabled", p1, args{t1}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.prov.AuthorizeRevoke(tt.args.token); (err != nil) != tt.wantErr {
-				t.Errorf("OIDC.AuthorizeRevoke() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-*/
 
 func Test_sanitizeEmail(t *testing.T) {
 	tests := []struct {

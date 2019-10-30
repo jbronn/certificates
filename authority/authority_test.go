@@ -3,11 +3,13 @@ package authority
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"reflect"
 	"testing"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 	stepJOSE "github.com/smallstep/cli/jose"
 )
 
@@ -122,11 +124,14 @@ func TestAuthorityNew(t *testing.T) {
 					assert.True(t, auth.initOnce)
 					assert.NotNil(t, auth.intermediateIdentity)
 					for _, p := range tc.config.AuthorityConfig.Provisioners {
-						_p, ok := auth.provisioners.Load(p.GetID())
+						var _p provisioner.Interface
+						_p, ok = auth.provisioners.Load(p.GetID())
 						assert.True(t, ok)
 						assert.Equals(t, p, _p)
-						if kid, encryptedKey, ok := p.GetEncryptedKey(); ok {
-							key, ok := auth.provisioners.LoadEncryptedKey(kid)
+						var kid, encryptedKey string
+						if kid, encryptedKey, ok = p.GetEncryptedKey(); ok {
+							var key string
+							key, ok = auth.provisioners.LoadEncryptedKey(kid)
 							assert.True(t, ok)
 							assert.Equals(t, encryptedKey, key)
 						}
@@ -135,6 +140,28 @@ func TestAuthorityNew(t *testing.T) {
 					_, ok = auth.provisioners.Load("fooo")
 					assert.False(t, ok)
 				}
+			}
+		})
+	}
+}
+
+func TestAuthority_GetDatabase(t *testing.T) {
+	auth := testAuthority(t)
+	authWithDatabase, err := New(auth.config, WithDatabase(auth.db))
+	assert.FatalError(t, err)
+
+	tests := []struct {
+		name string
+		auth *Authority
+		want db.AuthDB
+	}{
+		{"ok", auth, auth.db},
+		{"ok WithDatabase", authWithDatabase, auth.db},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.auth.GetDatabase(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Authority.GetDatabase() = %v, want %v", got, tt.want)
 			}
 		})
 	}
