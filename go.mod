@@ -28,6 +28,6 @@ require (
 )
 
 replace (
-     github.com/smallstep/cli v0.14.6 => github.com/jbronn/cli v0.14.6
+     github.com/smallstep/cli => github.com/jbronn/cli hjsj
 )
 //replace github.com/smallstep/nosql => ../nosql
