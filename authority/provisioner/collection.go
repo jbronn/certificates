@@ -37,8 +37,9 @@ func (p provisionerSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 // provisioner.
 type loadByTokenPayload struct {
 	jose.Claims
-	AuthorizedParty string `json:"azp"` // OIDC client id
-	TenantID        string `json:"tid"` // Microsoft Azure tenant id
+	AuthorizedParty    string `json:"azp"`                                               // OIDC client id
+	TenantID           string `json:"tid"`                                               // Microsoft Azure tenant id
+	ServiceAccountName string `json:"kubernetes.io/serviceaccount/service-account.name"` // Kubernetes Service Acct Name
 }
 
 // Collection is a memory map of provisioners.
@@ -77,7 +78,7 @@ func (c *Collection) LoadByToken(token *jose.JSONWebToken, claims *jose.Claims) 
 
 	// match with server audiences
 	if matchesAudience(claims.Audience, audiences) {
-		// Use fragment to get provisioner name (GCP, AWS)
+		// Use fragment to get provisioner name (GCP, AWS, SSHPOP)
 		if fragment != "" {
 			return c.Load(fragment)
 		}
@@ -91,10 +92,21 @@ func (c *Collection) LoadByToken(token *jose.JSONWebToken, claims *jose.Claims) 
 	if err := token.UnsafeClaimsWithoutVerification(&payload); err != nil {
 		return nil, false
 	}
-	// Audience is required
+
+	// Kubernetes Service Account tokens.
+	if len(payload.ServiceAccountName) > 0 {
+		if p, ok := c.Load(K8sSAID); ok {
+			return p, ok
+		}
+		// Kubernetes service account provisioner not found
+		return nil, false
+	}
+
+	// Audience is required for non k8sSA tokens.
 	if len(payload.Audience) == 0 {
 		return nil, false
 	}
+
 	// Try with azp (OIDC)
 	if len(payload.AuthorizedParty) > 0 {
 		if p, ok := c.Load(payload.AuthorizedParty); ok {
@@ -129,6 +141,10 @@ func (c *Collection) LoadByCertificate(cert *x509.Certificate) (Interface, bool)
 				return c.Load("gcp/" + string(provisioner.Name))
 			case TypeACME:
 				return c.Load("acme/" + string(provisioner.Name))
+			case TypeX5C:
+				return c.Load("x5c/" + string(provisioner.Name))
+			case TypeK8sSA:
+				return c.Load(K8sSAID)
 			default:
 				return c.Load(string(provisioner.CredentialID))
 			}

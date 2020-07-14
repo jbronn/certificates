@@ -3,11 +3,13 @@ package provisioner
 import (
 	"context"
 	"crypto/x509"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
+	"github.com/smallstep/certificates/errs"
 )
 
 func TestACME_Getters(t *testing.T) {
@@ -88,95 +90,104 @@ func TestACME_Init(t *testing.T) {
 	}
 }
 
-func TestACME_AuthorizeRevoke(t *testing.T) {
-	p, err := generateACME()
-	assert.FatalError(t, err)
-	assert.Nil(t, p.AuthorizeRevoke(""))
-}
-
-func TestACME_AuthorizeRenewal(t *testing.T) {
-	p1, err := generateACME()
-	assert.FatalError(t, err)
-	p2, err := generateACME()
-	assert.FatalError(t, err)
-
-	// disable renewal
-	disable := true
-	p2.Claims = &Claims{DisableRenewal: &disable}
-	p2.claimer, err = NewClaimer(p2.Claims, globalProvisionerClaims)
-	assert.FatalError(t, err)
-
-	type args struct {
+func TestACME_AuthorizeRenew(t *testing.T) {
+	type test struct {
+		p    *ACME
 		cert *x509.Certificate
-	}
-	tests := []struct {
-		name string
-		prov *ACME
-		args args
 		err  error
-	}{
-		{"ok", p1, args{nil}, nil},
-		{"fail", p2, args{nil}, errors.Errorf("renew is disabled for provisioner %s", p2.GetID())},
+		code int
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.prov.AuthorizeRenewal(tt.args.cert); err != nil {
-				if assert.NotNil(t, tt.err) {
-					assert.HasPrefix(t, err.Error(), tt.err.Error())
+	tests := map[string]func(*testing.T) test{
+		"fail/renew-disabled": func(t *testing.T) test {
+			p, err := generateACME()
+			assert.FatalError(t, err)
+			// disable renewal
+			disable := true
+			p.Claims = &Claims{DisableRenewal: &disable}
+			p.claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
+			assert.FatalError(t, err)
+			return test{
+				p:    p,
+				cert: &x509.Certificate{},
+				code: http.StatusUnauthorized,
+				err:  errors.Errorf("acme.AuthorizeRenew; renew is disabled for acme provisioner %s", p.GetID()),
+			}
+		},
+		"ok": func(t *testing.T) test {
+			p, err := generateACME()
+			assert.FatalError(t, err)
+			return test{
+				p:    p,
+				cert: &x509.Certificate{},
+			}
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tc := tt(t)
+			if err := tc.p.AuthorizeRenew(context.Background(), tc.cert); err != nil {
+				sc, ok := err.(errs.StatusCoder)
+				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				assert.Equals(t, sc.StatusCode(), tc.code)
+				if assert.NotNil(t, tc.err) {
+					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
-				assert.Nil(t, tt.err)
+				assert.Nil(t, tc.err)
 			}
 		})
 	}
 }
 
 func TestACME_AuthorizeSign(t *testing.T) {
-	p1, err := generateACME()
-	assert.FatalError(t, err)
-
-	tests := []struct {
-		name   string
-		prov   *ACME
-		method Method
-		err    error
-	}{
-		{"fail/method", p1, SignSSHMethod, errors.New("unexpected method type 1 in context")},
-		{"ok", p1, SignMethod, nil},
+	type test struct {
+		p     *ACME
+		token string
+		code  int
+		err   error
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ctx := NewContextWithMethod(context.Background(), tt.method)
-			if got, err := tt.prov.AuthorizeSign(ctx, ""); err != nil {
-				if assert.NotNil(t, tt.err) {
-					assert.HasPrefix(t, err.Error(), tt.err.Error())
+	tests := map[string]func(*testing.T) test{
+		"ok": func(t *testing.T) test {
+			p, err := generateACME()
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: "foo",
+			}
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tc := tt(t)
+			if opts, err := tc.p.AuthorizeSign(context.Background(), tc.token); err != nil {
+				if assert.NotNil(t, tc.err) {
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tc.code)
+					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
-				if assert.NotNil(t, got) {
-					assert.Len(t, 4, got)
-
-					_pdd := got[0]
-					pdd, ok := _pdd.(profileDefaultDuration)
-					assert.True(t, ok)
-					assert.Equals(t, pdd, profileDefaultDuration(86400000000000))
-
-					_peo := got[1]
-					peo, ok := _peo.(*provisionerExtensionOption)
-					assert.True(t, ok)
-					assert.Equals(t, peo.Type, 6)
-					assert.Equals(t, peo.Name, "test@acme-provisioner.com")
-					assert.Equals(t, peo.CredentialID, "")
-					assert.Equals(t, peo.KeyValuePairs, nil)
-
-					_vv := got[2]
-					vv, ok := _vv.(*validityValidator)
-					assert.True(t, ok)
-					assert.Equals(t, vv.min, time.Duration(300000000000))
-					assert.Equals(t, vv.max, time.Duration(86400000000000))
-
-					_dpkv := got[3]
-					_, ok = _dpkv.(defaultPublicKeyValidator)
-					assert.True(t, ok)
+				if assert.Nil(t, tc.err) && assert.NotNil(t, opts) {
+					assert.Len(t, 5, opts)
+					for _, o := range opts {
+						switch v := o.(type) {
+						case *provisionerExtensionOption:
+							assert.Equals(t, v.Type, int(TypeACME))
+							assert.Equals(t, v.Name, tc.p.GetName())
+							assert.Equals(t, v.CredentialID, "")
+							assert.Len(t, 0, v.KeyValuePairs)
+						case *forceCNOption:
+							assert.Equals(t, v.ForceCN, tc.p.ForceCN)
+						case profileDefaultDuration:
+							assert.Equals(t, time.Duration(v), tc.p.claimer.DefaultTLSCertDuration())
+						case defaultPublicKeyValidator:
+						case *validityValidator:
+							assert.Equals(t, v.min, tc.p.claimer.MinTLSCertDuration())
+							assert.Equals(t, v.max, tc.p.claimer.MaxTLSCertDuration())
+						default:
+							assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+						}
+					}
 				}
 			}
 		})

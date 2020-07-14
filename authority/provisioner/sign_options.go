@@ -7,6 +7,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"net"
+	"net/url"
 	"reflect"
 	"time"
 
@@ -15,10 +16,12 @@ import (
 	"golang.org/x/crypto/ed25519"
 )
 
-// Options contains the options that can be passed to the Sign method.
+// Options contains the options that can be passed to the Sign method. Backdate
+// is automatically filled and can only be configured in the CA.
 type Options struct {
-	NotAfter  TimeDuration `json:"notAfter"`
-	NotBefore TimeDuration `json:"notBefore"`
+	NotAfter  TimeDuration  `json:"notAfter"`
+	NotBefore TimeDuration  `json:"notBefore"`
+	Backdate  time.Duration `json:"-"`
 }
 
 // SignOption is the interface used to collect all extra options used in the
@@ -28,7 +31,7 @@ type SignOption interface{}
 // CertificateValidator is the interface used to validate a X.509 certificate.
 type CertificateValidator interface {
 	SignOption
-	Valid(crt *x509.Certificate) error
+	Valid(cert *x509.Certificate, o Options) error
 }
 
 // CertificateRequestValidator is the interface used to validate a X.509
@@ -45,25 +48,19 @@ type ProfileModifier interface {
 	Option(o Options) x509util.WithOption
 }
 
+// CertificateEnforcer is the interface used to modify a certificate after
+// validation.
+type CertificateEnforcer interface {
+	SignOption
+	Enforce(cert *x509.Certificate) error
+}
+
 // profileWithOption is a wrapper against x509util.WithOption to conform the
 // interface.
 type profileWithOption x509util.WithOption
 
 func (v profileWithOption) Option(Options) x509util.WithOption {
 	return x509util.WithOption(v)
-}
-
-// profileDefaultDuration is a wrapper against x509util.WithOption to conform the
-// interface.
-type profileDefaultDuration time.Duration
-
-func (v profileDefaultDuration) Option(so Options) x509util.WithOption {
-	notBefore := so.NotBefore.Time()
-	if notBefore.IsZero() {
-		notBefore = time.Now()
-	}
-	notAfter := so.NotAfter.RelativeTime(notBefore)
-	return x509util.WithNotBeforeAfterDuration(notBefore, notAfter, time.Duration(v))
 }
 
 // emailOnlyIdentity is a CertificateRequestValidator that checks that the only
@@ -112,22 +109,24 @@ func (v defaultPublicKeyValidator) Valid(req *x509.CertificateRequest) error {
 type commonNameValidator string
 
 // Valid checks that certificate request common name matches the one configured.
+// An empty common name is considered valid.
 func (v commonNameValidator) Valid(req *x509.CertificateRequest) error {
 	if req.Subject.CommonName == "" {
-		return errors.New("certificate request cannot contain an empty common name")
+		return nil
 	}
 	if req.Subject.CommonName != string(v) {
-		return errors.Errorf("certificate request does not contain the valid common name, got %s, want %s", req.Subject.CommonName, v)
+		return errors.Errorf("certificate request does not contain the valid common name; requested common name = %s, token subject = %s", req.Subject.CommonName, v)
 	}
 	return nil
 }
 
-// commonNameSliceValidator validates thats the common name of a certificate request is present in the slice.
+// commonNameSliceValidator validates thats the common name of a certificate
+// request is present in the slice. An empty common name is considered valid.
 type commonNameSliceValidator []string
 
 func (v commonNameSliceValidator) Valid(req *x509.CertificateRequest) error {
 	if req.Subject.CommonName == "" {
-		return errors.New("certificate request cannot contain an empty common name")
+		return nil
 	}
 	for _, cn := range v {
 		if req.Subject.CommonName == cn {
@@ -197,7 +196,133 @@ func (v emailAddressesValidator) Valid(req *x509.CertificateRequest) error {
 	return nil
 }
 
-// validityValidator validates the certificate temporal validity settings.
+// urisValidator validates the URI SANs of a certificate request.
+type urisValidator []*url.URL
+
+// Valid checks that certificate request IP Addresses match those configured in
+// the bootstrap (token) flow.
+func (v urisValidator) Valid(req *x509.CertificateRequest) error {
+	want := make(map[string]bool)
+	for _, u := range v {
+		want[u.String()] = true
+	}
+	got := make(map[string]bool)
+	for _, u := range req.URIs {
+		got[u.String()] = true
+	}
+	if !reflect.DeepEqual(want, got) {
+		return errors.Errorf("URIs claim failed - got %v, want %v", req.URIs, v)
+	}
+	return nil
+}
+
+// defaultsSANsValidator stores a set of SANs to eventually validate 1:1 against
+// the SANs in an x509 certificate request.
+type defaultSANsValidator []string
+
+// Valid verifies that the SANs stored in the validator match 1:1 with those
+// requested in the x509 certificate request.
+func (v defaultSANsValidator) Valid(req *x509.CertificateRequest) (err error) {
+	dnsNames, ips, emails, uris := x509util.SplitSANs(v)
+	if err = dnsNamesValidator(dnsNames).Valid(req); err != nil {
+		return
+	} else if err = emailAddressesValidator(emails).Valid(req); err != nil {
+		return
+	} else if err = ipAddressesValidator(ips).Valid(req); err != nil {
+		return
+	} else if err = urisValidator(uris).Valid(req); err != nil {
+		return
+	}
+	return
+}
+
+// ExtraExtsEnforcer enforces only those extra extensions that are strictly
+// managed by step-ca. All other "extra extensions" are dropped.
+type ExtraExtsEnforcer struct{}
+
+// Enforce removes all extensions except the step provisioner extension, if it
+// exists. If the step provisioner extension is not present, then remove all
+// extra extensions from the cert.
+func (eee ExtraExtsEnforcer) Enforce(cert *x509.Certificate) error {
+	for _, ext := range cert.ExtraExtensions {
+		if ext.Id.Equal(stepOIDProvisioner) {
+			cert.ExtraExtensions = []pkix.Extension{ext}
+			return nil
+		}
+	}
+	cert.ExtraExtensions = nil
+	return nil
+}
+
+// profileDefaultDuration is a wrapper against x509util.WithOption to conform
+// the SignOption interface.
+type profileDefaultDuration time.Duration
+
+func (v profileDefaultDuration) Option(so Options) x509util.WithOption {
+	var backdate time.Duration
+	notBefore := so.NotBefore.Time()
+	if notBefore.IsZero() {
+		notBefore = now()
+		backdate = -1 * so.Backdate
+	}
+	notAfter := so.NotAfter.RelativeTime(notBefore)
+	return func(p x509util.Profile) error {
+		fn := x509util.WithNotBeforeAfterDuration(notBefore, notAfter, time.Duration(v))
+		if err := fn(p); err != nil {
+			return err
+		}
+		crt := p.Subject()
+		crt.NotBefore = crt.NotBefore.Add(backdate)
+		return nil
+	}
+}
+
+// profileLimitDuration is an x509 profile option that modifies an x509 validity
+// period according to an imposed expiration time.
+type profileLimitDuration struct {
+	def                 time.Duration
+	notBefore, notAfter time.Time
+}
+
+// Option returns an x509util option that limits the validity period of a
+// certificate to one that is superficially imposed.
+func (v profileLimitDuration) Option(so Options) x509util.WithOption {
+	return func(p x509util.Profile) error {
+		var backdate time.Duration
+		n := now()
+		notBefore := so.NotBefore.Time()
+		if notBefore.IsZero() {
+			notBefore = n
+			backdate = -1 * so.Backdate
+		}
+		if notBefore.Before(v.notBefore) {
+			return errors.Errorf("requested certificate notBefore (%s) is before "+
+				"the active validity window of the provisioning credential (%s)",
+				notBefore, v.notBefore)
+		}
+
+		notAfter := so.NotAfter.RelativeTime(notBefore)
+		if notAfter.After(v.notAfter) {
+			return errors.Errorf("requested certificate notAfter (%s) is after "+
+				"the expiration of the provisioning credential (%s)",
+				notAfter, v.notAfter)
+		}
+		if notAfter.IsZero() {
+			t := notBefore.Add(v.def)
+			if t.After(v.notAfter) {
+				notAfter = v.notAfter
+			} else {
+				notAfter = t
+			}
+		}
+		crt := p.Subject()
+		crt.NotBefore = notBefore.Add(backdate)
+		crt.NotAfter = notAfter
+		return nil
+	}
+}
+
+// validityValidator validates the certificate validity settings.
 type validityValidator struct {
 	min time.Duration
 	max time.Duration
@@ -208,28 +333,34 @@ func newValidityValidator(min, max time.Duration) *validityValidator {
 	return &validityValidator{min: min, max: max}
 }
 
-// Validate validates the certificate temporal validity settings.
-func (v *validityValidator) Valid(crt *x509.Certificate) error {
+// Valid validates the certificate validity settings (notBefore/notAfter) and
+// and total duration.
+func (v *validityValidator) Valid(cert *x509.Certificate, o Options) error {
 	var (
-		na  = crt.NotAfter
-		nb  = crt.NotBefore
-		d   = na.Sub(nb)
-		now = time.Now()
+		na  = cert.NotAfter.Truncate(time.Second)
+		nb  = cert.NotBefore.Truncate(time.Second)
+		now = time.Now().Truncate(time.Second)
 	)
 
+	d := na.Sub(nb)
+
 	if na.Before(now) {
-		return errors.Errorf("NotAfter: %v cannot be in the past", na)
+		return errors.Errorf("notAfter cannot be in the past; na=%v", na)
 	}
 	if na.Before(nb) {
-		return errors.Errorf("NotAfter: %v cannot be before NotBefore: %v", na, nb)
+		return errors.Errorf("notAfter cannot be before notBefore; na=%v, nb=%v", na, nb)
 	}
 	if d < v.min {
 		return errors.Errorf("requested duration of %v is less than the authorized minimum certificate duration of %v",
 			d, v.min)
 	}
-	if d > v.max {
+	// NOTE: this check is not "technically correct". We're allowing the max
+	// duration of a cert to be "max + backdate" and not all certificates will
+	// be backdated (e.g. if a user passes the NotBefore value then we do not
+	// apply a backdate). This is good enough.
+	if d > v.max+o.Backdate {
 		return errors.Errorf("requested duration of %v is more than the authorized maximum certificate duration of %v",
-			d, v.max)
+			d, v.max+o.Backdate)
 	}
 	return nil
 }
@@ -244,6 +375,32 @@ type stepProvisionerASN1 struct {
 	Name          []byte
 	CredentialID  []byte
 	KeyValuePairs []string `asn1:"optional,omitempty"`
+}
+
+type forceCNOption struct {
+	ForceCN bool
+}
+
+func newForceCNOption(forceCN bool) *forceCNOption {
+	return &forceCNOption{forceCN}
+}
+
+func (o *forceCNOption) Option(Options) x509util.WithOption {
+	return func(p x509util.Profile) error {
+		if !o.ForceCN {
+			// Forcing CN is disabled, do nothing to certificate
+			return nil
+		}
+		crt := p.Subject()
+		if crt.Subject.CommonName == "" {
+			if len(crt.DNSNames) > 0 {
+				crt.Subject.CommonName = crt.DNSNames[0]
+			} else {
+				return errors.New("Cannot force CN, DNSNames is empty")
+			}
+		}
+		return nil
+	}
 }
 
 type provisionerExtensionOption struct {
@@ -269,7 +426,14 @@ func (o *provisionerExtensionOption) Option(Options) x509util.WithOption {
 		if err != nil {
 			return err
 		}
-		crt.ExtraExtensions = append(crt.ExtraExtensions, ext)
+		// Prepend the provisioner extension. In the auth.Sign code we will
+		// force the resulting certificate to only have one extension, the
+		// first stepOIDProvisioner that is found in the ExtraExtensions.
+		// A client could pass a csr containing a malicious stepOIDProvisioner
+		// ExtraExtension. If we were to append (rather than prepend) the correct
+		// stepOIDProvisioner extension, then the resulting certificate would
+		// contain the malicious extension, rather than the one applied by step-ca.
+		crt.ExtraExtensions = append([]pkix.Extension{ext}, crt.ExtraExtensions...)
 		return nil
 	}
 }

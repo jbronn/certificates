@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -15,18 +16,19 @@ import (
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
 )
 
 func TestRevokeRequestValidate(t *testing.T) {
 	type test struct {
 		rr  *RevokeRequest
-		err *Error
+		err *errs.Error
 	}
 	tests := map[string]test{
 		"error/missing serial": {
 			rr:  &RevokeRequest{},
-			err: &Error{Err: errors.New("missing serial"), Status: http.StatusBadRequest},
+			err: &errs.Error{Err: errors.New("missing serial"), Status: http.StatusBadRequest},
 		},
 		"error/bad reasonCode": {
 			rr: &RevokeRequest{
@@ -34,7 +36,7 @@ func TestRevokeRequestValidate(t *testing.T) {
 				ReasonCode: 15,
 				Passive:    true,
 			},
-			err: &Error{Err: errors.New("reasonCode out of bounds"), Status: http.StatusBadRequest},
+			err: &errs.Error{Err: errors.New("reasonCode out of bounds"), Status: http.StatusBadRequest},
 		},
 		"error/non-passive not implemented": {
 			rr: &RevokeRequest{
@@ -42,7 +44,7 @@ func TestRevokeRequestValidate(t *testing.T) {
 				ReasonCode: 8,
 				Passive:    false,
 			},
-			err: &Error{Err: errors.New("non-passive revocation not implemented"), Status: http.StatusNotImplemented},
+			err: &errs.Error{Err: errors.New("non-passive revocation not implemented"), Status: http.StatusNotImplemented},
 		},
 		"ok": {
 			rr: &RevokeRequest{
@@ -56,7 +58,7 @@ func TestRevokeRequestValidate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if err := tc.rr.Validate(); err != nil {
 				switch v := err.(type) {
-				case *Error:
+				case *errs.Error:
 					assert.HasPrefix(t, v.Error(), tc.err.Error())
 					assert.Equals(t, v.StatusCode(), tc.err.Status)
 				default:
@@ -105,7 +107,10 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusOK,
 				auth: &mockAuthority{
-					revoke: func(opts *authority.RevokeOptions) error {
+					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+						return nil, nil
+					},
+					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
 						assert.True(t, opts.PassiveOnly)
 						assert.False(t, opts.MTLS)
 						assert.Equals(t, opts.Serial, "sn")
@@ -146,7 +151,10 @@ func Test_caHandler_Revoke(t *testing.T) {
 				statusCode: http.StatusOK,
 				tls:        cs,
 				auth: &mockAuthority{
-					revoke: func(ri *authority.RevokeOptions) error {
+					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+						return nil, nil
+					},
+					revoke: func(ctx context.Context, ri *authority.RevokeOptions) error {
 						assert.True(t, ri.PassiveOnly)
 						assert.True(t, ri.MTLS)
 						assert.Equals(t, ri.Serial, "1404354960355712309")
@@ -178,8 +186,11 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusInternalServerError,
 				auth: &mockAuthority{
-					revoke: func(opts *authority.RevokeOptions) error {
-						return InternalServerError(errors.New("force"))
+					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+						return nil, nil
+					},
+					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
+						return errs.InternalServer("force")
 					},
 				},
 			}
@@ -197,7 +208,10 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusForbidden,
 				auth: &mockAuthority{
-					revoke: func(opts *authority.RevokeOptions) error {
+					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+						return nil, nil
+					},
+					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
 						return errors.New("force")
 					},
 				},

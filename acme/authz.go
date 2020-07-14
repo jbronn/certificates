@@ -1,12 +1,12 @@
 package acme
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/nosql"
 )
 
@@ -51,7 +51,7 @@ type authz interface {
 	getChallenges() []string
 	getCreated() time.Time
 	updateStatus(db nosql.DB) (authz, error)
-	toACME(nosql.DB, *directory, provisioner.Interface) (*Authz, error)
+	toACME(context.Context, nosql.DB, *directory) (*Authz, error)
 }
 
 // baseAuthz is the base authz type that others build from.
@@ -141,14 +141,14 @@ func (ba *baseAuthz) getCreated() time.Time {
 
 // toACME converts the internal Authz type into the public acmeAuthz type for
 // presentation in the ACME protocol.
-func (ba *baseAuthz) toACME(db nosql.DB, dir *directory, p provisioner.Interface) (*Authz, error) {
+func (ba *baseAuthz) toACME(ctx context.Context, db nosql.DB, dir *directory) (*Authz, error) {
 	var chs = make([]*Challenge, len(ba.Challenges))
 	for i, chID := range ba.Challenges {
 		ch, err := getChallenge(db, chID)
 		if err != nil {
 			return nil, err
 		}
-		chs[i], err = ch.toACME(db, dir, p)
+		chs[i], err = ch.toACME(ctx, db, dir)
 		if err != nil {
 			return nil, err
 		}
@@ -294,7 +294,7 @@ func newDNSAuthz(db nosql.DB, accID string, identifier Identifier) (authz, error
 
 	ba.Challenges = []string{}
 	if !ba.Wildcard {
-		// http challenges are only permitted if the DNS is not a wildcard dns.
+		// http and alpn challenges are only permitted if the DNS is not a wildcard dns.
 		ch1, err := newHTTP01Challenge(db, ChallengeOptions{
 			AccountID:  accID,
 			AuthzID:    ba.ID,
@@ -303,15 +303,25 @@ func newDNSAuthz(db nosql.DB, accID string, identifier Identifier) (authz, error
 			return nil, Wrap(err, "error creating http challenge")
 		}
 		ba.Challenges = append(ba.Challenges, ch1.getID())
+
+		ch2, err := newTLSALPN01Challenge(db, ChallengeOptions{
+			AccountID:  accID,
+			AuthzID:    ba.ID,
+			Identifier: ba.Identifier,
+		})
+		if err != nil {
+			return nil, Wrap(err, "error creating alpn challenge")
+		}
+		ba.Challenges = append(ba.Challenges, ch2.getID())
 	}
-	ch2, err := newDNS01Challenge(db, ChallengeOptions{
+	ch3, err := newDNS01Challenge(db, ChallengeOptions{
 		AccountID:  accID,
 		AuthzID:    ba.ID,
 		Identifier: identifier})
 	if err != nil {
 		return nil, Wrap(err, "error creating dns challenge")
 	}
-	ba.Challenges = append(ba.Challenges, ch2.getID())
+	ba.Challenges = append(ba.Challenges, ch3.getID())
 
 	da := &dnsAuthz{ba}
 	if err := da.save(db, nil); err != nil {

@@ -50,7 +50,7 @@ It's super easy to get started and to operate `step-ca` thanks to [streamlined i
 ### [Your own private ACME Server](https://smallstep.com/blog/private-acme-server/)
 - Issue certificates using ACMEv2 ([RFC8555](https://tools.ietf.org/html/rfc8555)), **the protocol used by Let's Encrypt**
 - Great for [using ACME in development & pre-production](https://smallstep.com/blog/private-acme-server/#local-development-pre-production)
-- Supports the `http-01` and `dns-01` ACME challenge types
+- Supports the `http-01`, `tls-alpn-01`, and `dns-01` ACME challenge types
 - Works with any compliant ACME client including [certbot](https://smallstep.com/blog/private-acme-server/#certbot-uploads-acme-certbot-png-certbot-example), [acme.sh](https://smallstep.com/blog/private-acme-server/#acme-sh-uploads-acme-acme-sh-png-acme-sh-example), [Caddy](https://smallstep.com/blog/private-acme-server/#caddy-uploads-acme-caddy-png-caddy-example), and [traefik](https://smallstep.com/blog/private-acme-server/#traefik-uploads-acme-traefik-png-traefik-example)
 - Get certificates programmatically (e.g., in [Go](https://smallstep.com/blog/private-acme-server/#golang-uploads-acme-golang-png-go-example), [Python](https://smallstep.com/blog/private-acme-server/#python-uploads-acme-python-png-python-example), [Node.js](https://smallstep.com/blog/private-acme-server/#node-js-uploads-acme-node-js-png-node-js-example))
 
@@ -126,7 +126,7 @@ Certificate:
 
 > Note: If you have installed `step` previously through the `smallstep/smallstep`
 > tap you will need to run the following commands before installing:
-> 
+>
 > ```
 > $ brew untap smallstep/smallstep
 > $ brew uninstall step
@@ -142,13 +142,13 @@ Certificate:
     [`step` releases](https://github.com/smallstep/cli/releases):
 
     ```
-    $ wget https://github.com/smallstep/cli/releases/download/X.Y.Z/step_X.Y.Z_amd64.deb
+    $ wget https://github.com/smallstep/cli/releases/download/vX.Y.Z/step-cli_X.Y.Z_amd64.deb
     ```
 
     Install the Debian package:
 
     ```
-    $ sudo dpkg -i step_X.Y.Z_amd64.deb
+    $ sudo dpkg -i step-cli_X.Y.Z_amd64.deb
     ```
 
 2. Install `step-ca`.
@@ -156,7 +156,7 @@ Certificate:
     Download the latest Debian package from [releases](https://github.com/smallstep/certificates/releases):
 
     ```
-    $ wget https://github.com/smallstep/certificates/releases/download/X.Y.Z/step-certificates_X.Y.Z_amd64.deb
+    $ wget https://github.com/smallstep/certificates/releases/download/vX.Y.Z/step-certificates_X.Y.Z_amd64.deb
     ```
 
     Install the Debian package:
@@ -174,6 +174,43 @@ We are using the [Arch User Repository](https://aur.archlinux.org) to distribute
 * The `step-ca` binary tarball can be found [here](https://aur.archlinux.org/packages/step-ca-bin/).
 
 You can use [pacman](https://www.archlinux.org/pacman/) to install the packages.
+
+#### RHEL/CentOS
+
+1. [Optional] Install `step`.
+
+    Download the latest Linux tarball from
+    [`step` releases](https://github.com/smallstep/cli/releases):
+
+    ```
+    $ wget -O step-cli.tar.gz https://github.com/smallstep/cli/releases/download/vX.Y.Z/step_linux_X.Y.Z_amd64.tar.gz
+    ```
+
+    Install `step` by unzipping and copying the executable over to `/usr/bin`:
+
+    ```
+    $ tar -xf step-cli.tar.gz
+    $ sudo cp step_X.Y.Z/bin/step /usr/bin
+    ```
+
+2. Install `step-ca`.
+
+    Download the latest Linux package from [releases](https://github.com/smallstep/certificates/releases):
+
+    ```
+    $ wget -O step-ca.tar.gz https://github.com/smallstep/cli/releases/download/vX.Y.Z/step_linux_X.Y.Z_amd64.tar.gz
+    ```
+
+    Install `step-ca` by unzipping and copying the executable over to `/usr/bin`:
+
+    ```
+    $ tar -xf step-ca.tar.gz
+    $ sudo cp step-certificates_X.Y.Z/bin/step-ca /usr/bin
+    ```
+
+See the [`systemctl` setup section](./docs/GETTING_STARTED.md#systemctl) for a
+guide on configuring `step-ca` as a daemon.
+
 
 ### Kubernetes
 
@@ -342,8 +379,8 @@ Documentation can be found in a handful of different places:
 
 1. The [docs](./docs/README.md) sub-repo has an index of documentation and tutorials.
 
-2. On the command line with `step ca help xxx` where `xxx` is the subcommand
-you are interested in. Ex: `step help ca provisioners list`.
+2. On the command line with `step help ca xxx` where `xxx` is the subcommand
+you are interested in. Ex: `step help ca provisioner list`.
 
 3. On the web at https://smallstep.com/docs/certificates.
 

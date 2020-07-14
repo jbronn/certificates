@@ -1,12 +1,13 @@
 language: go
 go:
-- 1.13.x
+- 1.14.x
 addons:
   apt:
     packages:
     - debhelper
     - fakeroot
     - bash-completion
+    - libpcsclite-dev
 env:
   global:
   - V=1
@@ -20,7 +21,6 @@ after_success:
   not collect coverage reports"
 notifications:
   email: false
-stage: Github Release
 deploy:
   provider: releases
   skip_cleanup: true

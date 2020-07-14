@@ -156,8 +156,8 @@ func TestBootstrap(t *testing.T) {
 					if !reflect.DeepEqual(got.endpoint, tt.want.endpoint) {
 						t.Errorf("Bootstrap() endpoint = %v, want %v", got.endpoint, tt.want.endpoint)
 					}
-					gotTR := got.client.Transport.(*http.Transport)
-					wantTR := tt.want.client.Transport.(*http.Transport)
+					gotTR := got.client.GetTransport().(*http.Transport)
+					wantTR := tt.want.client.GetTransport().(*http.Transport)
 					if !reflect.DeepEqual(gotTR.TLSClientConfig.RootCAs, wantTR.TLSClientConfig.RootCAs) {
 						t.Errorf("Bootstrap() certPool = %v, want %v", gotTR.TLSClientConfig.RootCAs, wantTR.TLSClientConfig.RootCAs)
 					}
@@ -303,7 +303,7 @@ func TestBootstrapClient(t *testing.T) {
 					t.Errorf("BootstrapClient() error reading response: %v", err)
 					return
 				}
-				if renewal.CaPEM.Certificate == nil || renewal.ServerPEM.Certificate == nil {
+				if renewal.CaPEM.Certificate == nil || renewal.ServerPEM.Certificate == nil || len(renewal.CertChainPEM) == 0 {
 					t.Errorf("BootstrapClient() invalid renewal response: %v", renewal)
 				}
 			}
@@ -375,7 +375,7 @@ func TestBootstrapClientServerRotation(t *testing.T) {
 		if err := readJSON(resp.Body, &renew); err != nil {
 			return errors.Wrap(err, "client.Post() error reading response")
 		}
-		if renew.ServerPEM.Certificate == nil || renew.CaPEM.Certificate == nil {
+		if renew.ServerPEM.Certificate == nil || renew.CaPEM.Certificate == nil || len(renew.CertChainPEM) == 0 {
 			return errors.New("client.Post() unexpected response found")
 		}
 		// test with bootstrap server
@@ -492,7 +492,7 @@ func TestBootstrapClientServerFederation(t *testing.T) {
 		if err := readJSON(resp.Body, &renew); err != nil {
 			return errors.Wrap(err, "client.Post() error reading response")
 		}
-		if renew.ServerPEM.Certificate == nil || renew.CaPEM.Certificate == nil {
+		if renew.ServerPEM.Certificate == nil || renew.CaPEM.Certificate == nil || len(renew.CertChainPEM) == 0 {
 			return errors.New("client.Post() unexpected response found")
 		}
 		// test with bootstrap server

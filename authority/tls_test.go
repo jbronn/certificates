@@ -2,12 +2,12 @@ package authority
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"net/http"
@@ -19,6 +19,7 @@ import (
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
+	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/cli/crypto/keys"
 	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/crypto/tlsutil"
@@ -38,6 +39,17 @@ type stepProvisionerASN1 struct {
 	Type         int
 	Name         []byte
 	CredentialID []byte
+}
+
+type certificateDurationEnforcer struct {
+	NotBefore time.Time
+	NotAfter  time.Time
+}
+
+func (m *certificateDurationEnforcer) Enforce(cert *x509.Certificate) error {
+	cert.NotBefore = m.NotBefore
+	cert.NotAfter = m.NotAfter
+	return nil
 }
 
 func withProvisionerOID(name, kid string) x509util.WithOption {
@@ -77,7 +89,18 @@ func getCSR(t *testing.T, priv interface{}, opts ...func(*x509.CertificateReques
 	return csr
 }
 
-func TestSign(t *testing.T) {
+func setExtraExtsCSR(exts []pkix.Extension) func(*x509.CertificateRequest) {
+	return func(csr *x509.CertificateRequest) {
+		csr.ExtraExtensions = exts
+	}
+}
+
+type basicConstraints struct {
+	IsCA       bool `asn1:"optional"`
+	MaxPathLen int  `asn1:"optional,default:-1"`
+}
+
+func TestAuthority_Sign(t *testing.T) {
 	pub, priv, err := keys.GenerateDefaultKeyPair()
 	assert.FatalError(t, err)
 
@@ -102,7 +125,7 @@ func TestSign(t *testing.T) {
 	p := a.config.AuthorityConfig.Provisioners[1].(*provisioner.JWK)
 	key, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
-	token, err := generateToken("smallstep test", "step-cli", "https://test.ca.smallstep.com/sign", []string{"test.smallstep.com"}, time.Now(), key)
+	token, err := generateToken("smallstep test", "step-cli", testAudiences.Sign[0], []string{"test.smallstep.com"}, time.Now(), key)
 	assert.FatalError(t, err)
 	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.SignMethod)
 	extraOpts, err := a.Authorize(ctx, token)
@@ -113,7 +136,10 @@ func TestSign(t *testing.T) {
 		csr       *x509.CertificateRequest
 		signOpts  provisioner.Options
 		extraOpts []provisioner.SignOption
-		err       *apiError
+		notBefore time.Time
+		notAfter  time.Time
+		err       error
+		code      int
 	}
 	tests := map[string]func(*testing.T) *signTest{
 		"fail invalid signature": func(t *testing.T) *signTest {
@@ -124,10 +150,8 @@ func TestSign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: invalid certificate request"),
-					http.StatusBadRequest,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign; invalid certificate request"),
+				code:      http.StatusBadRequest,
 			}
 		},
 		"fail invalid extra option": func(t *testing.T) *signTest {
@@ -138,10 +162,8 @@ func TestSign(t *testing.T) {
 				csr:       csr,
 				extraOpts: append(extraOpts, "42"),
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: invalid extra option type string"),
-					http.StatusInternalServerError,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign; invalid extra option type string"),
+				code:      http.StatusInternalServerError,
 			}
 		},
 		"fail merge default ASN1DN": func(t *testing.T) *signTest {
@@ -153,25 +175,21 @@ func TestSign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: default ASN1DN template cannot be nil"),
-					http.StatusInternalServerError,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign: default ASN1DN template cannot be nil"),
+				code:      http.StatusInternalServerError,
 			}
 		},
 		"fail create cert": func(t *testing.T) *signTest {
 			_a := testAuthority(t)
-			_a.intermediateIdentity.Key = nil
+			_a.x509Signer = nil
 			csr := getCSR(t, priv)
 			return &signTest{
 				auth:      _a,
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: error creating new leaf certificate"),
-					http.StatusInternalServerError,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign; error creating new leaf certificate"),
+				code:      http.StatusInternalServerError,
 			}
 		},
 		"fail provisioner duration claim": func(t *testing.T) *signTest {
@@ -185,10 +203,8 @@ func TestSign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  _signOpts,
-				err: &apiError{errors.New("sign: requested duration of 25h0m0s is more than the authorized maximum certificate duration of 24h0m0s"),
-					http.StatusUnauthorized,
-					apiCtx{"csr": csr, "signOptions": _signOpts},
-				},
+				err:       errors.New("authority.Sign: requested duration of 25h0m0s is more than the authorized maximum certificate duration of 24h1m0s"),
+				code:      http.StatusUnauthorized,
 			}
 		},
 		"fail validate sans when adding common name not in claims": func(t *testing.T) *signTest {
@@ -200,22 +216,21 @@ func TestSign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: certificate request does not contain the valid DNS names - got [test.smallstep.com smallstep test], want [test.smallstep.com]"),
-					http.StatusUnauthorized,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign: certificate request does not contain the valid DNS names - got [test.smallstep.com smallstep test], want [test.smallstep.com]"),
+				code:      http.StatusUnauthorized,
 			}
 		},
 		"fail rsa key too short": func(t *testing.T) *signTest {
 			shortRSAKeyPEM := `-----BEGIN CERTIFICATE REQUEST-----
-MIIBdDCB2wIBADAOMQwwCgYDVQQDEwNmb28wgaIwDQYJKoZIhvcNAQEBBQADgZAA
-MIGMAoGEAK8dks7oV6kcIFEaWna7CDGYPAE8IL7rNi+ruQ1dIYz+JtxT7OPjbCn/
-t5iqni96+35iS/8CvMtEuquOMTMSWOWwlurrbTbLqCazuz/g233o8udxSxhny3cY
-wHogp4cXCX6cFll6DeUnoCEuTTSIu8IBHbK48VfNw4V4gGz6cp/H93HrAgMBAAGg
-ITAfBgkqhkiG9w0BCQ4xEjAQMA4GA1UdEQQHMAWCA2ZvbzANBgkqhkiG9w0BAQsF
-AAOBhABCZsYM+Kgje68Z9Fjl2+cBwtQHvZDarh+cz6W1SchinZ1T0aNQvSj/otOe
-ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
-2FbarLt9jN2aJLAYQPwtSeGTAZ74tLOPRPnTP6aMfFNg4XCR0uveHA==
+MIIBhDCB7gIBADAZMRcwFQYDVQQDEw5zbWFsbHN0ZXAgdGVzdDCBnzANBgkqhkiG
+9w0BAQEFAAOBjQAwgYkCgYEA5JlgH99HvHHsCD6XTqqYj3bXU2oIlnYGoLVs7IJ4
+k205rv5/YWky2gjdpIv0Tnaf3o57IJ891lB7GiyO5iHIEUv5N9dVzrdUboyzk2uZ
+7JMMNB43CSLB2oNuwJjLeAM/yBzlhRnvpKjrNSfSV+cH54FXdnbFbcTFMStnjqKG
+MeECAwEAAaAsMCoGCSqGSIb3DQEJDjEdMBswGQYDVR0RBBIwEIIOc21hbGxzdGVw
+IHRlc3QwDQYJKoZIhvcNAQELBQADgYEAKwsbr8Zfcq05DgOoJ//cXMFK1SP8ktRU
+N2++E8Ww0Tet9oyNRArqxxS/UyVio63D3wynzRAB25PFGpYG1cN4b81Gv/foFUT6
+W5kR63lNVHBHgQmv5mA8YFsfrJHstaz5k727v2LMHEYIf5/3i16d5zhuxUoaPTYr
+ZYtQ9Ot36qc=
 -----END CERTIFICATE REQUEST-----`
 			block, _ := pem.Decode([]byte(shortRSAKeyPEM))
 			assert.FatalError(t, err)
@@ -227,20 +242,16 @@ ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: rsa key in CSR must be at least 2048 bits (256 bytes)"),
-					http.StatusUnauthorized,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign: rsa key in CSR must be at least 2048 bits (256 bytes)"),
+				code:      http.StatusUnauthorized,
 			}
 		},
 		"fail store cert in db": func(t *testing.T) *signTest {
 			csr := getCSR(t, priv)
 			_a := testAuthority(t)
-			_a.db = &MockAuthDB{
-				storeCertificate: func(crt *x509.Certificate) error {
-					return &apiError{errors.New("force"),
-						http.StatusInternalServerError,
-						apiCtx{"csr": csr, "signOptions": signOpts}}
+			_a.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					return errors.New("force")
 				},
 			}
 			return &signTest{
@@ -248,17 +259,15 @@ ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err: &apiError{errors.New("sign: error storing certificate in db: force"),
-					http.StatusInternalServerError,
-					apiCtx{"csr": csr, "signOptions": signOpts},
-				},
+				err:       errors.New("authority.Sign; error storing certificate in db: force"),
+				code:      http.StatusInternalServerError,
 			}
 		},
 		"ok": func(t *testing.T) *signTest {
 			csr := getCSR(t, priv)
 			_a := testAuthority(t)
-			_a.db = &MockAuthDB{
-				storeCertificate: func(crt *x509.Certificate) error {
+			_a.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
 					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
 					return nil
 				},
@@ -268,6 +277,40 @@ ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
+				notBefore: signOpts.NotBefore.Time().Truncate(time.Second),
+				notAfter:  signOpts.NotAfter.Time().Truncate(time.Second),
+			}
+		},
+		"ok with enforced modifier": func(t *testing.T) *signTest {
+			bcExt := pkix.Extension{}
+			bcExt.Id = asn1.ObjectIdentifier{2, 5, 29, 19}
+			bcExt.Critical = false
+			bcExt.Value, err = asn1.Marshal(basicConstraints{IsCA: true, MaxPathLen: 4})
+			assert.FatalError(t, err)
+
+			csr := getCSR(t, priv, setExtraExtsCSR([]pkix.Extension{
+				bcExt,
+				{Id: stepOIDProvisioner, Value: []byte("foo")},
+				{Id: []int{1, 1, 1}, Value: []byte("bar")}}))
+			now := time.Now().UTC()
+			enforcedExtraOptions := append(extraOpts, &certificateDurationEnforcer{
+				NotBefore: now,
+				NotAfter:  now.Add(365 * 24 * time.Hour),
+			})
+			_a := testAuthority(t)
+			_a.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
+					return nil
+				},
+			}
+			return &signTest{
+				auth:      a,
+				csr:       csr,
+				extraOpts: enforcedExtraOptions,
+				signOpts:  signOpts,
+				notBefore: now.Truncate(time.Second),
+				notAfter:  now.Add(365 * 24 * time.Hour).Truncate(time.Second),
 			}
 		},
 	}
@@ -276,22 +319,26 @@ ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
 		t.Run(name, func(t *testing.T) {
 			tc := genTestCase(t)
 
-			leaf, intermediate, err := tc.auth.Sign(tc.csr, tc.signOpts, tc.extraOpts...)
+			certChain, err := tc.auth.Sign(tc.csr, tc.signOpts, tc.extraOpts...)
 			if err != nil {
-				if assert.NotNil(t, tc.err) {
-					switch v := err.(type) {
-					case *apiError:
-						assert.HasPrefix(t, v.err.Error(), tc.err.Error())
-						assert.Equals(t, v.code, tc.err.code)
-						assert.Equals(t, v.context, tc.err.context)
-					default:
-						t.Errorf("unexpected error type: %T", v)
-					}
+				if assert.NotNil(t, tc.err, fmt.Sprintf("unexpected error: %s", err)) {
+					assert.Nil(t, certChain)
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tc.code)
+					assert.HasPrefix(t, err.Error(), tc.err.Error())
+
+					ctxErr, ok := err.(*errs.Error)
+					assert.Fatal(t, ok, "error is not of type *errs.Error")
+					assert.Equals(t, ctxErr.Details["csr"], tc.csr)
+					assert.Equals(t, ctxErr.Details["signOptions"], tc.signOpts)
 				}
 			} else {
+				leaf := certChain[0]
+				intermediate := certChain[1]
 				if assert.Nil(t, tc.err) {
-					assert.Equals(t, leaf.NotBefore, signOpts.NotBefore.Time().Truncate(time.Second))
-					assert.Equals(t, leaf.NotAfter, signOpts.NotAfter.Time().Truncate(time.Second))
+					assert.Equals(t, leaf.NotBefore, tc.notBefore)
+					assert.Equals(t, leaf.NotAfter, tc.notAfter)
 					tmplt := a.config.AuthorityConfig.Template
 					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
 						fmt.Sprintf("%v", &pkix.Name{
@@ -315,26 +362,33 @@ ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
 					hash := sha1.Sum(pubBytes)
 					assert.Equals(t, leaf.SubjectKeyId, hash[:])
 
-					assert.Equals(t, leaf.AuthorityKeyId, a.intermediateIdentity.Crt.SubjectKeyId)
+					assert.Equals(t, leaf.AuthorityKeyId, a.x509Issuer.SubjectKeyId)
 
 					// Verify Provisioner OID
 					found := 0
 					for _, ext := range leaf.Extensions {
-						id := ext.Id.String()
-						if id != stepOIDProvisioner.String() {
-							continue
+						switch {
+						case ext.Id.Equal(stepOIDProvisioner):
+							found++
+							val := stepProvisionerASN1{}
+							_, err := asn1.Unmarshal(ext.Value, &val)
+							assert.FatalError(t, err)
+							assert.Equals(t, val.Type, provisionerTypeJWK)
+							assert.Equals(t, val.Name, []byte(p.Name))
+							assert.Equals(t, val.CredentialID, []byte(p.Key.KeyID))
+						// Basic Constraints
+						case ext.Id.Equal(asn1.ObjectIdentifier([]int{2, 5, 29, 19})):
+							val := basicConstraints{}
+							_, err := asn1.Unmarshal(ext.Value, &val)
+							assert.FatalError(t, err)
+							assert.False(t, val.IsCA, false)
+							assert.Equals(t, val.MaxPathLen, 0)
 						}
-						found++
-						val := stepProvisionerASN1{}
-						_, err := asn1.Unmarshal(ext.Value, &val)
-						assert.FatalError(t, err)
-						assert.Equals(t, val.Type, provisionerTypeJWK)
-						assert.Equals(t, val.Name, []byte(p.Name))
-						assert.Equals(t, val.CredentialID, []byte(p.Key.KeyID))
 					}
 					assert.Equals(t, found, 1)
+					assert.Len(t, 6, leaf.Extensions)
 
-					realIntermediate, err := x509.ParseCertificate(a.intermediateIdentity.Crt.Raw)
+					realIntermediate, err := x509.ParseCertificate(a.x509Issuer.Raw)
 					assert.FatalError(t, err)
 					assert.Equals(t, intermediate, realIntermediate)
 				}
@@ -343,7 +397,7 @@ ttnEF4Rq8zqzr4fbv+AF451Mx36AkfgZr9XWGzxidrH+fBCNWXWNR+ymhrL6UFTG
 	}
 }
 
-func TestRenew(t *testing.T) {
+func TestAuthority_Renew(t *testing.T) {
 	pub, _, err := keys.GenerateDefaultKeyPair()
 	assert.FatalError(t, err)
 
@@ -365,61 +419,57 @@ func TestRenew(t *testing.T) {
 		NotAfter:  provisioner.NewTimeDuration(na1),
 	}
 
-	leaf, err := x509util.NewLeafProfile("renew", a.intermediateIdentity.Crt,
-		a.intermediateIdentity.Key,
+	leaf, err := x509util.NewLeafProfile("renew", a.x509Issuer, a.x509Signer,
 		x509util.WithNotBeforeAfterDuration(so.NotBefore.Time(), so.NotAfter.Time(), 0),
 		withDefaultASN1DN(a.config.AuthorityConfig.Template),
 		x509util.WithPublicKey(pub), x509util.WithHosts("test.smallstep.com,test"),
 		withProvisionerOID("Max", a.config.AuthorityConfig.Provisioners[0].(*provisioner.JWK).Key.KeyID))
 	assert.FatalError(t, err)
-	crtBytes, err := leaf.CreateCertificate()
+	certBytes, err := leaf.CreateCertificate()
 	assert.FatalError(t, err)
-	crt, err := x509.ParseCertificate(crtBytes)
+	cert, err := x509.ParseCertificate(certBytes)
 	assert.FatalError(t, err)
 
-	leafNoRenew, err := x509util.NewLeafProfile("norenew", a.intermediateIdentity.Crt,
-		a.intermediateIdentity.Key,
+	leafNoRenew, err := x509util.NewLeafProfile("norenew", a.x509Issuer, a.x509Signer,
 		x509util.WithNotBeforeAfterDuration(so.NotBefore.Time(), so.NotAfter.Time(), 0),
 		withDefaultASN1DN(a.config.AuthorityConfig.Template),
 		x509util.WithPublicKey(pub), x509util.WithHosts("test.smallstep.com,test"),
 		withProvisionerOID("dev", a.config.AuthorityConfig.Provisioners[2].(*provisioner.JWK).Key.KeyID),
 	)
 	assert.FatalError(t, err)
-	crtBytesNoRenew, err := leafNoRenew.CreateCertificate()
+	certBytesNoRenew, err := leafNoRenew.CreateCertificate()
 	assert.FatalError(t, err)
-	crtNoRenew, err := x509.ParseCertificate(crtBytesNoRenew)
+	certNoRenew, err := x509.ParseCertificate(certBytesNoRenew)
 	assert.FatalError(t, err)
 
 	type renewTest struct {
 		auth *Authority
-		crt  *x509.Certificate
-		err  *apiError
+		cert *x509.Certificate
+		err  error
+		code int
 	}
 	tests := map[string]func() (*renewTest, error){
 		"fail-create-cert": func() (*renewTest, error) {
 			_a := testAuthority(t)
-			_a.intermediateIdentity.Key = nil
+			_a.x509Signer = nil
 			return &renewTest{
 				auth: _a,
-				crt:  crt,
-				err: &apiError{errors.New("error renewing certificate from existing server certificate"),
-					http.StatusInternalServerError, apiCtx{}},
+				cert: cert,
+				err:  errors.New("authority.Renew; error renewing certificate from existing server certificate"),
+				code: http.StatusInternalServerError,
 			}, nil
 		},
 		"fail-unauthorized": func() (*renewTest, error) {
-			ctx := map[string]interface{}{
-				"serialNumber": crtNoRenew.SerialNumber.String(),
-			}
 			return &renewTest{
-				crt: crtNoRenew,
-				err: &apiError{errors.New("renew: renew is disabled for provisioner dev:IMi94WBNI6gP5cNHXlZYNUzvMjGdHyBRmFoo-lCEaqk"),
-					http.StatusUnauthorized, ctx},
+				cert: certNoRenew,
+				err:  errors.New("authority.Renew: authority.authorizeRenew: jwk.AuthorizeRenew; renew is disabled for jwk provisioner dev:IMi94WBNI6gP5cNHXlZYNUzvMjGdHyBRmFoo-lCEaqk"),
+				code: http.StatusUnauthorized,
 			}, nil
 		},
 		"success": func() (*renewTest, error) {
 			return &renewTest{
 				auth: a,
-				crt:  crt,
+				cert: cert,
 			}, nil
 		},
 		"success-new-intermediate": func() (*renewTest, error) {
@@ -427,23 +477,23 @@ func TestRenew(t *testing.T) {
 			assert.FatalError(t, err)
 			newRootBytes, err := newRootProfile.CreateCertificate()
 			assert.FatalError(t, err)
-			newRootCrt, err := x509.ParseCertificate(newRootBytes)
+			newRootCert, err := x509.ParseCertificate(newRootBytes)
 			assert.FatalError(t, err)
 
 			newIntermediateProfile, err := x509util.NewIntermediateProfile("new-intermediate",
-				newRootCrt, newRootProfile.SubjectPrivateKey())
+				newRootCert, newRootProfile.SubjectPrivateKey())
 			assert.FatalError(t, err)
 			newIntermediateBytes, err := newIntermediateProfile.CreateCertificate()
 			assert.FatalError(t, err)
-			newIntermediateCrt, err := x509.ParseCertificate(newIntermediateBytes)
+			newIntermediateCert, err := x509.ParseCertificate(newIntermediateBytes)
 			assert.FatalError(t, err)
 
 			_a := testAuthority(t)
-			_a.intermediateIdentity.Key = newIntermediateProfile.SubjectPrivateKey()
-			_a.intermediateIdentity.Crt = newIntermediateCrt
+			_a.x509Signer = newIntermediateProfile.SubjectPrivateKey().(crypto.Signer)
+			_a.x509Issuer = newIntermediateCert
 			return &renewTest{
 				auth: _a,
-				crt:  crt,
+				cert: cert,
 			}, nil
 		},
 	}
@@ -453,32 +503,35 @@ func TestRenew(t *testing.T) {
 			tc, err := genTestCase()
 			assert.FatalError(t, err)
 
-			var leaf, intermediate *x509.Certificate
+			var certChain []*x509.Certificate
 			if tc.auth != nil {
-				leaf, intermediate, err = tc.auth.Renew(tc.crt)
+				certChain, err = tc.auth.Renew(tc.cert)
 			} else {
-				leaf, intermediate, err = a.Renew(tc.crt)
+				certChain, err = a.Renew(tc.cert)
 			}
 			if err != nil {
-				if assert.NotNil(t, tc.err) {
-					switch v := err.(type) {
-					case *apiError:
-						assert.HasPrefix(t, v.err.Error(), tc.err.Error())
-						assert.Equals(t, v.code, tc.err.code)
-						assert.Equals(t, v.context, tc.err.context)
-					default:
-						t.Errorf("unexpected error type: %T", v)
-					}
+				if assert.NotNil(t, tc.err, fmt.Sprintf("unexpected error: %s", err)) {
+					assert.Nil(t, certChain)
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tc.code)
+					assert.HasPrefix(t, err.Error(), tc.err.Error())
+
+					ctxErr, ok := err.(*errs.Error)
+					assert.Fatal(t, ok, "error is not of type *errs.Error")
+					assert.Equals(t, ctxErr.Details["serialNumber"], tc.cert.SerialNumber.String())
 				}
 			} else {
+				leaf := certChain[0]
+				intermediate := certChain[1]
 				if assert.Nil(t, tc.err) {
-					assert.Equals(t, leaf.NotAfter.Sub(leaf.NotBefore), tc.crt.NotAfter.Sub(crt.NotBefore))
+					assert.Equals(t, leaf.NotAfter.Sub(leaf.NotBefore), tc.cert.NotAfter.Sub(cert.NotBefore))
 
-					assert.True(t, leaf.NotBefore.After(now.Add(-time.Minute)))
+					assert.True(t, leaf.NotBefore.After(now.Add(-2*time.Minute)))
 					assert.True(t, leaf.NotBefore.Before(now.Add(time.Minute)))
 
 					expiry := now.Add(time.Minute * 7)
-					assert.True(t, leaf.NotAfter.After(expiry.Add(-time.Minute)))
+					assert.True(t, leaf.NotAfter.After(expiry.Add(-2*time.Minute)))
 					assert.True(t, leaf.NotAfter.Before(expiry.Add(time.Minute)))
 
 					tmplt := a.config.AuthorityConfig.Template
@@ -505,10 +558,10 @@ func TestRenew(t *testing.T) {
 					assert.Equals(t, leaf.SubjectKeyId, hash[:])
 
 					// We did not change the intermediate before renewing.
-					if a.intermediateIdentity.Crt.SerialNumber == tc.auth.intermediateIdentity.Crt.SerialNumber {
-						assert.Equals(t, leaf.AuthorityKeyId, a.intermediateIdentity.Crt.SubjectKeyId)
+					if a.x509Issuer.SerialNumber == tc.auth.x509Issuer.SerialNumber {
+						assert.Equals(t, leaf.AuthorityKeyId, a.x509Issuer.SubjectKeyId)
 						// Compare extensions: they can be in a different order
-						for _, ext1 := range tc.crt.Extensions {
+						for _, ext1 := range tc.cert.Extensions {
 							found := false
 							for _, ext2 := range leaf.Extensions {
 								if reflect.DeepEqual(ext1, ext2) {
@@ -522,9 +575,9 @@ func TestRenew(t *testing.T) {
 						}
 					} else {
 						// We did change the intermediate before renewing.
-						assert.Equals(t, leaf.AuthorityKeyId, tc.auth.intermediateIdentity.Crt.SubjectKeyId)
+						assert.Equals(t, leaf.AuthorityKeyId, tc.auth.x509Issuer.SubjectKeyId)
 						// Compare extensions: they can be in a different order
-						for _, ext1 := range tc.crt.Extensions {
+						for _, ext1 := range tc.cert.Extensions {
 							// The authority key id extension should be different b/c the intermediates are different.
 							if ext1.Id.Equal(oidAuthorityKeyIdentifier) {
 								for _, ext2 := range leaf.Extensions {
@@ -546,7 +599,7 @@ func TestRenew(t *testing.T) {
 						}
 					}
 
-					realIntermediate, err := x509.ParseCertificate(tc.auth.intermediateIdentity.Crt.Raw)
+					realIntermediate, err := x509.ParseCertificate(tc.auth.x509Issuer.Raw)
 					assert.FatalError(t, err)
 					assert.Equals(t, intermediate, realIntermediate)
 				}
@@ -555,7 +608,7 @@ func TestRenew(t *testing.T) {
 	}
 }
 
-func TestGetTLSOptions(t *testing.T) {
+func TestAuthority_GetTLSOptions(t *testing.T) {
 	type renewTest struct {
 		auth *Authority
 		opts *tlsutil.TLSOptions
@@ -591,21 +644,12 @@ func TestGetTLSOptions(t *testing.T) {
 	}
 }
 
-func TestRevoke(t *testing.T) {
+func TestAuthority_Revoke(t *testing.T) {
 	reasonCode := 2
 	reason := "bob was let go"
 	validIssuer := "step-cli"
-	validAudience := []string{"https://test.ca.smallstep.com/revoke"}
+	validAudience := testAudiences.Revoke
 	now := time.Now().UTC()
-	getCtx := func() map[string]interface{} {
-		return apiCtx{
-			"serialNumber": "sn",
-			"reasonCode":   reasonCode,
-			"reason":       reason,
-			"mTLS":         false,
-			"passiveOnly":  false,
-		}
-	}
 
 	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
@@ -614,30 +658,30 @@ func TestRevoke(t *testing.T) {
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", jwk.KeyID))
 	assert.FatalError(t, err)
 
+	a := testAuthority(t)
+
 	type test struct {
-		a    *Authority
-		opts *RevokeOptions
-		err  *apiError
+		auth            *Authority
+		opts            *RevokeOptions
+		err             error
+		code            int
+		checkErrDetails func(err *errs.Error)
 	}
 	tests := map[string]func() test{
-		"error/token/authorizeRevoke error": func() test {
-			a := testAuthority(t)
-			ctx := getCtx()
-			ctx["ott"] = "foo"
+		"fail/token/authorizeRevoke error": func() test {
 			return test{
-				a: a,
+				auth: a,
 				opts: &RevokeOptions{
 					OTT:        "foo",
 					Serial:     "sn",
 					ReasonCode: reasonCode,
 					Reason:     reason,
 				},
-				err: &apiError{errors.New("revoke: authorizeRevoke: authorizeToken: error parsing token"),
-					http.StatusUnauthorized, ctx},
+				err:  errors.New("authority.Revoke; error parsing token"),
+				code: http.StatusUnauthorized,
 			}
 		},
-		"error/nil-db": func() test {
-			a := testAuthority(t)
+		"fail/nil-db": func() test {
 			cl := jwt.Claims{
 				Subject:   "sn",
 				Issuer:    validIssuer,
@@ -649,30 +693,30 @@ func TestRevoke(t *testing.T) {
 			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 
-			ctx := getCtx()
-			ctx["ott"] = raw
-			ctx["tokenID"] = "44"
-			ctx["provisionerID"] = "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc"
 			return test{
-				a: a,
+				auth: a,
 				opts: &RevokeOptions{
 					Serial:     "sn",
 					ReasonCode: reasonCode,
 					Reason:     reason,
 					OTT:        raw,
 				},
-				err: &apiError{errors.New("revoke: no persistence layer configured"),
-					http.StatusNotImplemented, ctx},
+				err:  errors.New("authority.Revoke; no persistence layer configured"),
+				code: http.StatusNotImplemented,
+				checkErrDetails: func(err *errs.Error) {
+					assert.Equals(t, err.Details["token"], raw)
+					assert.Equals(t, err.Details["tokenID"], "44")
+					assert.Equals(t, err.Details["provisionerID"], "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc")
+				},
 			}
 		},
-		"error/db-revoke": func() test {
-			a := testAuthority(t)
-			a.db = &MockAuthDB{
-				useToken: func(id, tok string) (bool, error) {
+		"fail/db-revoke": func() test {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
 					return true, nil
 				},
-				err: errors.New("force"),
-			}
+				Err: errors.New("force"),
+			}))
 
 			cl := jwt.Claims{
 				Subject:   "sn",
@@ -685,30 +729,30 @@ func TestRevoke(t *testing.T) {
 			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 
-			ctx := getCtx()
-			ctx["ott"] = raw
-			ctx["tokenID"] = "44"
-			ctx["provisionerID"] = "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc"
 			return test{
-				a: a,
+				auth: _a,
 				opts: &RevokeOptions{
 					Serial:     "sn",
 					ReasonCode: reasonCode,
 					Reason:     reason,
 					OTT:        raw,
 				},
-				err: &apiError{errors.New("force"),
-					http.StatusInternalServerError, ctx},
+				err:  errors.New("authority.Revoke: force"),
+				code: http.StatusInternalServerError,
+				checkErrDetails: func(err *errs.Error) {
+					assert.Equals(t, err.Details["token"], raw)
+					assert.Equals(t, err.Details["tokenID"], "44")
+					assert.Equals(t, err.Details["provisionerID"], "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc")
+				},
 			}
 		},
-		"error/already-revoked": func() test {
-			a := testAuthority(t)
-			a.db = &MockAuthDB{
-				useToken: func(id, tok string) (bool, error) {
+		"fail/already-revoked": func() test {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
 					return true, nil
 				},
-				err: db.ErrAlreadyExists,
-			}
+				Err: db.ErrAlreadyExists,
+			}))
 
 			cl := jwt.Claims{
 				Subject:   "sn",
@@ -721,29 +765,29 @@ func TestRevoke(t *testing.T) {
 			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 
-			ctx := getCtx()
-			ctx["ott"] = raw
-			ctx["tokenID"] = "44"
-			ctx["provisionerID"] = "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc"
 			return test{
-				a: a,
+				auth: _a,
 				opts: &RevokeOptions{
 					Serial:     "sn",
 					ReasonCode: reasonCode,
 					Reason:     reason,
 					OTT:        raw,
 				},
-				err: &apiError{errors.New("revoke: certificate with serial number sn has already been revoked"),
-					http.StatusBadRequest, ctx},
+				err:  errors.New("authority.Revoke; certificate with serial number sn has already been revoked"),
+				code: http.StatusBadRequest,
+				checkErrDetails: func(err *errs.Error) {
+					assert.Equals(t, err.Details["token"], raw)
+					assert.Equals(t, err.Details["tokenID"], "44")
+					assert.Equals(t, err.Details["provisionerID"], "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc")
+				},
 			}
 		},
 		"ok/token": func() test {
-			a := testAuthority(t)
-			a.db = &MockAuthDB{
-				useToken: func(id, tok string) (bool, error) {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
 					return true, nil
 				},
-			}
+			}))
 
 			cl := jwt.Claims{
 				Subject:   "sn",
@@ -756,7 +800,7 @@ func TestRevoke(t *testing.T) {
 			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return test{
-				a: a,
+				auth: _a,
 				opts: &RevokeOptions{
 					Serial:     "sn",
 					ReasonCode: reasonCode,
@@ -765,39 +809,14 @@ func TestRevoke(t *testing.T) {
 				},
 			}
 		},
-		"error/mTLS/authorizeRevoke": func() test {
-			a := testAuthority(t)
-			a.db = &MockAuthDB{}
-
-			crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
-			assert.FatalError(t, err)
-
-			ctx := getCtx()
-			ctx["certificate"] = base64.StdEncoding.EncodeToString(crt.Raw)
-			ctx["mTLS"] = true
-
-			return test{
-				a: a,
-				opts: &RevokeOptions{
-					Crt:        crt,
-					Serial:     "sn",
-					ReasonCode: reasonCode,
-					Reason:     reason,
-					MTLS:       true,
-				},
-				err: &apiError{errors.New("revoke: authorizeRevoke: serial number in certificate different than body"),
-					http.StatusUnauthorized, ctx},
-			}
-		},
 		"ok/mTLS": func() test {
-			a := testAuthority(t)
-			a.db = &MockAuthDB{}
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{}))
 
 			crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
 			assert.FatalError(t, err)
 
 			return test{
-				a: a,
+				auth: _a,
 				opts: &RevokeOptions{
 					Crt:        crt,
 					Serial:     "102012593071130646873265215610956555026",
@@ -811,15 +830,24 @@ func TestRevoke(t *testing.T) {
 	for name, f := range tests {
 		tc := f()
 		t.Run(name, func(t *testing.T) {
-			if err := tc.a.Revoke(tc.opts); err != nil {
-				if assert.NotNil(t, tc.err) {
-					switch v := err.(type) {
-					case *apiError:
-						assert.HasPrefix(t, v.err.Error(), tc.err.Error())
-						assert.Equals(t, v.code, tc.err.code)
-						assert.Equals(t, v.context, tc.err.context)
-					default:
-						t.Errorf("unexpected error type: %T", v)
+			ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.RevokeMethod)
+			if err := tc.auth.Revoke(ctx, tc.opts); err != nil {
+				if assert.NotNil(t, tc.err, fmt.Sprintf("unexpected error: %s", err)) {
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tc.code)
+					assert.HasPrefix(t, err.Error(), tc.err.Error())
+
+					ctxErr, ok := err.(*errs.Error)
+					assert.Fatal(t, ok, "error is not of type *errs.Error")
+					assert.Equals(t, ctxErr.Details["serialNumber"], tc.opts.Serial)
+					assert.Equals(t, ctxErr.Details["reasonCode"], tc.opts.ReasonCode)
+					assert.Equals(t, ctxErr.Details["reason"], tc.opts.Reason)
+					assert.Equals(t, ctxErr.Details["MTLS"], tc.opts.MTLS)
+					assert.Equals(t, ctxErr.Details["context"], string(provisioner.RevokeMethod))
+
+					if tc.checkErrDetails != nil {
+						tc.checkErrDetails(ctxErr)
 					}
 				}
 			} else {

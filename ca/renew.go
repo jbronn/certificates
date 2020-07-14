@@ -51,6 +51,7 @@ func NewTLSRenewer(cert *tls.Certificate, fn RenewFunc, opts ...tlsRenewerOption
 	r := &TLSRenewer{
 		RenewCertificate: fn,
 		cert:             cert,
+		certNotAfter:     cert.Leaf.NotAfter.Add(-1 * time.Minute),
 	}
 
 	for _, f := range opts {
@@ -80,7 +81,9 @@ func NewTLSRenewer(cert *tls.Certificate, fn RenewFunc, opts ...tlsRenewerOption
 func (r *TLSRenewer) Run() {
 	cert := r.getCertificate()
 	next := r.nextRenewDuration(cert.Leaf.NotAfter)
+	r.Lock()
 	r.timer = time.AfterFunc(next, r.renewCertificate)
+	r.Unlock()
 }
 
 // RunContext starts the certificate renewer for the given certificate.
@@ -178,7 +181,7 @@ func (r *TLSRenewer) renewCertificate() {
 }
 
 func (r *TLSRenewer) nextRenewDuration(notAfter time.Time) time.Duration {
-	d := notAfter.Sub(time.Now()) - r.renewBefore
+	d := time.Until(notAfter) - r.renewBefore
 	n := rand.Int63n(int64(r.renewJitter))
 	d -= time.Duration(n)
 	if d < 0 {

@@ -10,19 +10,43 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/crypto/randutil"
 	"github.com/smallstep/cli/jose"
+	"golang.org/x/crypto/ssh"
 )
 
-var testAudiences = Audiences{
-	Sign:   []string{"https://ca.smallstep.com/sign", "https://ca.smallstep.com/1.0/sign"},
-	Revoke: []string{"https://ca.smallstep.com/revoke", "https://ca.smallstep.com/1.0/revoke"},
-}
+var (
+	defaultDisableRenewal   = false
+	defaultEnableSSHCA      = true
+	globalProvisionerClaims = Claims{
+		MinTLSDur:         &Duration{5 * time.Minute},
+		MaxTLSDur:         &Duration{24 * time.Hour},
+		DefaultTLSDur:     &Duration{24 * time.Hour},
+		DisableRenewal:    &defaultDisableRenewal,
+		MinUserSSHDur:     &Duration{Duration: 5 * time.Minute}, // User SSH certs
+		MaxUserSSHDur:     &Duration{Duration: 24 * time.Hour},
+		DefaultUserSSHDur: &Duration{Duration: 16 * time.Hour},
+		MinHostSSHDur:     &Duration{Duration: 5 * time.Minute}, // Host SSH certs
+		MaxHostSSHDur:     &Duration{Duration: 30 * 24 * time.Hour},
+		DefaultHostSSHDur: &Duration{Duration: 30 * 24 * time.Hour},
+		EnableSSHCA:       &defaultEnableSSHCA,
+	}
+	testAudiences = Audiences{
+		Sign:      []string{"https://ca.smallstep.com/1.0/sign", "https://ca.smallstep.com/sign"},
+		Revoke:    []string{"https://ca.smallstep.com/1.0/revoke", "https://ca.smallstep.com/revoke"},
+		SSHSign:   []string{"https://ca.smallstep.com/1.0/ssh/sign"},
+		SSHRevoke: []string{"https://ca.smallstep.com/1.0/ssh/revoke"},
+		SSHRenew:  []string{"https://ca.smallstep.com/1.0/ssh/renew"},
+		SSHRekey:  []string{"https://ca.smallstep.com/1.0/ssh/rekey"},
+	}
+)
 
 const awsTestCertificate = `-----BEGIN CERTIFICATE-----
 MIICFTCCAX6gAwIBAgIRAKmbVVYAl/1XEqRfF3eJ97MwDQYJKoZIhvcNAQELBQAw
@@ -159,6 +183,135 @@ func generateJWK() (*JWK, error) {
 		Claims:       &globalProvisionerClaims,
 		audiences:    testAudiences,
 		claimer:      claimer,
+	}, nil
+}
+
+func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
+	fooPubB, err := ioutil.ReadFile("./testdata/certs/foo.pub")
+	if err != nil {
+		return nil, err
+	}
+	fooPub, err := pemutil.ParseKey(fooPubB)
+	if err != nil {
+		return nil, err
+	}
+	barPubB, err := ioutil.ReadFile("./testdata/certs/bar.pub")
+	if err != nil {
+		return nil, err
+	}
+	barPub, err := pemutil.ParseKey(barPubB)
+	if err != nil {
+		return nil, err
+	}
+
+	claimer, err := NewClaimer(nil, globalProvisionerClaims)
+	if err != nil {
+		return nil, err
+	}
+	pubKeys := []interface{}{fooPub, barPub}
+	if inputPubKey != nil {
+		pubKeys = append(pubKeys, inputPubKey)
+	}
+
+	return &K8sSA{
+		Name:      K8sSAName,
+		Type:      "K8sSA",
+		Claims:    &globalProvisionerClaims,
+		audiences: testAudiences,
+		claimer:   claimer,
+		pubKeys:   pubKeys,
+	}, nil
+}
+
+func generateSSHPOP() (*SSHPOP, error) {
+	name, err := randutil.Alphanumeric(10)
+	if err != nil {
+		return nil, err
+	}
+	claimer, err := NewClaimer(nil, globalProvisionerClaims)
+	if err != nil {
+		return nil, err
+	}
+
+	userB, err := ioutil.ReadFile("./testdata/certs/ssh_user_ca_key.pub")
+	if err != nil {
+		return nil, err
+	}
+	userKey, _, _, _, err := ssh.ParseAuthorizedKey(userB)
+	if err != nil {
+		return nil, err
+	}
+	hostB, err := ioutil.ReadFile("./testdata/certs/ssh_host_ca_key.pub")
+	if err != nil {
+		return nil, err
+	}
+	hostKey, _, _, _, err := ssh.ParseAuthorizedKey(hostB)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SSHPOP{
+		Name:      name,
+		Type:      "SSHPOP",
+		Claims:    &globalProvisionerClaims,
+		audiences: testAudiences,
+		claimer:   claimer,
+		sshPubKeys: &SSHKeys{
+			UserKeys: []ssh.PublicKey{userKey},
+			HostKeys: []ssh.PublicKey{hostKey},
+		},
+	}, nil
+}
+
+func generateX5C(root []byte) (*X5C, error) {
+	if root == nil {
+		root = []byte(`-----BEGIN CERTIFICATE-----
+MIIBhTCCASqgAwIBAgIRAMalM7pKi0GCdKjO6u88OyowCgYIKoZIzj0EAwIwFDES
+MBAGA1UEAxMJcm9vdC10ZXN0MCAXDTE5MTAwMjAyMzk0OFoYDzIxMTkwOTA4MDIz
+OTQ4WjAUMRIwEAYDVQQDEwlyb290LXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB
+BwNCAAS29QTCXUu7cx9sa9wZPpRSFq/zXaw8Ai3EIygayrBsKnX42U2atBUjcBZO
+BWL6A+PpLzU9ja867U5SYNHERS+Oo1swWTAOBgNVHQ8BAf8EBAMCAQYwEgYDVR0T
+AQH/BAgwBgEB/wIBATAdBgNVHQ4EFgQUpHS7FfaQ5bCrTxUeu6R2ZC3VGOowFAYD
+VR0RBA0wC4IJcm9vdC10ZXN0MAoGCCqGSM49BAMCA0kAMEYCIQC2vgqwla0u8LHH
+1MHob14qvS5o76HautbIBW7fcHzz5gIhAIx5A2+wkJYX4026kqaZCk/1sAwTxSGY
+M46l92gdOozT
+-----END CERTIFICATE-----`)
+	}
+
+	name, err := randutil.Alphanumeric(10)
+	if err != nil {
+		return nil, err
+	}
+	claimer, err := NewClaimer(nil, globalProvisionerClaims)
+	if err != nil {
+		return nil, err
+	}
+
+	rootPool := x509.NewCertPool()
+
+	var (
+		block *pem.Block
+		rest  = root
+	)
+	for rest != nil {
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing x509 certificate from PEM block")
+		}
+		rootPool.AddCert(cert)
+	}
+	return &X5C{
+		Name:      name,
+		Type:      "X5C",
+		Roots:     root,
+		Claims:    &globalProvisionerClaims,
+		audiences: testAudiences,
+		claimer:   claimer,
+		rootPool:  rootPool,
 	}, nil
 }
 
@@ -446,11 +599,38 @@ func generateSimpleToken(iss, aud string, jwk *jose.JSONWebKey) (string, error) 
 	return generateToken("subject", iss, aud, "name@smallstep.com", []string{"test.smallstep.com"}, time.Now(), jwk)
 }
 
-func generateToken(sub, iss, aud string, email string, sans []string, iat time.Time, jwk *jose.JSONWebKey) (string, error) {
-	sig, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
-		new(jose.SignerOptions).WithType("JWT").WithHeader("kid", jwk.KeyID),
-	)
+type tokOption func(*jose.SignerOptions) error
+
+func withX5CHdr(certs []*x509.Certificate) tokOption {
+	return func(so *jose.SignerOptions) error {
+		strs := make([]string, len(certs))
+		for i, cert := range certs {
+			strs[i] = base64.StdEncoding.EncodeToString(cert.Raw)
+		}
+		so.WithHeader("x5c", strs)
+		return nil
+	}
+}
+
+func withSSHPOPFile(cert *ssh.Certificate) tokOption {
+	return func(so *jose.SignerOptions) error {
+		so.WithHeader("sshpop", base64.StdEncoding.EncodeToString(cert.Marshal()))
+		return nil
+	}
+}
+
+func generateToken(sub, iss, aud string, email string, sans []string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for _, o := range tokOpts {
+		if err := o(so); err != nil {
+			return "", err
+		}
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
 	if err != nil {
 		return "", err
 	}
@@ -478,6 +658,58 @@ func generateToken(sub, iss, aud string, email string, sans []string, iat time.T
 		SANS:  sans,
 	}
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
+}
+
+func generateX5CSSHToken(jwk *jose.JSONWebKey, claims *x5cPayload, tokOpts ...tokOption) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for _, o := range tokOpts {
+		if err := o(so); err != nil {
+			return "", err
+		}
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+	return jose.Signed(sig).Claims(claims).CompactSerialize()
+}
+
+func getK8sSAPayload() *k8sSAPayload {
+	return &k8sSAPayload{
+		Claims: jose.Claims{
+			Issuer:  k8sSAIssuer,
+			Subject: "foo",
+		},
+		Namespace:          "ns-foo",
+		SecretName:         "sn-foo",
+		ServiceAccountName: "san-foo",
+		ServiceAccountUID:  "sauid-foo",
+	}
+}
+
+func generateK8sSAToken(jwk *jose.JSONWebKey, claims *k8sSAPayload, tokOpts ...tokOption) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithHeader("kid", jwk.KeyID)
+
+	for _, o := range tokOpts {
+		if err := o(so); err != nil {
+			return "", err
+		}
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+
+	if claims == nil {
+		claims = getK8sSAPayload()
+	}
+	return jose.Signed(sig).Claims(*claims).CompactSerialize()
 }
 
 func generateSimpleSSHUserToken(iss, aud string, jwk *jose.JSONWebKey) (string, error) {
@@ -711,6 +943,8 @@ func generateJWKServer(n int) *httptest.Server {
 			writeJSON(w, hits)
 		case "/.well-known/openid-configuration":
 			writeJSON(w, openIDConfiguration{Issuer: "the-issuer", JWKSetURI: srv.URL + "/jwks_uri"})
+		case "/common/.well-known/openid-configuration":
+			writeJSON(w, openIDConfiguration{Issuer: "https://login.microsoftonline.com/{tenantid}/v2.0", JWKSetURI: srv.URL + "/jwks_uri"})
 		case "/random":
 			keySet := must(generateJSONWebKeySet(n))[0].(jose.JSONWebKeySet)
 			w.Header().Add("Cache-Control", "max-age=5")
@@ -741,4 +975,25 @@ func generateACME() (*ACME, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+func parseCerts(b []byte) ([]*x509.Certificate, error) {
+	var (
+		block *pem.Block
+		rest  = b
+		certs = []*x509.Certificate{}
+	)
+	for rest != nil {
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing x509 certificate from PEM block")
+		}
+
+		certs = append(certs, cert)
+	}
+	return certs, nil
 }

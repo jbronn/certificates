@@ -42,12 +42,30 @@ more info).  Below are a few examples for supported databases:
   "key": ".step/secrets/intermediate_ca_key",
   "db": {
     "type": "badger",
-    "dataSource": "./stepdb",
-    "valueDir": "./steplogdb"   # leave empty if equivalent to dataSource
+    "dataSource": "./.step/db",
+    "valueDir": "./.step/valuedb"
+    "badgerFileLoadingMode": "MemoryMap"
   },
   ...
 },
 ```
+
+#### Options
+
+* `type`
+    * `badger` - currently refers to Badger V1. However, as Badger V1 is deprecated,
+    this will refer to Badger V2 starting with a the next major version release.
+    * `badgerV1` - explicitly select Badger V1.
+    * `badgerV2` - explicitly select Badger V2. Anyone looking to use Badger V2
+    will need to set it explicitly until it becomes the default.
+* `dataSource` - path, database directory.
+* `valueDir` [optional] - path, value directory, only if different from `dataSource`.
+* `badgerFileLoadingMode` [optional] - can be set to `FileIO` (instead of the default
+        `MemoryMap`) to avoid memory-mapping log files. This can be
+        useful in environments with low RAM. Make sure to use `badgerV2` as the
+        database `type` if using this option.
+    * `MemoryMap` - default.
+    * `FileIO` - This can be useful in environments with low RAM.
 
 ### BoltDB
 

@@ -5,7 +5,6 @@ import (
 	"crypto/dsa"
 	"crypto/ecdsa"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
@@ -21,6 +20,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
 	"github.com/smallstep/cli/crypto/tlsutil"
 )
@@ -33,15 +33,16 @@ type Authority interface {
 	AuthorizeSign(ott string) ([]provisioner.SignOption, error)
 	GetTLSOptions() *tlsutil.TLSOptions
 	Root(shasum string) (*x509.Certificate, error)
-	Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) (*x509.Certificate, *x509.Certificate, error)
-	Renew(peer *x509.Certificate) (*x509.Certificate, *x509.Certificate, error)
+	Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
+	Renew(peer *x509.Certificate) ([]*x509.Certificate, error)
 	LoadProvisionerByCertificate(*x509.Certificate) (provisioner.Interface, error)
 	LoadProvisionerByID(string) (provisioner.Interface, error)
 	GetProvisioners(cursor string, limit int) (provisioner.List, string, error)
-	Revoke(*authority.RevokeOptions) error
+	Revoke(context.Context, *authority.RevokeOptions) error
 	GetEncryptedKey(kid string) (string, error)
 	GetRoots() (federation []*x509.Certificate, err error)
 	GetFederation() ([]*x509.Certificate, error)
+	Version() authority.Version
 }
 
 // TimeDuration is an alias of provisioner.TimeDuration
@@ -71,6 +72,13 @@ func NewCertificate(cr *x509.Certificate) Certificate {
 	}
 }
 
+// reset sets the inner x509.CertificateRequest to nil
+func (c *Certificate) reset() {
+	if c != nil {
+		c.Certificate = nil
+	}
+}
+
 // MarshalJSON implements the json.Marshaler interface. The certificate is
 // quoted string using the PEM encoding.
 func (c Certificate) MarshalJSON() ([]byte, error) {
@@ -91,6 +99,13 @@ func (c *Certificate) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return errors.Wrap(err, "error decoding certificate")
 	}
+
+	// Make sure the inner x509.Certificate is nil
+	if s == "null" || s == "" {
+		c.reset()
+		return nil
+	}
+
 	block, _ := pem.Decode([]byte(s))
 	if block == nil {
 		return errors.New("error decoding certificate")
@@ -117,6 +132,13 @@ func NewCertificateRequest(cr *x509.CertificateRequest) CertificateRequest {
 	}
 }
 
+// reset sets the inner x509.CertificateRequest to nil
+func (c *CertificateRequest) reset() {
+	if c != nil {
+		c.CertificateRequest = nil
+	}
+}
+
 // MarshalJSON implements the json.Marshaler interface. The certificate request
 // is a quoted string using the PEM encoding.
 func (c CertificateRequest) MarshalJSON() ([]byte, error) {
@@ -137,6 +159,13 @@ func (c *CertificateRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return errors.Wrap(err, "error decoding csr")
 	}
+
+	// Make sure the inner x509.CertificateRequest is nil
+	if s == "null" || s == "" {
+		c.reset()
+		return nil
+	}
+
 	block, _ := pem.Decode([]byte(s))
 	if block == nil {
 		return errors.New("error decoding csr")
@@ -162,6 +191,13 @@ type RouterHandler interface {
 	Route(r Router)
 }
 
+// VersionResponse is the response object that returns the version of the
+// server.
+type VersionResponse struct {
+	Version                     string `json:"version"`
+	RequireClientAuthentication bool   `json:"requireClientAuthentication,omitempty"`
+}
+
 // HealthResponse is the response object that returns the health of the server.
 type HealthResponse struct {
 	Status string `json:"status"`
@@ -170,14 +206,6 @@ type HealthResponse struct {
 // RootResponse is the response object that returns the PEM of a root certificate.
 type RootResponse struct {
 	RootPEM Certificate `json:"ca"`
-}
-
-// SignRequest is the request body for a certificate signature request.
-type SignRequest struct {
-	CsrPEM    CertificateRequest `json:"csr"`
-	OTT       string             `json:"ott"`
-	NotAfter  TimeDuration       `json:"notAfter"`
-	NotBefore TimeDuration       `json:"notBefore"`
 }
 
 // ProvisionersResponse is the response object that returns the list of
@@ -191,30 +219,6 @@ type ProvisionersResponse struct {
 // of a provisioner.
 type ProvisionerKeyResponse struct {
 	Key string `json:"key"`
-}
-
-// Validate checks the fields of the SignRequest and returns nil if they are ok
-// or an error if something is wrong.
-func (s *SignRequest) Validate() error {
-	if s.CsrPEM.CertificateRequest == nil {
-		return BadRequest(errors.New("missing csr"))
-	}
-	if err := s.CsrPEM.CertificateRequest.CheckSignature(); err != nil {
-		return BadRequest(errors.Wrap(err, "invalid csr"))
-	}
-	if s.OTT == "" {
-		return BadRequest(errors.New("missing ott"))
-	}
-
-	return nil
-}
-
-// SignResponse is the response object of the certificate signature request.
-type SignResponse struct {
-	ServerPEM  Certificate          `json:"crt"`
-	CaPEM      Certificate          `json:"ca"`
-	TLSOptions *tlsutil.TLSOptions  `json:"tlsOptions,omitempty"`
-	TLS        *tls.ConnectionState `json:"-"`
 }
 
 // RootsResponse is the response object of the roots request.
@@ -240,6 +244,7 @@ func New(authority Authority) RouterHandler {
 }
 
 func (h *caHandler) Route(r Router) {
+	r.MethodFunc("GET", "/version", h.Version)
 	r.MethodFunc("GET", "/health", h.Health)
 	r.MethodFunc("GET", "/root/{sha}", h.Root)
 	r.MethodFunc("POST", "/sign", h.Sign)
@@ -249,10 +254,32 @@ func (h *caHandler) Route(r Router) {
 	r.MethodFunc("GET", "/provisioners/{kid}/encrypted-key", h.ProvisionerKey)
 	r.MethodFunc("GET", "/roots", h.Roots)
 	r.MethodFunc("GET", "/federation", h.Federation)
+	// SSH CA
+	r.MethodFunc("POST", "/ssh/sign", h.SSHSign)
+	r.MethodFunc("POST", "/ssh/renew", h.SSHRenew)
+	r.MethodFunc("POST", "/ssh/revoke", h.SSHRevoke)
+	r.MethodFunc("POST", "/ssh/rekey", h.SSHRekey)
+	r.MethodFunc("GET", "/ssh/roots", h.SSHRoots)
+	r.MethodFunc("GET", "/ssh/federation", h.SSHFederation)
+	r.MethodFunc("POST", "/ssh/config", h.SSHConfig)
+	r.MethodFunc("POST", "/ssh/config/{type}", h.SSHConfig)
+	r.MethodFunc("POST", "/ssh/check-host", h.SSHCheckHost)
+	r.MethodFunc("GET", "/ssh/hosts", h.SSHGetHosts)
+	r.MethodFunc("POST", "/ssh/bastion", h.SSHBastion)
+
 	// For compatibility with old code:
 	r.MethodFunc("POST", "/re-sign", h.Renew)
-	// SSH CA
-	r.MethodFunc("POST", "/sign-ssh", h.SignSSH)
+	r.MethodFunc("POST", "/sign-ssh", h.SSHSign)
+	r.MethodFunc("GET", "/ssh/get-hosts", h.SSHGetHosts)
+}
+
+// Version is an HTTP handler that returns the version of the server.
+func (h *caHandler) Version(w http.ResponseWriter, r *http.Request) {
+	v := h.Authority.Version()
+	JSON(w, VersionResponse{
+		Version:                     v.Version,
+		RequireClientAuthentication: v.RequireClientAuthentication,
+	})
 }
 
 // Health is an HTTP handler that returns the status of the server.
@@ -268,87 +295,32 @@ func (h *caHandler) Root(w http.ResponseWriter, r *http.Request) {
 	// Load root certificate with the
 	cert, err := h.Authority.Root(sum)
 	if err != nil {
-		WriteError(w, NotFound(errors.Wrapf(err, "%s was not found", r.RequestURI)))
+		WriteError(w, errs.Wrapf(http.StatusNotFound, err, "%s was not found", r.RequestURI))
 		return
 	}
 
 	JSON(w, &RootResponse{RootPEM: Certificate{cert}})
 }
 
-// Sign is an HTTP handler that reads a certificate request and an
-// one-time-token (ott) from the body and creates a new certificate with the
-// information in the certificate request.
-func (h *caHandler) Sign(w http.ResponseWriter, r *http.Request) {
-	var body SignRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, BadRequest(errors.Wrap(err, "error reading request body")))
-		return
+func certChainToPEM(certChain []*x509.Certificate) []Certificate {
+	certChainPEM := make([]Certificate, 0, len(certChain))
+	for _, c := range certChain {
+		certChainPEM = append(certChainPEM, Certificate{c})
 	}
-
-	logOtt(w, body.OTT)
-	if err := body.Validate(); err != nil {
-		WriteError(w, err)
-		return
-	}
-
-	opts := provisioner.Options{
-		NotBefore: body.NotBefore,
-		NotAfter:  body.NotAfter,
-	}
-
-	signOpts, err := h.Authority.AuthorizeSign(body.OTT)
-	if err != nil {
-		WriteError(w, Unauthorized(err))
-		return
-	}
-
-	cert, root, err := h.Authority.Sign(body.CsrPEM.CertificateRequest, opts, signOpts...)
-	if err != nil {
-		WriteError(w, Forbidden(err))
-		return
-	}
-
-	logCertificate(w, cert)
-	JSONStatus(w, &SignResponse{
-		ServerPEM:  Certificate{cert},
-		CaPEM:      Certificate{root},
-		TLSOptions: h.Authority.GetTLSOptions(),
-	}, http.StatusCreated)
-}
-
-// Renew uses the information of certificate in the TLS connection to create a
-// new one.
-func (h *caHandler) Renew(w http.ResponseWriter, r *http.Request) {
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		WriteError(w, BadRequest(errors.New("missing peer certificate")))
-		return
-	}
-
-	cert, root, err := h.Authority.Renew(r.TLS.PeerCertificates[0])
-	if err != nil {
-		WriteError(w, Forbidden(err))
-		return
-	}
-
-	logCertificate(w, cert)
-	JSONStatus(w, &SignResponse{
-		ServerPEM:  Certificate{cert},
-		CaPEM:      Certificate{root},
-		TLSOptions: h.Authority.GetTLSOptions(),
-	}, http.StatusCreated)
+	return certChainPEM
 }
 
 // Provisioners returns the list of provisioners configured in the authority.
 func (h *caHandler) Provisioners(w http.ResponseWriter, r *http.Request) {
 	cursor, limit, err := parseCursor(r)
 	if err != nil {
-		WriteError(w, BadRequest(err))
+		WriteError(w, errs.BadRequestErr(err))
 		return
 	}
 
 	p, next, err := h.Authority.GetProvisioners(cursor, limit)
 	if err != nil {
-		WriteError(w, InternalServerError(err))
+		WriteError(w, errs.InternalServerErr(err))
 		return
 	}
 	JSON(w, &ProvisionersResponse{
@@ -362,7 +334,7 @@ func (h *caHandler) ProvisionerKey(w http.ResponseWriter, r *http.Request) {
 	kid := chi.URLParam(r, "kid")
 	key, err := h.Authority.GetEncryptedKey(kid)
 	if err != nil {
-		WriteError(w, NotFound(err))
+		WriteError(w, errs.NotFoundErr(err))
 		return
 	}
 	JSON(w, &ProvisionerKeyResponse{key})
@@ -372,7 +344,7 @@ func (h *caHandler) ProvisionerKey(w http.ResponseWriter, r *http.Request) {
 func (h *caHandler) Roots(w http.ResponseWriter, r *http.Request) {
 	roots, err := h.Authority.GetRoots()
 	if err != nil {
-		WriteError(w, Forbidden(err))
+		WriteError(w, errs.ForbiddenErr(err))
 		return
 	}
 
@@ -390,7 +362,7 @@ func (h *caHandler) Roots(w http.ResponseWriter, r *http.Request) {
 func (h *caHandler) Federation(w http.ResponseWriter, r *http.Request) {
 	federated, err := h.Authority.GetFederation()
 	if err != nil {
-		WriteError(w, Forbidden(err))
+		WriteError(w, errs.ForbiddenErr(err))
 		return
 	}
 

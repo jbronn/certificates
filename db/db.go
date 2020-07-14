@@ -3,17 +3,25 @@ package db
 import (
 	"crypto/x509"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/nosql"
 	"github.com/smallstep/nosql/database"
+	"golang.org/x/crypto/ssh"
 )
 
 var (
-	certsTable        = []byte("x509_certs")
-	revokedCertsTable = []byte("revoked_x509_certs")
-	usedOTTTable      = []byte("used_ott")
+	certsTable             = []byte("x509_certs")
+	revokedCertsTable      = []byte("revoked_x509_certs")
+	revokedSSHCertsTable   = []byte("revoked_ssh_certs")
+	usedOTTTable           = []byte("used_ott")
+	sshCertsTable          = []byte("ssh_certs")
+	sshHostsTable          = []byte("ssh_hosts")
+	sshUsersTable          = []byte("ssh_users")
+	sshHostPrincipalsTable = []byte("ssh_host_principals")
 )
 
 // ErrAlreadyExists can be returned if the DB attempts to set a key that has
@@ -26,14 +34,24 @@ type Config struct {
 	DataSource string `json:"dataSource"`
 	ValueDir   string `json:"valueDir,omitempty"`
 	Database   string `json:"database,omitempty"`
+
+	// BadgerFileLoadingMode can be set to 'FileIO' (instead of the default
+	// 'MemoryMap') to avoid memory-mapping log files. This can be useful
+	// in environments with low RAM
+	BadgerFileLoadingMode string `json:"badgerFileLoadingMode"`
 }
 
 // AuthDB is an interface over an Authority DB client that implements a nosql.DB interface.
 type AuthDB interface {
 	IsRevoked(sn string) (bool, error)
+	IsSSHRevoked(sn string) (bool, error)
 	Revoke(rci *RevokedCertificateInfo) error
+	RevokeSSH(rci *RevokedCertificateInfo) error
 	StoreCertificate(crt *x509.Certificate) error
 	UseToken(id, tok string) (bool, error)
+	IsSSHHost(name string) (bool, error)
+	StoreSSHCertificate(crt *ssh.Certificate) error
+	GetSSHHostPrincipals() ([]string, error)
 	Shutdown() error
 }
 
@@ -49,13 +67,22 @@ func New(c *Config) (AuthDB, error) {
 		return newSimpleDB(c)
 	}
 
-	db, err := nosql.New(c.Type, c.DataSource, nosql.WithDatabase(c.Database),
-		nosql.WithValueDir(c.ValueDir))
+	opts := []nosql.Option{nosql.WithDatabase(c.Database),
+		nosql.WithValueDir(c.ValueDir)}
+	if len(c.BadgerFileLoadingMode) > 0 {
+		opts = append(opts, nosql.WithBadgerFileLoadingMode(c.BadgerFileLoadingMode))
+	}
+
+	db, err := nosql.New(c.Type, c.DataSource, opts...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Error opening database of Type %s with source %s", c.Type, c.DataSource)
 	}
 
-	tables := [][]byte{revokedCertsTable, certsTable, usedOTTTable}
+	tables := [][]byte{
+		revokedCertsTable, certsTable, usedOTTTable,
+		sshCertsTable, sshHostsTable, sshHostPrincipalsTable, sshUsersTable,
+		revokedSSHCertsTable,
+	}
 	for _, b := range tables {
 		if err := db.CreateTable(b); err != nil {
 			return nil, errors.Wrapf(err, "error creating table %s",
@@ -101,6 +128,29 @@ func (db *DB) IsRevoked(sn string) (bool, error) {
 	return true, nil
 }
 
+// IsSSHRevoked returns whether or not a certificate with the given identifier
+// has been revoked.
+// In the case of an X509 Certificate the `id` should be the Serial Number of
+// the Certificate.
+func (db *DB) IsSSHRevoked(sn string) (bool, error) {
+	// If the DB is nil then act as pass through.
+	if db == nil {
+		return false, nil
+	}
+
+	// If the error is `Not Found` then the certificate has not been revoked.
+	// Any other error should be propagated to the caller.
+	if _, err := db.Get(revokedSSHCertsTable, []byte(sn)); err != nil {
+		if nosql.IsErrNotFound(err) {
+			return false, nil
+		}
+		return false, errors.Wrap(err, "error checking revocation bucket")
+	}
+
+	// This certificate has been revoked.
+	return true, nil
+}
+
 // Revoke adds a certificate to the revocation table.
 func (db *DB) Revoke(rci *RevokedCertificateInfo) error {
 	rcib, err := json.Marshal(rci)
@@ -109,6 +159,24 @@ func (db *DB) Revoke(rci *RevokedCertificateInfo) error {
 	}
 
 	_, swapped, err := db.CmpAndSwap(revokedCertsTable, []byte(rci.Serial), nil, rcib)
+	switch {
+	case err != nil:
+		return errors.Wrap(err, "error AuthDB CmpAndSwap")
+	case !swapped:
+		return ErrAlreadyExists
+	default:
+		return nil
+	}
+}
+
+// RevokeSSH adds a SSH certificate to the revocation table.
+func (db *DB) RevokeSSH(rci *RevokedCertificateInfo) error {
+	rcib, err := json.Marshal(rci)
+	if err != nil {
+		return errors.Wrap(err, "error marshaling revoked certificate info")
+	}
+
+	_, swapped, err := db.CmpAndSwap(revokedSSHCertsTable, []byte(rci.Serial), nil, rcib)
 	switch {
 	case err != nil:
 		return errors.Wrap(err, "error AuthDB CmpAndSwap")
@@ -138,6 +206,69 @@ func (db *DB) UseToken(id, tok string) (bool, error) {
 	return swapped, nil
 }
 
+// IsSSHHost returns if a principal is present in the ssh hosts table.
+func (db *DB) IsSSHHost(principal string) (bool, error) {
+	if _, err := db.Get(sshHostsTable, []byte(strings.ToLower(principal))); err != nil {
+		if database.IsErrNotFound(err) {
+			return false, nil
+		}
+		return false, errors.Wrap(err, "database Get error")
+	}
+	return true, nil
+}
+
+type sshHostPrincipalData struct {
+	Serial string
+	Expiry uint64
+}
+
+// StoreSSHCertificate stores an SSH certificate.
+func (db *DB) StoreSSHCertificate(crt *ssh.Certificate) error {
+	serial := strconv.FormatUint(crt.Serial, 10)
+	tx := new(database.Tx)
+	tx.Set(sshCertsTable, []byte(serial), crt.Marshal())
+	if crt.CertType == ssh.HostCert {
+		for _, p := range crt.ValidPrincipals {
+			hostPrincipalData, err := json.Marshal(sshHostPrincipalData{
+				Serial: serial,
+				Expiry: crt.ValidBefore,
+			})
+			if err != nil {
+				return err
+			}
+			tx.Set(sshHostsTable, []byte(strings.ToLower(p)), []byte(serial))
+			tx.Set(sshHostPrincipalsTable, []byte(strings.ToLower(p)), hostPrincipalData)
+		}
+	} else {
+		for _, p := range crt.ValidPrincipals {
+			tx.Set(sshUsersTable, []byte(strings.ToLower(p)), []byte(serial))
+		}
+	}
+	if err := db.Update(tx); err != nil {
+		return errors.Wrap(err, "database Update error")
+	}
+	return nil
+}
+
+// GetSSHHostPrincipals gets a list of all valid host principals.
+func (db *DB) GetSSHHostPrincipals() ([]string, error) {
+	entries, err := db.List(sshHostPrincipalsTable)
+	if err != nil {
+		return nil, err
+	}
+	var principals []string
+	for _, e := range entries {
+		var data sshHostPrincipalData
+		if err := json.Unmarshal(e.Value, &data); err != nil {
+			return nil, err
+		}
+		if time.Unix(int64(data.Expiry), 0).After(time.Now()) {
+			principals = append(principals, string(e.Key))
+		}
+	}
+	return principals, nil
+}
+
 // Shutdown sends a shutdown message to the database.
 func (db *DB) Shutdown() error {
 	if db.isUp {
@@ -147,6 +278,105 @@ func (db *DB) Shutdown() error {
 		db.isUp = false
 	}
 	return nil
+}
+
+// MockAuthDB mocks the AuthDB interface. //
+type MockAuthDB struct {
+	Err                   error
+	Ret1                  interface{}
+	MIsRevoked            func(string) (bool, error)
+	MIsSSHRevoked         func(string) (bool, error)
+	MRevoke               func(rci *RevokedCertificateInfo) error
+	MRevokeSSH            func(rci *RevokedCertificateInfo) error
+	MStoreCertificate     func(crt *x509.Certificate) error
+	MUseToken             func(id, tok string) (bool, error)
+	MIsSSHHost            func(principal string) (bool, error)
+	MStoreSSHCertificate  func(crt *ssh.Certificate) error
+	MGetSSHHostPrincipals func() ([]string, error)
+	MShutdown             func() error
+}
+
+// IsRevoked mock.
+func (m *MockAuthDB) IsRevoked(sn string) (bool, error) {
+	if m.MIsRevoked != nil {
+		return m.MIsRevoked(sn)
+	}
+	return m.Ret1.(bool), m.Err
+}
+
+// IsSSHRevoked mock.
+func (m *MockAuthDB) IsSSHRevoked(sn string) (bool, error) {
+	if m.MIsSSHRevoked != nil {
+		return m.MIsSSHRevoked(sn)
+	}
+	return m.Ret1.(bool), m.Err
+}
+
+// UseToken mock.
+func (m *MockAuthDB) UseToken(id, tok string) (bool, error) {
+	if m.MUseToken != nil {
+		return m.MUseToken(id, tok)
+	}
+	if m.Ret1 == nil {
+		return false, m.Err
+	}
+	return m.Ret1.(bool), m.Err
+}
+
+// Revoke mock.
+func (m *MockAuthDB) Revoke(rci *RevokedCertificateInfo) error {
+	if m.MRevoke != nil {
+		return m.MRevoke(rci)
+	}
+	return m.Err
+}
+
+// RevokeSSH mock.
+func (m *MockAuthDB) RevokeSSH(rci *RevokedCertificateInfo) error {
+	if m.MRevokeSSH != nil {
+		return m.MRevokeSSH(rci)
+	}
+	return m.Err
+}
+
+// StoreCertificate mock.
+func (m *MockAuthDB) StoreCertificate(crt *x509.Certificate) error {
+	if m.MStoreCertificate != nil {
+		return m.MStoreCertificate(crt)
+	}
+	return m.Err
+}
+
+// IsSSHHost mock.
+func (m *MockAuthDB) IsSSHHost(principal string) (bool, error) {
+	if m.MIsSSHHost != nil {
+		return m.MIsSSHHost(principal)
+	}
+	return m.Ret1.(bool), m.Err
+}
+
+// StoreSSHCertificate mock.
+func (m *MockAuthDB) StoreSSHCertificate(crt *ssh.Certificate) error {
+	if m.MStoreSSHCertificate != nil {
+		return m.MStoreSSHCertificate(crt)
+	}
+	return m.Err
+}
+
+// GetSSHHostPrincipals mock.
+func (m *MockAuthDB) GetSSHHostPrincipals() ([]string, error) {
+	if m.MGetSSHHostPrincipals != nil {
+		return m.MGetSSHHostPrincipals()
+	}
+	return m.Ret1.([]string), m.Err
+}
+
+// Shutdown mock.
+func (m *MockAuthDB) Shutdown() error {
+	if m.MShutdown != nil {
+		return m.MShutdown()
+	}
+	return m.Err
 }
 
 // MockNoSQLDB //

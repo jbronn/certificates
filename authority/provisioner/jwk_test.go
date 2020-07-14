@@ -6,31 +6,15 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
+	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/cli/jose"
-)
-
-var (
-	defaultDisableRenewal   = false
-	defaultEnableSSHCA      = true
-	globalProvisionerClaims = Claims{
-		MinTLSDur:         &Duration{5 * time.Minute},
-		MaxTLSDur:         &Duration{24 * time.Hour},
-		DefaultTLSDur:     &Duration{24 * time.Hour},
-		DisableRenewal:    &defaultDisableRenewal,
-		MinUserSSHDur:     &Duration{Duration: 5 * time.Minute}, // User SSH certs
-		MaxUserSSHDur:     &Duration{Duration: 24 * time.Hour},
-		DefaultUserSSHDur: &Duration{Duration: 4 * time.Hour},
-		MinHostSSHDur:     &Duration{Duration: 5 * time.Minute}, // Host SSH certs
-		MaxHostSSHDur:     &Duration{Duration: 30 * 24 * time.Hour},
-		DefaultHostSSHDur: &Duration{Duration: 30 * 24 * time.Hour},
-		EnableSSHCA:       &defaultEnableSSHCA,
-	}
 )
 
 func TestJWK_Getters(t *testing.T) {
@@ -179,25 +163,29 @@ func TestJWK_authorizeToken(t *testing.T) {
 		name string
 		prov *JWK
 		args args
+		code int
 		err  error
 	}{
-		{"fail-token", p1, args{failTok}, errors.New("error parsing token")},
-		{"fail-key", p1, args{failKey}, errors.New("error parsing claims")},
-		{"fail-claims", p1, args{failClaims}, errors.New("error parsing claims")},
-		{"fail-signature", p1, args{failSig}, errors.New("error parsing claims: square/go-jose: error in cryptographic primitive")},
-		{"fail-issuer", p1, args{failIss}, errors.New("invalid token: square/go-jose/jwt: validation failed, invalid issuer claim (iss)")},
-		{"fail-expired", p1, args{failExp}, errors.New("invalid token: square/go-jose/jwt: validation failed, token is expired (exp)")},
-		{"fail-not-before", p1, args{failNbf}, errors.New("invalid token: square/go-jose/jwt: validation failed, token not valid yet (nbf)")},
-		{"fail-audience", p1, args{failAud}, errors.New("invalid token: invalid audience claim (aud)")},
-		{"fail-subject", p1, args{failSub}, errors.New("token subject cannot be empty")},
-		{"ok", p1, args{t1}, nil},
-		{"ok-no-encrypted-key", p2, args{t2}, nil},
-		{"ok-no-sans", p1, args{t3}, nil},
+		{"fail-token", p1, args{failTok}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; error parsing jwk token")},
+		{"fail-key", p1, args{failKey}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; error parsing jwk claims")},
+		{"fail-claims", p1, args{failClaims}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; error parsing jwk claims")},
+		{"fail-signature", p1, args{failSig}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; error parsing jwk claims: square/go-jose: error in cryptographic primitive")},
+		{"fail-issuer", p1, args{failIss}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; invalid jwk claims: square/go-jose/jwt: validation failed, invalid issuer claim (iss)")},
+		{"fail-expired", p1, args{failExp}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; invalid jwk claims: square/go-jose/jwt: validation failed, token is expired (exp)")},
+		{"fail-not-before", p1, args{failNbf}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; invalid jwk claims: square/go-jose/jwt: validation failed, token not valid yet (nbf)")},
+		{"fail-audience", p1, args{failAud}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; invalid jwk token audience claim (aud)")},
+		{"fail-subject", p1, args{failSub}, http.StatusUnauthorized, errors.New("jwk.authorizeToken; jwk token subject cannot be empty")},
+		{"ok", p1, args{t1}, http.StatusOK, nil},
+		{"ok-no-encrypted-key", p2, args{t2}, http.StatusOK, nil},
+		{"ok-no-sans", p1, args{t3}, http.StatusOK, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got, err := tt.prov.authorizeToken(tt.args.token, testAudiences.Sign); err != nil {
 				if assert.NotNil(t, tt.err) {
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tt.code)
 					assert.HasPrefix(t, err.Error(), tt.err.Error())
 				}
 			} else {
@@ -225,15 +213,19 @@ func TestJWK_AuthorizeRevoke(t *testing.T) {
 		name string
 		prov *JWK
 		args args
+		code int
 		err  error
 	}{
-		{"fail-signature", p1, args{failSig}, errors.New("error parsing claims: square/go-jose: error in cryptographic primitive")},
-		{"ok", p1, args{t1}, nil},
+		{"fail-signature", p1, args{failSig}, http.StatusUnauthorized, errors.New("jwk.AuthorizeRevoke: jwk.authorizeToken; error parsing jwk claims: square/go-jose: error in cryptographic primitive")},
+		{"ok", p1, args{t1}, http.StatusOK, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.prov.AuthorizeRevoke(tt.args.token); err != nil {
+			if err := tt.prov.AuthorizeRevoke(context.Background(), tt.args.token); err != nil {
 				if assert.NotNil(t, tt.err) {
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tt.code)
 					assert.HasPrefix(t, err.Error(), tt.err.Error())
 				}
 			}
@@ -247,7 +239,7 @@ func TestJWK_AuthorizeSign(t *testing.T) {
 	key1, err := decryptJSONWebKey(p1.EncryptedKey)
 	assert.FatalError(t, err)
 
-	t1, err := generateSimpleToken(p1.Name, testAudiences.Sign[0], key1)
+	t1, err := generateToken("subject", p1.Name, testAudiences.Sign[0], "name@smallstep.com", []string{"127.0.0.1", "max@smallstep.com", "foo"}, time.Now(), key1)
 	assert.FatalError(t, err)
 
 	t2, err := generateToken("subject", p1.Name, testAudiences.Sign[0], "name@smallstep.com", []string{}, time.Now(), key1)
@@ -263,35 +255,67 @@ func TestJWK_AuthorizeSign(t *testing.T) {
 		name string
 		prov *JWK
 		args args
+		code int
 		err  error
+		sans []string
 	}{
-		{"fail-signature", p1, args{failSig}, errors.New("error parsing claims: square/go-jose: error in cryptographic primitive")},
-		{"ok-sans", p1, args{t1}, nil},
-		{"ok-no-sans", p1, args{t2}, nil},
+		{
+			name: "fail-signature",
+			prov: p1,
+			args: args{failSig},
+			code: http.StatusUnauthorized,
+			err:  errors.New("jwk.AuthorizeSign: jwk.authorizeToken; error parsing jwk claims: square/go-jose: error in cryptographic primitive"),
+		},
+		{
+			name: "ok-sans",
+			prov: p1,
+			args: args{t1},
+			code: http.StatusOK,
+			err:  nil,
+			sans: []string{"127.0.0.1", "max@smallstep.com", "foo"},
+		},
+		{
+			name: "ok-no-sans",
+			prov: p1,
+			args: args{t2},
+			code: http.StatusOK,
+			err:  nil,
+			sans: []string{"subject"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := NewContextWithMethod(context.Background(), SignMethod)
 			if got, err := tt.prov.AuthorizeSign(ctx, tt.args.token); err != nil {
 				if assert.NotNil(t, tt.err) {
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tt.code)
 					assert.HasPrefix(t, err.Error(), tt.err.Error())
 				}
 			} else {
 				if assert.NotNil(t, got) {
-					assert.Len(t, 8, got)
-
-					_cnv := got[1]
-					cnv, ok := _cnv.(commonNameValidator)
-					assert.True(t, ok)
-					assert.Equals(t, string(cnv), "subject")
-
-					_dnv := got[2]
-					dnv, ok := _dnv.(dnsNamesValidator)
-					assert.True(t, ok)
-					if tt.name == "ok-sans" {
-						assert.Equals(t, []string(dnv), []string{"test.smallstep.com"})
-					} else {
-						assert.Equals(t, []string(dnv), []string{"subject"})
+					assert.Len(t, 6, got)
+					for _, o := range got {
+						switch v := o.(type) {
+						case *provisionerExtensionOption:
+							assert.Equals(t, v.Type, int(TypeJWK))
+							assert.Equals(t, v.Name, tt.prov.GetName())
+							assert.Equals(t, v.CredentialID, tt.prov.Key.KeyID)
+							assert.Len(t, 0, v.KeyValuePairs)
+						case profileDefaultDuration:
+							assert.Equals(t, time.Duration(v), tt.prov.claimer.DefaultTLSCertDuration())
+						case commonNameValidator:
+							assert.Equals(t, string(v), "subject")
+						case defaultPublicKeyValidator:
+						case *validityValidator:
+							assert.Equals(t, v.min, tt.prov.claimer.MinTLSCertDuration())
+							assert.Equals(t, v.max, tt.prov.claimer.MaxTLSCertDuration())
+						case defaultSANsValidator:
+							assert.Equals(t, []string(v), tt.sans)
+						default:
+							assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+						}
 					}
 				}
 			}
@@ -299,7 +323,7 @@ func TestJWK_AuthorizeSign(t *testing.T) {
 	}
 }
 
-func TestJWK_AuthorizeRenewal(t *testing.T) {
+func TestJWK_AuthorizeRenew(t *testing.T) {
 	p1, err := generateJWK()
 	assert.FatalError(t, err)
 	p2, err := generateJWK()
@@ -318,30 +342,43 @@ func TestJWK_AuthorizeRenewal(t *testing.T) {
 		name    string
 		prov    *JWK
 		args    args
+		code    int
 		wantErr bool
 	}{
-		{"ok", p1, args{nil}, false},
-		{"fail", p2, args{nil}, true},
+		{"ok", p1, args{nil}, http.StatusOK, false},
+		{"fail/renew-disabled", p2, args{nil}, http.StatusUnauthorized, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.prov.AuthorizeRenewal(tt.args.cert); (err != nil) != tt.wantErr {
-				t.Errorf("JWK.AuthorizeRenewal() error = %v, wantErr %v", err, tt.wantErr)
+			if err := tt.prov.AuthorizeRenew(context.Background(), tt.args.cert); (err != nil) != tt.wantErr {
+				t.Errorf("JWK.AuthorizeRenew() error = %v, wantErr %v", err, tt.wantErr)
+			} else if err != nil {
+				sc, ok := err.(errs.StatusCoder)
+				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				assert.Equals(t, sc.StatusCode(), tt.code)
 			}
 		})
 	}
 }
 
-func TestJWK_AuthorizeSign_SSH(t *testing.T) {
+func TestJWK_AuthorizeSSHSign(t *testing.T) {
 	tm, fn := mockNow()
 	defer fn()
 
 	p1, err := generateJWK()
 	assert.FatalError(t, err)
+	p2, err := generateJWK()
+	assert.FatalError(t, err)
+	// disable sshCA
+	disable := false
+	p2.Claims = &Claims{EnableSSHCA: &disable}
+	p2.claimer, err = NewClaimer(p2.Claims, globalProvisionerClaims)
+	assert.FatalError(t, err)
+
 	jwk, err := decryptJSONWebKey(p1.EncryptedKey)
 	assert.FatalError(t, err)
 
-	iss, aud := p1.Name, testAudiences.Sign[0]
+	iss, aud := p1.Name, testAudiences.SSHSign[0]
 
 	t1, err := generateSimpleSSHUserToken(iss, aud, jwk)
 	assert.FatalError(t, err)
@@ -385,30 +422,34 @@ func TestJWK_AuthorizeSign_SSH(t *testing.T) {
 		prov        *JWK
 		args        args
 		expected    *SSHOptions
+		code        int
 		wantErr     bool
 		wantSignErr bool
 	}{
-		{"user", p1, args{t1, SSHOptions{}, pub}, expectedUserOptions, false, false},
-		{"user-rsa2048", p1, args{t1, SSHOptions{}, rsa2048.Public()}, expectedUserOptions, false, false},
-		{"user-type", p1, args{t1, SSHOptions{CertType: "user"}, pub}, expectedUserOptions, false, false},
-		{"user-principals", p1, args{t1, SSHOptions{Principals: []string{"name"}}, pub}, expectedUserOptions, false, false},
-		{"user-options", p1, args{t1, SSHOptions{CertType: "user", Principals: []string{"name"}}, pub}, expectedUserOptions, false, false},
-		{"host", p1, args{t2, SSHOptions{}, pub}, expectedHostOptions, false, false},
-		{"host-type", p1, args{t2, SSHOptions{CertType: "host"}, pub}, expectedHostOptions, false, false},
-		{"host-principals", p1, args{t2, SSHOptions{Principals: []string{"smallstep.com"}}, pub}, expectedHostOptions, false, false},
-		{"host-options", p1, args{t2, SSHOptions{CertType: "host", Principals: []string{"smallstep.com"}}, pub}, expectedHostOptions, false, false},
-		{"fail-signature", p1, args{failSig, SSHOptions{}, pub}, nil, true, false},
-		{"rail-rsa1024", p1, args{t1, SSHOptions{}, rsa1024.Public()}, expectedUserOptions, false, true},
+		{"user", p1, args{t1, SSHOptions{}, pub}, expectedUserOptions, http.StatusOK, false, false},
+		{"user-rsa2048", p1, args{t1, SSHOptions{}, rsa2048.Public()}, expectedUserOptions, http.StatusOK, false, false},
+		{"user-type", p1, args{t1, SSHOptions{CertType: "user"}, pub}, expectedUserOptions, http.StatusOK, false, false},
+		{"user-principals", p1, args{t1, SSHOptions{Principals: []string{"name"}}, pub}, expectedUserOptions, http.StatusOK, false, false},
+		{"user-options", p1, args{t1, SSHOptions{CertType: "user", Principals: []string{"name"}}, pub}, expectedUserOptions, http.StatusOK, false, false},
+		{"host", p1, args{t2, SSHOptions{}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"host-type", p1, args{t2, SSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"host-principals", p1, args{t2, SSHOptions{Principals: []string{"smallstep.com"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"host-options", p1, args{t2, SSHOptions{CertType: "host", Principals: []string{"smallstep.com"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"fail-sshCA-disabled", p2, args{"foo", SSHOptions{}, pub}, expectedUserOptions, http.StatusUnauthorized, true, false},
+		{"fail-signature", p1, args{failSig, SSHOptions{}, pub}, nil, http.StatusUnauthorized, true, false},
+		{"rail-rsa1024", p1, args{t1, SSHOptions{}, rsa1024.Public()}, expectedUserOptions, http.StatusOK, false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := NewContextWithMethod(context.Background(), SignSSHMethod)
-			got, err := tt.prov.AuthorizeSign(ctx, tt.args.token)
+			got, err := tt.prov.AuthorizeSSHSign(context.Background(), tt.args.token)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("OIDC.Authorize() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("JWK.AuthorizeSSHSign() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if err != nil {
+				sc, ok := err.(errs.StatusCoder)
+				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				assert.Equals(t, sc.StatusCode(), tt.code)
 				assert.Nil(t, got)
 			} else if assert.NotNil(t, got) {
 				cert, err := signSSHCertificate(tt.args.key, tt.args.sshOpts, got, signer.Key.(crypto.Signer))
@@ -435,7 +476,7 @@ func TestJWK_AuthorizeSign_SSHOptions(t *testing.T) {
 	jwk, err := decryptJSONWebKey(p1.EncryptedKey)
 	assert.FatalError(t, err)
 
-	sub, iss, aud, iat := "subject@smallstep.com", p1.Name, testAudiences.Sign[0], time.Now()
+	sub, iss, aud, iat := "subject@smallstep.com", p1.Name, testAudiences.SSHSign[0], time.Now()
 
 	key, err := generateJSONWebKey()
 	assert.FatalError(t, err)
@@ -514,11 +555,10 @@ func TestJWK_AuthorizeSign_SSHOptions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := NewContextWithMethod(context.Background(), SignSSHMethod)
 			token, err := generateSSHToken(tt.args.sub, tt.args.iss, tt.args.aud, tt.args.iat, tt.args.tokSSHOpts, tt.args.jwk)
 			assert.FatalError(t, err)
-			if got, err := tt.prov.AuthorizeSign(ctx, token); (err != nil) != tt.wantErr {
-				t.Errorf("JWK.AuthorizeSign() error = %v, wantErr %v", err, tt.wantErr)
+			if got, err := tt.prov.AuthorizeSSHSign(context.Background(), token); (err != nil) != tt.wantErr {
+				t.Errorf("JWK.AuthorizeSSHSign() error = %v, wantErr %v", err, tt.wantErr)
 			} else if !tt.wantErr && assert.NotNil(t, got) {
 				var opts SSHOptions
 				if tt.args.userSSHOpts != nil {
@@ -534,6 +574,55 @@ func TestJWK_AuthorizeSign_SSHOptions(t *testing.T) {
 						assert.NoError(t, validateSSHCertificate(cert, tt.expected))
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestJWK_AuthorizeSSHRevoke(t *testing.T) {
+	type test struct {
+		p     *JWK
+		token string
+		code  int
+		err   error
+	}
+	tests := map[string]func(*testing.T) test{
+		"fail/invalid-token": func(t *testing.T) test {
+			p, err := generateJWK()
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: "foo",
+				code:  http.StatusUnauthorized,
+				err:   errors.New("jwk.AuthorizeSSHRevoke: jwk.authorizeToken; error parsing jwk token"),
+			}
+		},
+		"ok": func(t *testing.T) test {
+			p, err := generateJWK()
+			assert.FatalError(t, err)
+			jwk, err := decryptJSONWebKey(p.EncryptedKey)
+			assert.FatalError(t, err)
+
+			tok, err := generateToken("subject", p.Name, testAudiences.SSHRevoke[0], "name@smallstep.com", []string{"127.0.0.1", "max@smallstep.com", "foo"}, time.Now(), jwk)
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: tok,
+			}
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tc := tt(t)
+			if err := tc.p.AuthorizeSSHRevoke(context.Background(), tc.token); err != nil {
+				if assert.NotNil(t, tc.err) {
+					sc, ok := err.(errs.StatusCoder)
+					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					assert.Equals(t, sc.StatusCode(), tc.code)
+					assert.HasPrefix(t, err.Error(), tc.err.Error())
+				}
+			} else {
+				assert.Nil(t, tc.err)
 			}
 		})
 	}

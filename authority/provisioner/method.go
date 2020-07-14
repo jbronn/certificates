@@ -14,11 +14,41 @@ type methodKey struct{}
 const (
 	// SignMethod is the method used to sign X.509 certificates.
 	SignMethod Method = iota
-	// SignSSHMethod is the method used to sign SSH certificate.
-	SignSSHMethod
 	// RevokeMethod is the method used to revoke X.509 certificates.
 	RevokeMethod
+	// RenewMethod is the method used to renew X.509 certificates.
+	RenewMethod
+	// SSHSignMethod is the method used to sign SSH certificates.
+	SSHSignMethod
+	// SSHRenewMethod is the method used to renew SSH certificates.
+	SSHRenewMethod
+	// SSHRevokeMethod is the method used to revoke SSH certificates.
+	SSHRevokeMethod
+	// SSHRekeyMethod is the method used to rekey SSH certificates.
+	SSHRekeyMethod
 )
+
+// String returns a string representation of the context method.
+func (m Method) String() string {
+	switch m {
+	case SignMethod:
+		return "sign-method"
+	case RevokeMethod:
+		return "revoke-method"
+	case RenewMethod:
+		return "renew-method"
+	case SSHSignMethod:
+		return "ssh-sign-method"
+	case SSHRenewMethod:
+		return "ssh-renew-method"
+	case SSHRevokeMethod:
+		return "ssh-revoke-method"
+	case SSHRekeyMethod:
+		return "ssh-rekey-method"
+	default:
+		return "unknown"
+	}
+}
 
 // NewContextWithMethod creates a new context from ctx and attaches method to
 // it.

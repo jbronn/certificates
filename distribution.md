@@ -26,7 +26,7 @@ e.g. `v1.0.2`
 2. **Update the version of step/cli**
 
     <pre><code>
-    <b>$ dep ensure -update github.com/smallstep/cli</b>
+    <b>$ go get -u github.com/smallstep/cli</b>
     </code></pre>
 
 3. **Commit all changes.**
@@ -150,9 +150,10 @@ e.g. `v1.0.2`
 
     <pre><code>
     <b>$ git checkout gh-pages</b>
+    <b>$ git pull origin gh-pages</b>
     <b>$ git add "step-certificates-<version>.tgz"</b>
     <b>$ helm repo index --merge index.yaml --url https://smallstep.github.io/helm-charts/ .</b>
-    <b>$ git commit -a -m "Add package for step-certificates <appVersion>"</b>
+    <b>$ git commit -a -m "Add package for step-certificates vX.Y.Z"</b>
     <b>$ git push origin gh-pages</b>
     </code></pre>
 

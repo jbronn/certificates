@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/nosql/database"
+	"golang.org/x/crypto/ssh"
 )
 
 // ErrNotImplemented is an error returned when an operation is Not Implemented.
@@ -30,8 +31,18 @@ func (s *SimpleDB) IsRevoked(sn string) (bool, error) {
 	return false, nil
 }
 
+// IsSSHRevoked noop
+func (s *SimpleDB) IsSSHRevoked(sn string) (bool, error) {
+	return false, nil
+}
+
 // Revoke returns a "NotImplemented" error.
 func (s *SimpleDB) Revoke(rci *RevokedCertificateInfo) error {
+	return ErrNotImplemented
+}
+
+// RevokeSSH returns a "NotImplemented" error.
+func (s *SimpleDB) RevokeSSH(rci *RevokedCertificateInfo) error {
 	return ErrNotImplemented
 }
 
@@ -56,6 +67,21 @@ func (s *SimpleDB) UseToken(id, tok string) (bool, error) {
 	}
 	// Successfully stored token.
 	return true, nil
+}
+
+// IsSSHHost returns a "NotImplemented" error.
+func (s *SimpleDB) IsSSHHost(principal string) (bool, error) {
+	return false, ErrNotImplemented
+}
+
+// StoreSSHCertificate returns a "NotImplemented" error.
+func (s *SimpleDB) StoreSSHCertificate(crt *ssh.Certificate) error {
+	return ErrNotImplemented
+}
+
+// GetSSHHostPrincipals returns a "NotImplemented" error.
+func (s *SimpleDB) GetSSHHostPrincipals() ([]string, error) {
+	return nil, ErrNotImplemented
 }
 
 // Shutdown returns nil

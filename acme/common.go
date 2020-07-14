@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"context"
 	"crypto/x509"
 	"net/url"
 	"time"
@@ -8,11 +9,123 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/cli/crypto/randutil"
+	"github.com/smallstep/cli/jose"
 )
+
+// Provisioner is an interface that implements a subset of the provisioner.Interface --
+// only those methods required by the ACME api/authority.
+type Provisioner interface {
+	AuthorizeSign(ctx context.Context, token string) ([]provisioner.SignOption, error)
+	GetName() string
+	DefaultTLSCertDuration() time.Duration
+}
+
+// MockProvisioner for testing
+type MockProvisioner struct {
+	Mret1                   interface{}
+	Merr                    error
+	MgetName                func() string
+	MauthorizeSign          func(ctx context.Context, ott string) ([]provisioner.SignOption, error)
+	MdefaultTLSCertDuration func() time.Duration
+}
+
+// GetName mock
+func (m *MockProvisioner) GetName() string {
+	if m.MgetName != nil {
+		return m.MgetName()
+	}
+	return m.Mret1.(string)
+}
+
+// AuthorizeSign mock
+func (m *MockProvisioner) AuthorizeSign(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
+	if m.MauthorizeSign != nil {
+		return m.MauthorizeSign(ctx, ott)
+	}
+	return m.Mret1.([]provisioner.SignOption), m.Merr
+}
+
+// DefaultTLSCertDuration mock
+func (m *MockProvisioner) DefaultTLSCertDuration() time.Duration {
+	if m.MdefaultTLSCertDuration != nil {
+		return m.MdefaultTLSCertDuration()
+	}
+	return m.Mret1.(time.Duration)
+}
+
+// ContextKey is the key type for storing and searching for ACME request
+// essentials in the context of a request.
+type ContextKey string
+
+const (
+	// AccContextKey account key
+	AccContextKey = ContextKey("acc")
+	// BaseURLContextKey baseURL key
+	BaseURLContextKey = ContextKey("baseURL")
+	// JwsContextKey jws key
+	JwsContextKey = ContextKey("jws")
+	// JwkContextKey jwk key
+	JwkContextKey = ContextKey("jwk")
+	// PayloadContextKey payload key
+	PayloadContextKey = ContextKey("payload")
+	// ProvisionerContextKey provisioner key
+	ProvisionerContextKey = ContextKey("provisioner")
+)
+
+// AccountFromContext searches the context for an ACME account. Returns the
+// account or an error.
+func AccountFromContext(ctx context.Context) (*Account, error) {
+	val, ok := ctx.Value(AccContextKey).(*Account)
+	if !ok || val == nil {
+		return nil, AccountDoesNotExistErr(nil)
+	}
+	return val, nil
+}
+
+// BaseURLFromContext returns the baseURL if one is stored in the context.
+func BaseURLFromContext(ctx context.Context) *url.URL {
+	val, ok := ctx.Value(BaseURLContextKey).(*url.URL)
+	if !ok || val == nil {
+		return nil
+	}
+	return val
+}
+
+// JwkFromContext searches the context for a JWK. Returns the JWK or an error.
+func JwkFromContext(ctx context.Context) (*jose.JSONWebKey, error) {
+	val, ok := ctx.Value(JwkContextKey).(*jose.JSONWebKey)
+	if !ok || val == nil {
+		return nil, ServerInternalErr(errors.Errorf("jwk expected in request context"))
+	}
+	return val, nil
+}
+
+// JwsFromContext searches the context for a JWS. Returns the JWS or an error.
+func JwsFromContext(ctx context.Context) (*jose.JSONWebSignature, error) {
+	val, ok := ctx.Value(JwsContextKey).(*jose.JSONWebSignature)
+	if !ok || val == nil {
+		return nil, ServerInternalErr(errors.Errorf("jws expected in request context"))
+	}
+	return val, nil
+}
+
+// ProvisionerFromContext searches the context for a provisioner. Returns the
+// provisioner or an error.
+func ProvisionerFromContext(ctx context.Context) (Provisioner, error) {
+	val := ctx.Value(ProvisionerContextKey)
+	if val == nil {
+		return nil, ServerInternalErr(errors.Errorf("provisioner expected in request context"))
+	}
+	pval, ok := val.(Provisioner)
+	if !ok || pval == nil {
+		return nil, ServerInternalErr(errors.Errorf("provisioner in context is not an ACME provisioner"))
+	}
+	return pval, nil
+}
 
 // SignAuthority is the interface implemented by a CA authority.
 type SignAuthority interface {
-	Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) (*x509.Certificate, *x509.Certificate, error)
+	Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
 	LoadProvisionerByID(string) (provisioner.Interface, error)
 }
 
@@ -21,17 +134,6 @@ type Identifier struct {
 	Type  string `json:"type"`
 	Value string `json:"value"`
 }
-
-var (
-	accountTable           = []byte("acme-accounts")
-	accountByKeyIDTable    = []byte("acme-keyID-accountID-index")
-	authzTable             = []byte("acme-authzs")
-	challengeTable         = []byte("acme-challenges")
-	nonceTable             = []byte("nonce-table")
-	orderTable             = []byte("acme-orders")
-	ordersByAccountIDTable = []byte("acme-account-orders-index")
-	certTable              = []byte("acme-certs")
-)
 
 var (
 	// StatusValid -- valid
@@ -68,9 +170,3 @@ func (c *Clock) Now() time.Time {
 }
 
 var clock = new(Clock)
-
-// URLSafeProvisionerName returns a path escaped version of the ACME provisioner
-// ID that is safe to use in URL paths.
-func URLSafeProvisionerName(p provisioner.Interface) string {
-	return url.PathEscape(p.GetName())
-}

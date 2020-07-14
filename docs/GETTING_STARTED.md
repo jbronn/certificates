@@ -34,8 +34,11 @@ provisioners and its options.
 
 To initialize a PKI and configure the Step Certificate Authority run:
 
+> **NOTE**: `step ca init` only initialize an x509 CA. If you
+> would like to initialize an SSH CA as well, add the `--ssh` flag.
+
 ```
-step ca init
+step ca init [--ssh]
 ```
 
 You'll be asked for a name for your PKI. This name will appear in your CA
@@ -54,27 +57,40 @@ You should see:
 .
 ├── certs
 │   ├── intermediate_ca.crt
-│   └── root_ca.crt
+│   ├── root_ca.crt
+│   ├── ssh_host_key.pub (--ssh only)
+│   └── ssh_user_key.pub (--ssh only)
 ├── config
 │   ├── ca.json
 │   └── defaults.json
 └── secrets
     ├── intermediate_ca_key
-    └── root_ca_key
+    ├── root_ca_key
+    ├── ssh_host_key (--ssh only)
+    └── ssh_user_key (--ssh only)
 ```
 
 The files created include:
 
 * `root_ca.crt` and `root_ca_key`: the root certificate and private key for
-  your PKI
+your PKI.
+
 * `intermediate_ca.crt` and `intermediate_ca_key`: the intermediate certificate
-  and private key that will be used to sign leaf certificates
+and private key that will be used to sign leaf certificates.
+
+* `ssh_host_key.pub` and `ssh_host_key` (`--ssh` only): the SSH host pub/priv key
+pair that will be used to sign new host SSH certificates.
+
+* `ssh_user_key.pub` and `ssh_user_key` (`--ssh` only): the SSH user pub/priv key
+pair that will be used to sign new user SSH certificates.
+
 * `ca.json`: the configuration file necessary for running the Step CA.
+
 * `defaults.json`: file containing default parameters for the `step` CA cli
 interface. You can override these values with the appropriate flags or
 environment variables.
 
-All of the files endinging in `_key` are password protected using the password
+All of the files ending in `_key` are password protected using the password
 you chose during PKI initialization. We advise you to change these passwords
 (using the `step crypto change-pass` utility) if you plan to run your CA in a
 non-development environment.
@@ -108,14 +124,14 @@ and respond to requests.
 * `logger`: the default logging format for the CA is `text`. The other option
 is `json`.
 
-* `db`: data persistence layer. See [database documentation](./db.md) for more
+* `db`: data persistence layer. See [database documentation](./database.md) for more
 info.
 
     - type: `badger`, `bbolt`, `mysql`, etc.
 
     - dataSource: `string` that can be interpreted differently depending on the
     type of the database. Usually a path to where the data is stored. See
-    the [database configuration docs](./db.md#configuration) for more info.
+    the [database configuration docs](./database.md#configuration) for more info.
 
     - database: name of the database. Used for backends that may have
     multiple databases. e.g. MySQL
@@ -146,10 +162,34 @@ ciphersuites, min/max TLS version, etc.
         against token reuse. The default value is `false`. Do not change this
         unless you know what you are doing.
 
-    - `provisioners`: list of provisioners. Each provisioner has a `name`,
-    associated public/private keys, and an optional `claims` attribute that will
-    override any values set in the global `claims` directly underneath `authority`.
+        SSH CA properties
 
+        * `minUserSSHDuration`: do not allow certificates with a duration less
+        than this value.
+
+        * `maxUserSSHDuration`: do not allow certificates with a duration
+        greater than this value.
+
+        * `defaultUserSSHDuration`: if no certificate validity period is specified,
+        use this value.
+
+        * `minHostSSHDuration`: do not allow certificates with a duration less
+        than this value.
+
+        * `maxHostSSHDuration`: do not allow certificates with a duration
+        greater than this value.
+
+        * `defaultHostSSHDuration`: if no certificate validity period is specified,
+        use this value.
+
+        * `enableSSHCA`: enable all provisioners to generate SSH Certificates.
+        The deault value is `false`. You can enable this option per provisioner
+        by setting it to `true` in the provisioner claims.
+
+    - `provisioners`: list of provisioners.
+    See the [provisioners documentation](./provisioners.md). Each provisioner
+    has an optional `claims` attribute that can override any attribute defined
+    at the level above in the `authority.claims`.
 
 `step ca init` will generate one provisioner. New provisioners can be added by
 running `step ca provisioner add`.
@@ -161,6 +201,49 @@ To start the CA run:
 ```
 export STEPPATH=$(step path)
 step-ca $STEPPATH/config/ca.json
+```
+
+### Systemctl
+
+Consider adding a service user that will only be used by `systemctl` to manage
+the service.
+
+```
+$ useradd step
+$ passwd -l step
+```
+
+Use the following example as a base for your `systemctl` service file:
+
+```
+[Unit]
+Description=step-ca
+After=syslog.target network.target
+
+[Service]
+
+User=smallstep
+Group=smallstep
+ExecStart=/bin/sh -c '/bin/step-ca /home/smallstep/.step/config/ca.json --password-file=/home/smallstep/.step/pwd >>   /var/log/smallstep/output.log 2>&1'
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The following are a few example commands you can use to check the status,
+enable on restart, and start your `systemctl` service.
+
+```
+# Check the current status of the `step-ca` service
+$ systemctl status step-ca
+# Configure the `step-ca` process to startup on reboot automatically
+$ systemctl enable step-ca
+# Start the `step-ca` service.
+$ systemctl start smallstep
 ```
 
 ## Configure Your Environment
@@ -176,7 +259,7 @@ created when you initilialized your PKI.  In order to properly validate this
 certificate clients need access to the public root of trust, aka the public root
 certificate.  If you are using the `step cli` on the same host where you
 initialized your PKI (the `root_ca.crt` is stored on disk locally), then you can
-continue to [setting up your environment](setting-up-environment-variables),
+continue to [setting up your environment](#setup-env),
 otherwise we will show you how to easily download your root certificate in the
 following step.
 
@@ -215,9 +298,10 @@ In the examples below we will use `https://ca.smallstep.com:8080`.
 3. Test.
 
     ```
-    * step ca health
+    $ step ca health
     ```
 
+<a name="setup-env"></a>
 #### Setting up Environment Defaults
 
 This is optional, but we recommend you populate a `defaults.json` file with a
@@ -401,7 +485,9 @@ types of certs. Each of these provisioners must have unique keys.
 
 ## Use Custom Claims for Provisioners to Control Certificate Validity etc
 
-It's possible to configure provisioners on the CA to issue certs using properties specific to their target environments. Most commonly different validity periods and disabling renewals for certs. Here's how:
+It's possible to configure provisioners on the CA to issue certs using
+properties specific to their target environments. Most commonly different
+validity periods and disabling renewals for certs. Here's how:
 
 ```bash
 $ step ca init
@@ -444,9 +530,17 @@ Please enter the password to decrypt ~/.step/secrets/intermediate_ca_key: passwo
 2019/02/21 12:09:51 Serving HTTPS on :9443 ...
 ```
 
-Please [`step ca provisioner`](https://smallstep.com/docs/cli/ca/provisioner/)'s docs for details on all available claims properties. The durations are strings which are a sequence of decimal numbers, each with optional fraction and a unit suffix, such as "300ms" or "2h45m". Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
+See the [`provisioner doc`][1] for details on all available provisioner claims.
+The durations are strings which are a sequence of decimal numbers, each with
+optional fraction and a unit suffix, such as "300ms" or "2h45m". Valid time
+units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
-Now certs issued by the `dev@smallstep.com` provisioner will be valid for two hours and deny renewals. Command line flags allow validity extension up to 12h, please see [`step ca certificate`](https://smallstep.com/docs/cli/ca/certificate/)'s docs for details.
+Now certs issued by the `dev@smallstep.com` provisioner will be valid for two
+hours and deny renewals. Command line flags allow validity extension up to 12h,
+please see [`step ca certificate`][2]'s docs for details.
+
+[1]: ./provisioners.md
+[2]: https://smallstep.com/docs/cli/ca/certificate/
 
 ```bash
 # grab a cert, will also work with 'step ca token' flow
@@ -609,3 +703,31 @@ are features that we plan to implement, but are not yet available. In the mean
 time short lived certificates are a decent alternative.
 * Keep your hosts secure by enforcing AuthN and AuthZ for every connection. SSH
 access is a big one.
+
+<a name="step-ca-ha"></a>
+## Notes on Running Step CA as a Highly Available Service
+
+**CAUTION**: `step-ca` is built to scale horizontally. However, the creators
+and maintainers do not regularly test in an HA environment using mulitple
+instances. You may run into issues we did not plan for. If this happens, please
+[open an issue][3].
+
+### Considerations
+
+A few things to consider / implement when running multiple instances of `step-ca`:
+
+* Use `MySQL` DB: The default `Badger` DB cannot be read / written by more than one
+process simultaneously. The only supported DB that can support multiple instances
+is `MySQL`. See the [database documentation][4] for guidance on configuring `MySQL`.
+
+* Synchronize `ca.json` across instances: `step-ca` reads all of it's
+configuration (and all of the provisioner configuration) from the `ca.json` file
+specified on the command line. If the `ca.json` of one instance is modified
+(either manually or using a command like `step ca provisioner (add | remove)`)
+the other instances will not pick up on this change until the `ca.json` is
+copied over to the correct location for each instance and the instance itself
+is `SIGHUP`'ed (or restarted). It's recommended to use a configuration management
+(ansible, chef, salt, puppet, etc.) tool to synchronize `ca.json` across instances.
+
+[3]: https://github.com/smallstep/certificates/issues
+[4]: ./database.md

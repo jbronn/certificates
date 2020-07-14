@@ -10,6 +10,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
+	kms "github.com/smallstep/certificates/kms/apiv1"
+	"github.com/smallstep/certificates/templates"
 	"github.com/smallstep/cli/crypto/tlsutil"
 	"github.com/smallstep/cli/crypto/x509util"
 )
@@ -27,6 +29,7 @@ var (
 		MaxVersion:    1.2,
 		Renegotiation: false,
 	}
+	defaultBackdate         = time.Minute
 	defaultDisableRenewal   = false
 	defaultEnableSSHCA      = false
 	globalProvisionerClaims = provisioner.Claims{
@@ -36,7 +39,7 @@ var (
 		DisableRenewal:    &defaultDisableRenewal,
 		MinUserSSHDur:     &provisioner.Duration{Duration: 5 * time.Minute}, // User SSH certs
 		MaxUserSSHDur:     &provisioner.Duration{Duration: 24 * time.Hour},
-		DefaultUserSSHDur: &provisioner.Duration{Duration: 4 * time.Hour},
+		DefaultUserSSHDur: &provisioner.Duration{Duration: 16 * time.Hour},
 		MinHostSSHDur:     &provisioner.Duration{Duration: 5 * time.Minute}, // Host SSH certs
 		MaxHostSSHDur:     &provisioner.Duration{Duration: 30 * 24 * time.Hour},
 		DefaultHostSSHDur: &provisioner.Duration{Duration: 30 * 24 * time.Hour},
@@ -46,27 +49,46 @@ var (
 
 // Config represents the CA configuration and it's mapped to a JSON object.
 type Config struct {
-	Root             multiString         `json:"root"`
-	FederatedRoots   []string            `json:"federatedRoots"`
-	IntermediateCert string              `json:"crt"`
-	IntermediateKey  string              `json:"key"`
-	Address          string              `json:"address"`
-	DNSNames         []string            `json:"dnsNames"`
-	SSH              *SSHConfig          `json:"ssh,omitempty"`
-	Logger           json.RawMessage     `json:"logger,omitempty"`
-	DB               *db.Config          `json:"db,omitempty"`
-	Monitoring       json.RawMessage     `json:"monitoring,omitempty"`
-	AuthorityConfig  *AuthConfig         `json:"authority,omitempty"`
-	TLS              *tlsutil.TLSOptions `json:"tls,omitempty"`
-	Password         string              `json:"password,omitempty"`
+	Root             multiString          `json:"root"`
+	FederatedRoots   []string             `json:"federatedRoots"`
+	IntermediateCert string               `json:"crt"`
+	IntermediateKey  string               `json:"key"`
+	Address          string               `json:"address"`
+	DNSNames         []string             `json:"dnsNames"`
+	KMS              *kms.Options         `json:"kms,omitempty"`
+	SSH              *SSHConfig           `json:"ssh,omitempty"`
+	Logger           json.RawMessage      `json:"logger,omitempty"`
+	DB               *db.Config           `json:"db,omitempty"`
+	Monitoring       json.RawMessage      `json:"monitoring,omitempty"`
+	AuthorityConfig  *AuthConfig          `json:"authority,omitempty"`
+	TLS              *tlsutil.TLSOptions  `json:"tls,omitempty"`
+	Password         string               `json:"password,omitempty"`
+	Templates        *templates.Templates `json:"templates,omitempty"`
 }
 
 // AuthConfig represents the configuration options for the authority.
 type AuthConfig struct {
-	Provisioners         provisioner.List    `json:"provisioners"`
-	Template             *x509util.ASN1DN    `json:"template,omitempty"`
-	Claims               *provisioner.Claims `json:"claims,omitempty"`
-	DisableIssuedAtCheck bool                `json:"disableIssuedAtCheck,omitempty"`
+	Provisioners         provisioner.List      `json:"provisioners"`
+	Template             *x509util.ASN1DN      `json:"template,omitempty"`
+	Claims               *provisioner.Claims   `json:"claims,omitempty"`
+	DisableIssuedAtCheck bool                  `json:"disableIssuedAtCheck,omitempty"`
+	Backdate             *provisioner.Duration `json:"backdate,omitempty"`
+}
+
+// init initializes the required fields in the AuthConfig if they are not
+// provided.
+func (c *AuthConfig) init() {
+	if c.Provisioners == nil {
+		c.Provisioners = provisioner.List{}
+	}
+	if c.Template == nil {
+		c.Template = &x509util.ASN1DN{}
+	}
+	if c.Backdate == nil {
+		c.Backdate = &provisioner.Duration{
+			Duration: defaultBackdate,
+		}
+	}
 }
 
 // Validate validates the authority configuration.
@@ -74,39 +96,26 @@ func (c *AuthConfig) Validate(audiences provisioner.Audiences) error {
 	if c == nil {
 		return errors.New("authority cannot be undefined")
 	}
-	if len(c.Provisioners) == 0 {
-		return errors.New("authority.provisioners cannot be empty")
-	}
 
-	// Merge global and configuration claims
-	claimer, err := provisioner.NewClaimer(c.Claims, globalProvisionerClaims)
-	if err != nil {
-		return err
-	}
+	// Initialize required fields.
+	c.init()
 
-	// Initialize provisioners
-	config := provisioner.Config{
-		Claims:    claimer.Claims(),
-		Audiences: audiences,
-	}
+	// Check that only one K8sSA is enabled
+	var k8sCount int
 	for _, p := range c.Provisioners {
-		if err := p.Init(config); err != nil {
-			return err
+		if p.GetType() == provisioner.TypeK8sSA {
+			k8sCount++
 		}
 	}
-
-	if c.Template == nil {
-		c.Template = &x509util.ASN1DN{}
+	if k8sCount > 1 {
+		return errors.New("cannot have more than one kubernetes service account provisioner")
 	}
-	return nil
-}
 
-// SSHConfig contains the user and host keys.
-type SSHConfig struct {
-	HostKey          string `json:"hostKey"`
-	UserKey          string `json:"userKey"`
-	AddUserPrincipal string `json:"addUserPrincipal"`
-	AddUserCommand   string `json:"addUserCommand"`
+	if c.Backdate.Duration < 0 {
+		return errors.New("authority.backdate cannot be less than 0")
+	}
+
+	return nil
 }
 
 // LoadConfiguration parses the given filename in JSON format and returns the
@@ -124,6 +133,21 @@ func LoadConfiguration(filename string) (*Config, error) {
 	}
 
 	return &c, nil
+}
+
+// initializes the minimal configuration required to create an authority. This
+// is mainly used on embedded authorities.
+func (c *Config) init() {
+	if c.DNSNames == nil {
+		c.DNSNames = []string{"localhost", "127.0.0.1", "::1"}
+	}
+	if c.TLS == nil {
+		c.TLS = &DefaultTLSOptions
+	}
+	if c.AuthorityConfig == nil {
+		c.AuthorityConfig = &AuthConfig{}
+	}
+	c.AuthorityConfig.init()
 }
 
 // Save saves the configuration to the given filename.
@@ -181,6 +205,21 @@ func (c *Config) Validate() error {
 		c.TLS.Renegotiation = c.TLS.Renegotiation || DefaultTLSOptions.Renegotiation
 	}
 
+	// Validate KMS options, nil is ok.
+	if err := c.KMS.Validate(); err != nil {
+		return err
+	}
+
+	// Validate ssh: nil is ok
+	if err := c.SSH.Validate(); err != nil {
+		return err
+	}
+
+	// Validate templates: nil is ok
+	if err := c.Templates.Validate(); err != nil {
+		return err
+	}
+
 	return c.AuthorityConfig.Validate(c.getAudiences())
 }
 
@@ -189,15 +228,36 @@ func (c *Config) Validate() error {
 // front so we cannot rely on the port.
 func (c *Config) getAudiences() provisioner.Audiences {
 	audiences := provisioner.Audiences{
-		Sign:   []string{legacyAuthority},
-		Revoke: []string{legacyAuthority},
+		Sign:      []string{legacyAuthority},
+		Revoke:    []string{legacyAuthority},
+		SSHSign:   []string{},
+		SSHRevoke: []string{},
+		SSHRenew:  []string{},
 	}
 
 	for _, name := range c.DNSNames {
 		audiences.Sign = append(audiences.Sign,
-			fmt.Sprintf("https://%s/sign", name), fmt.Sprintf("https://%s/1.0/sign", name))
+			fmt.Sprintf("https://%s/1.0/sign", name),
+			fmt.Sprintf("https://%s/sign", name),
+			fmt.Sprintf("https://%s/1.0/ssh/sign", name),
+			fmt.Sprintf("https://%s/ssh/sign", name))
 		audiences.Revoke = append(audiences.Revoke,
-			fmt.Sprintf("https://%s/revoke", name), fmt.Sprintf("https://%s/1.0/revoke", name))
+			fmt.Sprintf("https://%s/1.0/revoke", name),
+			fmt.Sprintf("https://%s/revoke", name))
+		audiences.SSHSign = append(audiences.SSHSign,
+			fmt.Sprintf("https://%s/1.0/ssh/sign", name),
+			fmt.Sprintf("https://%s/ssh/sign", name),
+			fmt.Sprintf("https://%s/1.0/sign", name),
+			fmt.Sprintf("https://%s/sign", name))
+		audiences.SSHRevoke = append(audiences.SSHRevoke,
+			fmt.Sprintf("https://%s/1.0/ssh/revoke", name),
+			fmt.Sprintf("https://%s/ssh/revoke", name))
+		audiences.SSHRenew = append(audiences.SSHRenew,
+			fmt.Sprintf("https://%s/1.0/ssh/renew", name),
+			fmt.Sprintf("https://%s/ssh/renew", name))
+		audiences.SSHRekey = append(audiences.SSHRekey,
+			fmt.Sprintf("https://%s/1.0/ssh/rekey", name),
+			fmt.Sprintf("https://%s/ssh/rekey", name))
 	}
 
 	return audiences

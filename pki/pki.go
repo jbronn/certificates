@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/crypto/ssh"
-
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
@@ -31,6 +29,7 @@ import (
 	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -46,6 +45,8 @@ const (
 	// DBPath is the directory name under the step path where the private keys
 	// will be stored.
 	dbPath = "db"
+	// templatesPath is the directory to store templates
+	templatesPath = "templates"
 )
 
 // GetDBPath returns the path where the file-system persistence is stored
@@ -82,6 +83,11 @@ func GetRootCAPath() string {
 // on the STEPPATH environment variable.
 func GetOTTKeyPath() string {
 	return filepath.Join(config.StepPath(), privatePath, "ott_key")
+}
+
+// GetTemplatesPath returns the path where the templates are stored.
+func GetTemplatesPath() string {
+	return filepath.Join(config.StepPath(), templatesPath)
 }
 
 // GetProvisioners returns the map of provisioners on the given CA.
@@ -142,21 +148,17 @@ type PKI struct {
 }
 
 // New creates a new PKI configuration.
-func New(public, private, config string) (*PKI, error) {
-	if _, err := os.Stat(public); os.IsNotExist(err) {
-		if err = os.MkdirAll(public, 0700); err != nil {
-			return nil, errs.FileError(err, public)
-		}
-	}
-	if _, err := os.Stat(private); os.IsNotExist(err) {
-		if err = os.MkdirAll(private, 0700); err != nil {
-			return nil, errs.FileError(err, private)
-		}
-	}
-	if len(config) > 0 {
-		if _, err := os.Stat(config); os.IsNotExist(err) {
-			if err = os.MkdirAll(config, 0700); err != nil {
-				return nil, errs.FileError(err, config)
+func New() (*PKI, error) {
+	public := GetPublicPath()
+	private := GetSecretsPath()
+	config := GetConfigPath()
+
+	// Create directories
+	dirs := []string{public, private, config, GetTemplatesPath()}
+	for _, name := range dirs {
+		if _, err := os.Stat(name); os.IsNotExist(err) {
+			if err = os.MkdirAll(name, 0700); err != nil {
+				return nil, errs.FileError(err, name)
 			}
 		}
 	}
@@ -185,16 +187,16 @@ func New(public, private, config string) (*PKI, error) {
 	if p.intermediateKey, err = getPath(private, "intermediate_ca_key"); err != nil {
 		return nil, err
 	}
-	if p.sshHostPubKey, err = getPath(public, "ssh_host_key.pub"); err != nil {
+	if p.sshHostPubKey, err = getPath(public, "ssh_host_ca_key.pub"); err != nil {
 		return nil, err
 	}
-	if p.sshUserPubKey, err = getPath(public, "ssh_user_key.pub"); err != nil {
+	if p.sshUserPubKey, err = getPath(public, "ssh_user_ca_key.pub"); err != nil {
 		return nil, err
 	}
-	if p.sshHostKey, err = getPath(private, "ssh_host_key"); err != nil {
+	if p.sshHostKey, err = getPath(private, "ssh_host_ca_key"); err != nil {
 		return nil, err
 	}
-	if p.sshUserKey, err = getPath(private, "ssh_user_key"); err != nil {
+	if p.sshUserKey, err = getPath(private, "ssh_user_ca_key"); err != nil {
 		return nil, err
 	}
 	if len(config) > 0 {
@@ -287,6 +289,10 @@ func (p *PKI) WriteRootCertificate(rootCrt *x509.Certificate, rootKey interface{
 	if err != nil {
 		return err
 	}
+
+	sum := sha256.Sum256(rootCrt.Raw)
+	p.rootFingerprint = strings.ToLower(hex.EncodeToString(sum[:]))
+
 	return nil
 }
 
@@ -432,6 +438,7 @@ func (p *PKI) GenerateConfig(opt ...Option) (*authority.Config, error) {
 			Renegotiation: x509util.DefaultTLSRenegotiation,
 			CipherSuites:  x509util.DefaultTLSCipherSuites,
 		},
+		Templates: p.getTemplates(),
 	}
 	if p.enableSSH {
 		enableSSHCA := true
@@ -459,6 +466,7 @@ func (p *PKI) GenerateConfig(opt ...Option) (*authority.Config, error) {
 func (p *PKI) Save(opt ...Option) error {
 	p.tellPKI()
 
+	// Generate and write ca.json
 	config, err := p.GenerateConfig(opt...)
 	if err != nil {
 		return err
@@ -468,7 +476,7 @@ func (p *PKI) Save(opt ...Option) error {
 	if err != nil {
 		return errors.Wrapf(err, "error marshaling %s", p.config)
 	}
-	if err = utils.WriteFile(p.config, b, 0666); err != nil {
+	if err = utils.WriteFile(p.config, b, 0644); err != nil {
 		return errs.FileError(err, p.config)
 	}
 
@@ -487,6 +495,7 @@ func (p *PKI) Save(opt ...Option) error {
 		}
 	}
 
+	// Generate and write defaults.json
 	defaults := &caDefaults{
 		Root:        p.root,
 		CAConfig:    p.config,
@@ -497,15 +506,24 @@ func (p *PKI) Save(opt ...Option) error {
 	if err != nil {
 		return errors.Wrapf(err, "error marshaling %s", p.defaults)
 	}
-	if err = utils.WriteFile(p.defaults, b, 0666); err != nil {
+	if err = utils.WriteFile(p.defaults, b, 0644); err != nil {
 		return errs.FileError(err, p.defaults)
+	}
+
+	// Generate and write templates
+	if err := generateTemplates(config.Templates); err != nil {
+		return err
+	}
+
+	if config.DB != nil {
+		ui.PrintSelected("Database folder", config.DB.DataSource)
+	}
+	if config.Templates != nil {
+		ui.PrintSelected("Templates folder", GetTemplatesPath())
 	}
 
 	ui.PrintSelected("Default configuration", p.defaults)
 	ui.PrintSelected("Certificate Authority configuration", p.config)
-	if config.DB != nil {
-		ui.PrintSelected("Database", config.DB.DataSource)
-	}
 	ui.Println()
 	ui.Println("Your PKI is ready to go. To generate certificates for individual services see 'step help ca'.")
 

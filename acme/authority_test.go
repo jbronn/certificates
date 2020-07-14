@@ -1,8 +1,10 @@
 package acme
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"testing"
 	"time"
 
@@ -14,8 +16,13 @@ import (
 )
 
 func TestAuthorityGetLink(t *testing.T) {
-	auth := NewAuthority(nil, "ca.smallstep.com", "acme", nil)
-	provID := "acme-test-provisioner"
+	auth, err := NewAuthority(new(db.MockNoSQLDB), "ca.smallstep.com", "acme", nil)
+	assert.FatalError(t, err)
+	prov := newProv()
+	provName := url.PathEscape(prov.GetName())
+	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, baseURL)
 	type test struct {
 		auth   *Authority
 		typ    Link
@@ -29,7 +36,7 @@ func TestAuthorityGetLink(t *testing.T) {
 				auth: auth,
 				typ:  NewAccountLink,
 				abs:  true,
-				res:  fmt.Sprintf("https://ca.smallstep.com/acme/%s/new-account", provID),
+				res:  fmt.Sprintf("%s/acme/%s/new-account", baseURL.String(), provName),
 			}
 		},
 		"ok/new-account/no-abs": func(t *testing.T) test {
@@ -37,7 +44,7 @@ func TestAuthorityGetLink(t *testing.T) {
 				auth: auth,
 				typ:  NewAccountLink,
 				abs:  false,
-				res:  fmt.Sprintf("/%s/new-account", provID),
+				res:  fmt.Sprintf("/%s/new-account", provName),
 			}
 		},
 		"ok/order/abs": func(t *testing.T) test {
@@ -46,7 +53,7 @@ func TestAuthorityGetLink(t *testing.T) {
 				typ:    OrderLink,
 				abs:    true,
 				inputs: []string{"foo"},
-				res:    fmt.Sprintf("https://ca.smallstep.com/acme/%s/order/foo", provID),
+				res:    fmt.Sprintf("%s/acme/%s/order/foo", baseURL.String(), provName),
 			}
 		},
 		"ok/order/no-abs": func(t *testing.T) test {
@@ -55,29 +62,84 @@ func TestAuthorityGetLink(t *testing.T) {
 				typ:    OrderLink,
 				abs:    false,
 				inputs: []string{"foo"},
-				res:    fmt.Sprintf("/%s/order/foo", provID),
+				res:    fmt.Sprintf("/%s/order/foo", provName),
 			}
 		},
 	}
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			link := tc.auth.GetLink(tc.typ, provID, tc.abs, tc.inputs...)
+			link := tc.auth.GetLink(ctx, tc.typ, tc.abs, tc.inputs...)
 			assert.Equals(t, tc.res, link)
 		})
 	}
 }
 
 func TestAuthorityGetDirectory(t *testing.T) {
-	auth := NewAuthority(nil, "ca.smallstep.com", "acme", nil)
+	auth, err := NewAuthority(new(db.MockNoSQLDB), "ca.smallstep.com", "acme", nil)
+	assert.FatalError(t, err)
+
 	prov := newProv()
-	acmeDir := auth.GetDirectory(prov)
-	assert.Equals(t, acmeDir.NewNonce, fmt.Sprintf("https://ca.smallstep.com/acme/%s/new-nonce", URLSafeProvisionerName(prov)))
-	assert.Equals(t, acmeDir.NewAccount, fmt.Sprintf("https://ca.smallstep.com/acme/%s/new-account", URLSafeProvisionerName(prov)))
-	assert.Equals(t, acmeDir.NewOrder, fmt.Sprintf("https://ca.smallstep.com/acme/%s/new-order", URLSafeProvisionerName(prov)))
-	//assert.Equals(t, acmeDir.NewOrder, "httsp://ca.smallstep.com/acme/new-authz")
-	assert.Equals(t, acmeDir.RevokeCert, fmt.Sprintf("https://ca.smallstep.com/acme/%s/revoke-cert", URLSafeProvisionerName(prov)))
-	assert.Equals(t, acmeDir.KeyChange, fmt.Sprintf("https://ca.smallstep.com/acme/%s/key-change", URLSafeProvisionerName(prov)))
+	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, baseURL)
+
+	type test struct {
+		ctx context.Context
+		err *Error
+	}
+	tests := map[string]func(t *testing.T) test{
+		"ok/empty-provisioner": func(t *testing.T) test {
+			return test{
+				ctx: context.Background(),
+			}
+		},
+		"ok/no-baseURL": func(t *testing.T) test {
+			return test{
+				ctx: context.WithValue(context.Background(), ProvisionerContextKey, prov),
+			}
+		},
+		"ok/baseURL": func(t *testing.T) test {
+			return test{
+				ctx: ctx,
+			}
+		},
+	}
+	for name, run := range tests {
+		t.Run(name, func(t *testing.T) {
+			tc := run(t)
+			if dir, err := auth.GetDirectory(tc.ctx); err != nil {
+				if assert.NotNil(t, tc.err) {
+					ae, ok := err.(*Error)
+					assert.True(t, ok)
+					assert.HasPrefix(t, ae.Error(), tc.err.Error())
+					assert.Equals(t, ae.StatusCode(), tc.err.StatusCode())
+					assert.Equals(t, ae.Type, tc.err.Type)
+				}
+			} else {
+				if assert.Nil(t, tc.err) {
+					bu := BaseURLFromContext(tc.ctx)
+					if bu == nil {
+						bu = &url.URL{Scheme: "https", Host: "ca.smallstep.com"}
+					}
+
+					var provName string
+					prov, err := ProvisionerFromContext(tc.ctx)
+					if err != nil {
+						provName = ""
+					} else {
+						provName = url.PathEscape(prov.GetName())
+					}
+
+					assert.Equals(t, dir.NewNonce, fmt.Sprintf("%s/acme/%s/new-nonce", bu.String(), provName))
+					assert.Equals(t, dir.NewAccount, fmt.Sprintf("%s/acme/%s/new-account", bu.String(), provName))
+					assert.Equals(t, dir.NewOrder, fmt.Sprintf("%s/acme/%s/new-order", bu.String(), provName))
+					assert.Equals(t, dir.RevokeCert, fmt.Sprintf("%s/acme/%s/revoke-cert", bu.String(), provName))
+					assert.Equals(t, dir.KeyChange, fmt.Sprintf("%s/acme/%s/key-change", bu.String(), provName))
+				}
+			}
+		})
+	}
 }
 
 func TestAuthorityNewNonce(t *testing.T) {
@@ -88,11 +150,12 @@ func TestAuthorityNewNonce(t *testing.T) {
 	}
 	tests := map[string]func(t *testing.T) test{
 		"fail/newNonce-error": func(t *testing.T) test {
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				res:  nil,
@@ -102,12 +165,13 @@ func TestAuthorityNewNonce(t *testing.T) {
 		"ok": func(t *testing.T) test {
 			var _res string
 			res := &_res
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 					*res = string(key)
 					return nil, true, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				res:  res,
@@ -141,22 +205,24 @@ func TestAuthorityUseNonce(t *testing.T) {
 	}
 	tests := map[string]func(t *testing.T) test{
 		"fail/newNonce-error": func(t *testing.T) test {
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MUpdate: func(tx *database.Tx) error {
 					return errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				err:  ServerInternalErr(errors.New("error deleting nonce foo: force")),
 			}
 		},
 		"ok": func(t *testing.T) test {
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MUpdate: func(tx *database.Tx) error {
 					return nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 			}
@@ -187,6 +253,8 @@ func TestAuthorityNewAccount(t *testing.T) {
 		Key: jwk, Contact: []string{"foo", "bar"},
 	}
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth *Authority
 		ops  AccountOptions
@@ -195,11 +263,12 @@ func TestAuthorityNewAccount(t *testing.T) {
 	}
 	tests := map[string]func(t *testing.T) test{
 		"fail/newAccount-error": func(t *testing.T) test {
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				ops:  ops,
@@ -213,18 +282,19 @@ func TestAuthorityNewAccount(t *testing.T) {
 				count    = 0
 				dir      = newDirectory("ca.smallstep.com", "acme")
 			)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 					if count == 1 {
 						var acc *account
 						assert.FatalError(t, json.Unmarshal(newval, &acc))
-						*acmeacc, err = acc.toACME(nil, dir, prov)
+						*acmeacc, err = acc.toACME(ctx, nil, dir)
 						return nil, true, nil
 					}
 					count++
 					return nil, true, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				ops:  ops,
@@ -235,7 +305,7 @@ func TestAuthorityNewAccount(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeAcc, err := tc.auth.NewAccount(prov, tc.ops); err != nil {
+			if acmeAcc, err := tc.auth.NewAccount(ctx, tc.ops); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -258,6 +328,8 @@ func TestAuthorityNewAccount(t *testing.T) {
 
 func TestAuthorityGetAccount(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth *Authority
 		id   string
@@ -267,13 +339,14 @@ func TestAuthorityGetAccount(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getAccount-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, accountTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -285,11 +358,12 @@ func TestAuthorityGetAccount(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(acc)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   acc.ID,
@@ -300,7 +374,7 @@ func TestAuthorityGetAccount(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeAcc, err := tc.auth.GetAccount(prov, tc.id); err != nil {
+			if acmeAcc, err := tc.auth.GetAccount(ctx, tc.id); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -313,7 +387,7 @@ func TestAuthorityGetAccount(t *testing.T) {
 					gotb, err := json.Marshal(acmeAcc)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.acc.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.acc.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)
@@ -327,6 +401,8 @@ func TestAuthorityGetAccount(t *testing.T) {
 
 func TestAuthorityGetAccountByKey(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth *Authority
 		jwk  *jose.JSONWebKey
@@ -338,7 +414,8 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 			jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 			assert.FatalError(t, err)
 			jwk.Key = "foo"
-			auth := NewAuthority(nil, "ca.smallstep.com", "acme", nil)
+			auth, err := NewAuthority(new(db.MockNoSQLDB), "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				jwk:  jwk,
@@ -350,13 +427,14 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 			assert.FatalError(t, err)
 			kid, err := keyToID(jwk)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, accountByKeyIDTable)
 					assert.Equals(t, key, []byte(kid))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				jwk:  jwk,
@@ -371,7 +449,7 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 			count := 0
 			kid, err := keyToID(acc.Key)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					var ret []byte
 					switch {
@@ -388,6 +466,7 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 					return ret, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				jwk:  acc.Key,
@@ -398,7 +477,7 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeAcc, err := tc.auth.GetAccountByKey(prov, tc.jwk); err != nil {
+			if acmeAcc, err := tc.auth.GetAccountByKey(ctx, tc.jwk); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -411,7 +490,7 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 					gotb, err := json.Marshal(acmeAcc)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.acc.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.acc.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)
@@ -425,6 +504,8 @@ func TestAuthorityGetAccountByKey(t *testing.T) {
 
 func TestAuthorityGetOrder(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth      *Authority
 		id, accID string
@@ -434,13 +515,14 @@ func TestAuthorityGetOrder(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getOrder-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -452,13 +534,14 @@ func TestAuthorityGetOrder(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(o)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(o.ID))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    o.ID,
@@ -472,7 +555,7 @@ func TestAuthorityGetOrder(t *testing.T) {
 			b, err := json.Marshal(o)
 			assert.FatalError(t, err)
 			i := 0
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					switch {
 					case i == 0:
@@ -487,6 +570,7 @@ func TestAuthorityGetOrder(t *testing.T) {
 					}
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    o.ID,
@@ -500,13 +584,14 @@ func TestAuthorityGetOrder(t *testing.T) {
 			o.Status = "valid"
 			b, err := json.Marshal(o)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(o.ID))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    o.ID,
@@ -518,7 +603,7 @@ func TestAuthorityGetOrder(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeO, err := tc.auth.GetOrder(prov, tc.accID, tc.id); err != nil {
+			if acmeO, err := tc.auth.GetOrder(ctx, tc.accID, tc.id); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -531,7 +616,7 @@ func TestAuthorityGetOrder(t *testing.T) {
 					gotb, err := json.Marshal(acmeO)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.o.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.o.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)
@@ -553,13 +638,14 @@ func TestAuthorityGetCertificate(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getCertificate-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, certTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -571,13 +657,14 @@ func TestAuthorityGetCertificate(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(cert)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, certTable)
 					assert.Equals(t, key, []byte(cert.ID))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    cert.ID,
@@ -590,13 +677,14 @@ func TestAuthorityGetCertificate(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(cert)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, certTable)
 					assert.Equals(t, key, []byte(cert.ID))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    cert.ID,
@@ -635,6 +723,8 @@ func TestAuthorityGetCertificate(t *testing.T) {
 
 func TestAuthorityGetAuthz(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth      *Authority
 		id, accID string
@@ -644,13 +734,14 @@ func TestAuthorityGetAuthz(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getAuthz-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, authzTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -662,13 +753,14 @@ func TestAuthorityGetAuthz(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(az)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, authzTable)
 					assert.Equals(t, key, []byte(az.getID()))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    az.getID(),
@@ -682,7 +774,7 @@ func TestAuthorityGetAuthz(t *testing.T) {
 			b, err := json.Marshal(az)
 			assert.FatalError(t, err)
 			count := 0
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					var ret []byte
 					switch count {
@@ -699,6 +791,7 @@ func TestAuthorityGetAuthz(t *testing.T) {
 					return ret, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    az.getID(),
@@ -707,7 +800,7 @@ func TestAuthorityGetAuthz(t *testing.T) {
 			}
 		},
 		"ok": func(t *testing.T) test {
-			var ch1B, ch2B = &[]byte{}, &[]byte{}
+			var ch1B, ch2B, ch3B = &[]byte{}, &[]byte{}, &[]byte{}
 			count := 0
 			mockdb := &db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
@@ -716,6 +809,8 @@ func TestAuthorityGetAuthz(t *testing.T) {
 						*ch1B = newval
 					case 1:
 						*ch2B = newval
+					case 2:
+						*ch3B = newval
 					}
 					count++
 					return nil, true, nil
@@ -735,6 +830,8 @@ func TestAuthorityGetAuthz(t *testing.T) {
 			assert.FatalError(t, err)
 			ch2, err := unmarshalChallenge(*ch2B)
 			assert.FatalError(t, err)
+			ch3, err := unmarshalChallenge(*ch3B)
+			assert.FatalError(t, err)
 			count = 0
 			mockdb = &db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
@@ -748,16 +845,20 @@ func TestAuthorityGetAuthz(t *testing.T) {
 						assert.Equals(t, bucket, challengeTable)
 						assert.Equals(t, key, []byte(ch2.getID()))
 						ret = *ch2B
+					case 2:
+						assert.Equals(t, bucket, challengeTable)
+						assert.Equals(t, key, []byte(ch3.getID()))
+						ret = *ch3B
 					}
 					count++
 					return ret, nil
 				},
 			}
-			acmeAz, err := az.toACME(mockdb, newDirectory("ca.smallstep.com", "acme"), prov)
+			acmeAz, err := az.toACME(ctx, mockdb, newDirectory("ca.smallstep.com", "acme"))
 			assert.FatalError(t, err)
 
 			count = 0
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					var ret []byte
 					switch count {
@@ -773,11 +874,16 @@ func TestAuthorityGetAuthz(t *testing.T) {
 						assert.Equals(t, bucket, challengeTable)
 						assert.Equals(t, key, []byte(ch2.getID()))
 						ret = *ch2B
+					case 3:
+						assert.Equals(t, bucket, challengeTable)
+						assert.Equals(t, key, []byte(ch3.getID()))
+						ret = *ch3B
 					}
 					count++
 					return ret, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:   auth,
 				id:     az.getID(),
@@ -789,7 +895,7 @@ func TestAuthorityGetAuthz(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeAz, err := tc.auth.GetAuthz(prov, tc.accID, tc.id); err != nil {
+			if acmeAz, err := tc.auth.GetAuthz(ctx, tc.accID, tc.id); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -814,22 +920,37 @@ func TestAuthorityGetAuthz(t *testing.T) {
 
 func TestAuthorityNewOrder(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth *Authority
 		ops  OrderOptions
+		ctx  context.Context
 		err  *Error
 		o    **Order
 	}
 	tests := map[string]func(t *testing.T) test{
+		"fail/no-provisioner": func(t *testing.T) test {
+			auth, err := NewAuthority(&db.MockNoSQLDB{}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
+			return test{
+				auth: auth,
+				ops:  defaultOrderOps(),
+				ctx:  context.Background(),
+				err:  ServerInternalErr(errors.New("provisioner expected in request context")),
+			}
+		},
 		"fail/newOrder-error": func(t *testing.T) test {
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				ops:  defaultOrderOps(),
+				ctx:  ctx,
 				err:  ServerInternalErr(errors.New("error creating order: error creating http challenge: error saving acme challenge: force")),
 			}
 		},
@@ -843,7 +964,7 @@ func TestAuthorityNewOrder(t *testing.T) {
 				_accID string
 				accID  = &_accID
 			)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
 					switch count {
 					case 0:
@@ -851,21 +972,25 @@ func TestAuthorityNewOrder(t *testing.T) {
 					case 1:
 						assert.Equals(t, bucket, challengeTable)
 					case 2:
-						assert.Equals(t, bucket, authzTable)
-					case 3:
 						assert.Equals(t, bucket, challengeTable)
+					case 3:
+						assert.Equals(t, bucket, authzTable)
 					case 4:
 						assert.Equals(t, bucket, challengeTable)
 					case 5:
-						assert.Equals(t, bucket, authzTable)
+						assert.Equals(t, bucket, challengeTable)
 					case 6:
+						assert.Equals(t, bucket, challengeTable)
+					case 7:
+						assert.Equals(t, bucket, authzTable)
+					case 8:
 						assert.Equals(t, bucket, orderTable)
 						var o order
 						assert.FatalError(t, json.Unmarshal(newval, &o))
-						*acmeO, err = o.toACME(nil, dir, prov)
+						*acmeO, err = o.toACME(ctx, nil, dir)
 						assert.FatalError(t, err)
 						*accID = o.AccountID
-					case 7:
+					case 9:
 						assert.Equals(t, bucket, ordersByAccountIDTable)
 						assert.Equals(t, string(key), *accID)
 					}
@@ -876,9 +1001,11 @@ func TestAuthorityNewOrder(t *testing.T) {
 					return nil, database.ErrNotFound
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				ops:  defaultOrderOps(),
+				ctx:  ctx,
 				o:    acmeO,
 			}
 		},
@@ -886,7 +1013,7 @@ func TestAuthorityNewOrder(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeO, err := tc.auth.NewOrder(prov, tc.ops); err != nil {
+			if acmeO, err := tc.auth.NewOrder(tc.ctx, tc.ops); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -909,6 +1036,10 @@ func TestAuthorityNewOrder(t *testing.T) {
 
 func TestAuthorityGetOrdersByAccount(t *testing.T) {
 	prov := newProv()
+	provName := url.PathEscape(prov.GetName())
+	baseURL := &url.URL{Scheme: "https", Host: "test.ca.smallstep.com"}
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, baseURL)
 	type test struct {
 		auth *Authority
 		id   string
@@ -918,13 +1049,14 @@ func TestAuthorityGetOrdersByAccount(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getOrderIDsByAccount-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, ordersByAccountIDTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -938,7 +1070,7 @@ func TestAuthorityGetOrdersByAccount(t *testing.T) {
 				count = 0
 				err   error
 			)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					var ret []byte
 					switch count {
@@ -956,58 +1088,82 @@ func TestAuthorityGetOrdersByAccount(t *testing.T) {
 					return ret, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
-				err:  ServerInternalErr(errors.New("error loading order foo: force")),
+				err:  ServerInternalErr(errors.New("error loading order foo for account zap: error loading order foo: force")),
 			}
 		},
 		"ok": func(t *testing.T) test {
-			var (
-				id    = "zap"
-				count = 0
-				err   error
-			)
-			foo, err := newO()
-			bar, err := newO()
-			baz, err := newO()
-			bar.Status = StatusInvalid
+			accID := "zap"
 
-			auth := NewAuthority(&db.MockNoSQLDB{
+			foo, err := newO()
+			assert.FatalError(t, err)
+			bfoo, err := json.Marshal(foo)
+			assert.FatalError(t, err)
+
+			bar, err := newO()
+			assert.FatalError(t, err)
+			bar.Status = StatusInvalid
+			bbar, err := json.Marshal(bar)
+			assert.FatalError(t, err)
+
+			zap, err := newO()
+			assert.FatalError(t, err)
+			bzap, err := json.Marshal(zap)
+			assert.FatalError(t, err)
+
+			az, err := newAz()
+			assert.FatalError(t, err)
+			baz, err := json.Marshal(az)
+			assert.FatalError(t, err)
+
+			ch, err := newDNSCh()
+			assert.FatalError(t, err)
+			bch, err := json.Marshal(ch)
+			assert.FatalError(t, err)
+
+			dbGetOrder := 0
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
-					var ret []byte
-					switch count {
-					case 0:
+					switch string(bucket) {
+					case string(orderTable):
+						dbGetOrder++
+						switch dbGetOrder {
+						case 1:
+							return bfoo, nil
+						case 2:
+							return bbar, nil
+						case 3:
+							return bzap, nil
+						}
+					case string(ordersByAccountIDTable):
 						assert.Equals(t, bucket, ordersByAccountIDTable)
-						assert.Equals(t, key, []byte(id))
-						ret, err = json.Marshal([]string{foo.ID, bar.ID, baz.ID})
+						assert.Equals(t, key, []byte(accID))
+						ret, err := json.Marshal([]string{foo.ID, bar.ID, zap.ID})
 						assert.FatalError(t, err)
-					case 1:
-						assert.Equals(t, bucket, orderTable)
-						assert.Equals(t, key, []byte(foo.ID))
-						ret, err = json.Marshal(foo)
-						assert.FatalError(t, err)
-					case 2:
-						assert.Equals(t, bucket, orderTable)
-						assert.Equals(t, key, []byte(bar.ID))
-						ret, err = json.Marshal(bar)
-						assert.FatalError(t, err)
-					case 3:
-						assert.Equals(t, bucket, orderTable)
-						assert.Equals(t, key, []byte(baz.ID))
-						ret, err = json.Marshal(baz)
-						assert.FatalError(t, err)
+						return ret, nil
+					case string(challengeTable):
+						return bch, nil
+					case string(authzTable):
+						return baz, nil
 					}
-					count++
-					return ret, nil
+					return nil, errors.Errorf("should not be query db table %s", bucket)
+				},
+				MCmpAndSwap: func(bucket, key, old, newVal []byte) ([]byte, bool, error) {
+					assert.Equals(t, bucket, ordersByAccountIDTable)
+					assert.Equals(t, string(key), accID)
+					return nil, true, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
-				id:   id,
+				id:   accID,
 				res: []string{
-					fmt.Sprintf("https://ca.smallstep.com/acme/%s/order/%s", URLSafeProvisionerName(prov), foo.ID),
-					fmt.Sprintf("https://ca.smallstep.com/acme/%s/order/%s", URLSafeProvisionerName(prov), baz.ID),
+					fmt.Sprintf("%s/acme/%s/order/%s", baseURL.String(), provName, foo.ID),
+					fmt.Sprintf("%s/acme/%s/order/%s", baseURL.String(), provName, zap.ID),
 				},
 			}
 		},
@@ -1015,7 +1171,7 @@ func TestAuthorityGetOrdersByAccount(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if orderLinks, err := tc.auth.GetOrdersByAccount(prov, tc.id); err != nil {
+			if orderLinks, err := tc.auth.GetOrdersByAccount(ctx, tc.id); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -1034,25 +1190,40 @@ func TestAuthorityGetOrdersByAccount(t *testing.T) {
 
 func TestAuthorityFinalizeOrder(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth      *Authority
 		id, accID string
+		ctx       context.Context
 		err       *Error
 		o         *order
 	}
 	tests := map[string]func(t *testing.T) test{
+		"fail/no-provisioner": func(t *testing.T) test {
+			auth, err := NewAuthority(&db.MockNoSQLDB{}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
+			return test{
+				auth: auth,
+				id:   "foo",
+				ctx:  context.Background(),
+				err:  ServerInternalErr(errors.New("provisioner expected in request context")),
+			}
+		},
 		"fail/getOrder-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
+				ctx:  ctx,
 				err:  ServerInternalErr(errors.New("error loading order foo: force")),
 			}
 		},
@@ -1061,17 +1232,19 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(o)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(o.ID))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    o.ID,
 				accID: "foo",
+				ctx:   ctx,
 				err:   UnauthorizedErr(errors.New("account does not own order")),
 			}
 		},
@@ -1081,7 +1254,7 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 			o.Expires = time.Now().Add(-time.Minute)
 			b, err := json.Marshal(o)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(o.ID))
@@ -1093,10 +1266,12 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    o.ID,
 				accID: o.AccountID,
+				ctx:   ctx,
 				err:   ServerInternalErr(errors.New("error finalizing order: error storing order: force")),
 			}
 		},
@@ -1107,17 +1282,19 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 			o.Certificate = "certID"
 			b, err := json.Marshal(o)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, orderTable)
 					assert.Equals(t, key, []byte(o.ID))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    o.ID,
 				accID: o.AccountID,
+				ctx:   ctx,
 				o:     o,
 			}
 		},
@@ -1125,7 +1302,7 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeO, err := tc.auth.FinalizeOrder(prov, tc.accID, tc.id, nil); err != nil {
+			if acmeO, err := tc.auth.FinalizeOrder(tc.ctx, tc.accID, tc.id, nil); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -1138,7 +1315,7 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 					gotb, err := json.Marshal(acmeO)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.o.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.o.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)
@@ -1152,6 +1329,8 @@ func TestAuthorityFinalizeOrder(t *testing.T) {
 
 func TestAuthorityValidateChallenge(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth      *Authority
 		id, accID string
@@ -1161,13 +1340,14 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getChallenge-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, challengeTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -1179,13 +1359,14 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(ch)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, challengeTable)
 					assert.Equals(t, key, []byte(ch.getID()))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    ch.getID(),
@@ -1198,7 +1379,7 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 			assert.FatalError(t, err)
 			b, err := json.Marshal(ch)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, challengeTable)
 					assert.Equals(t, key, []byte(ch.getID()))
@@ -1210,6 +1391,7 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    ch.getID(),
@@ -1226,13 +1408,14 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 			_ch.baseChallenge.Validated = clock.Now()
 			b, err := json.Marshal(ch)
 			assert.FatalError(t, err)
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, challengeTable)
 					assert.Equals(t, key, []byte(ch.getID()))
 					return b, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:  auth,
 				id:    ch.getID(),
@@ -1244,7 +1427,7 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeCh, err := tc.auth.ValidateChallenge(prov, tc.accID, tc.id, nil); err != nil {
+			if acmeCh, err := tc.auth.ValidateChallenge(ctx, tc.accID, tc.id, nil); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -1257,7 +1440,7 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 					gotb, err := json.Marshal(acmeCh)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.ch.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.ch.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)
@@ -1272,6 +1455,8 @@ func TestAuthorityValidateChallenge(t *testing.T) {
 func TestAuthorityUpdateAccount(t *testing.T) {
 	contact := []string{"baz", "zap"}
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth    *Authority
 		id      string
@@ -1282,13 +1467,14 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getAccount-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, accountTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:    auth,
 				id:      id,
@@ -1302,7 +1488,7 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 			b, err := json.Marshal(acc)
 			assert.FatalError(t, err)
 
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					return b, nil
 				},
@@ -1310,6 +1496,7 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:    auth,
 				id:      acc.ID,
@@ -1327,7 +1514,7 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 			_acc := *acc
 			clone := &_acc
 			clone.Contact = contact
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					return b, nil
 				},
@@ -1337,6 +1524,7 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 					return nil, true, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth:    auth,
 				id:      acc.ID,
@@ -1348,7 +1536,7 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeAcc, err := tc.auth.UpdateAccount(prov, tc.id, tc.contact); err != nil {
+			if acmeAcc, err := tc.auth.UpdateAccount(ctx, tc.id, tc.contact); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -1361,7 +1549,7 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 					gotb, err := json.Marshal(acmeAcc)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.acc.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.acc.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)
@@ -1375,6 +1563,8 @@ func TestAuthorityUpdateAccount(t *testing.T) {
 
 func TestAuthorityDeactivateAccount(t *testing.T) {
 	prov := newProv()
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, prov)
+	ctx = context.WithValue(ctx, BaseURLContextKey, "https://test.ca.smallstep.com:8080")
 	type test struct {
 		auth *Authority
 		id   string
@@ -1384,13 +1574,14 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/getAccount-error": func(t *testing.T) test {
 			id := "foo"
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					assert.Equals(t, bucket, accountTable)
 					assert.Equals(t, key, []byte(id))
 					return nil, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   id,
@@ -1403,7 +1594,7 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 			b, err := json.Marshal(acc)
 			assert.FatalError(t, err)
 
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					return b, nil
 				},
@@ -1411,6 +1602,7 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 					return nil, false, errors.New("force")
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   acc.ID,
@@ -1428,7 +1620,7 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 			clone := &_acc
 			clone.Status = StatusDeactivated
 			clone.Deactivated = clock.Now()
-			auth := NewAuthority(&db.MockNoSQLDB{
+			auth, err := NewAuthority(&db.MockNoSQLDB{
 				MGet: func(bucket, key []byte) ([]byte, error) {
 					return b, nil
 				},
@@ -1438,6 +1630,7 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 					return nil, true, nil
 				},
 			}, "ca.smallstep.com", "acme", nil)
+			assert.FatalError(t, err)
 			return test{
 				auth: auth,
 				id:   acc.ID,
@@ -1448,7 +1641,7 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := run(t)
-			if acmeAcc, err := tc.auth.DeactivateAccount(prov, tc.id); err != nil {
+			if acmeAcc, err := tc.auth.DeactivateAccount(ctx, tc.id); err != nil {
 				if assert.NotNil(t, tc.err) {
 					ae, ok := err.(*Error)
 					assert.True(t, ok)
@@ -1461,7 +1654,7 @@ func TestAuthorityDeactivateAccount(t *testing.T) {
 					gotb, err := json.Marshal(acmeAcc)
 					assert.FatalError(t, err)
 
-					acmeExp, err := tc.acc.toACME(nil, tc.auth.dir, prov)
+					acmeExp, err := tc.acc.toACME(ctx, nil, tc.auth.dir)
 					assert.FatalError(t, err)
 					expb, err := json.Marshal(acmeExp)
 					assert.FatalError(t, err)

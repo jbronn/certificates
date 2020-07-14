@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/cli/jose"
 )
 
@@ -74,6 +75,7 @@ func newGCPConfig() *gcpConfig {
 // Google Identity docs are available at
 // https://cloud.google.com/compute/docs/instances/verifying-instance-identity
 type GCP struct {
+	*base
 	Type                   string   `json:"type"`
 	Name                   string   `json:"name"`
 	ServiceAccounts        []string `json:"serviceAccounts"`
@@ -209,15 +211,7 @@ func (p *GCP) Init(config Config) error {
 func (p *GCP) AuthorizeSign(ctx context.Context, token string) ([]SignOption, error) {
 	claims, err := p.authorizeToken(token)
 	if err != nil {
-		return nil, err
-	}
-
-	// Check for the sign ssh method, default to sign X.509
-	if m := MethodFromContext(ctx); m == SignSSHMethod {
-		if p.claimer.IsSSHCAEnabled() == false {
-			return nil, errors.Errorf("ssh ca is disabled for provisioner %s", p.GetID())
-		}
-		return p.authorizeSSHSign(claims)
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "gcp.AuthorizeSign")
 	}
 
 	ce := claims.Google.ComputeEngine
@@ -234,28 +228,27 @@ func (p *GCP) AuthorizeSign(ctx context.Context, token string) ([]SignOption, er
 		so = append(so, dnsNamesValidator([]string{
 			dnsName1, dnsName2,
 		}))
+		so = append(so, ipAddressesValidator(nil))
+		so = append(so, emailAddressesValidator(nil))
+		so = append(so, urisValidator(nil))
 	}
 
 	return append(so,
-		defaultPublicKeyValidator{},
-		profileDefaultDuration(p.claimer.DefaultTLSCertDuration()),
+		// modifiers / withOptions
 		newProvisionerExtensionOption(TypeGCP, p.Name, claims.Subject, "InstanceID", ce.InstanceID, "InstanceName", ce.InstanceName),
+		profileDefaultDuration(p.claimer.DefaultTLSCertDuration()),
+		// validators
+		defaultPublicKeyValidator{},
 		newValidityValidator(p.claimer.MinTLSCertDuration(), p.claimer.MaxTLSCertDuration()),
 	), nil
 }
 
-// AuthorizeRenewal returns an error if the renewal is disabled.
-func (p *GCP) AuthorizeRenewal(cert *x509.Certificate) error {
+// AuthorizeRenew returns an error if the renewal is disabled.
+func (p *GCP) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
 	if p.claimer.IsDisableRenewal() {
-		return errors.Errorf("renew is disabled for provisioner %s", p.GetID())
+		return errs.Unauthorized("gcp.AuthorizeRenew; renew is disabled for gcp provisioner %s", p.GetID())
 	}
 	return nil
-}
-
-// AuthorizeRevoke returns an error because revoke is not supported on GCP
-// provisioners.
-func (p *GCP) AuthorizeRevoke(token string) error {
-	return errors.New("revoke is not supported on a GCP provisioner")
 }
 
 // assertConfig initializes the config if it has not been initialized.
@@ -271,10 +264,10 @@ func (p *GCP) assertConfig() {
 func (p *GCP) authorizeToken(token string) (*gcpPayload, error) {
 	jwt, err := jose.ParseSigned(token)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error parsing token")
+		return nil, errs.Wrap(http.StatusUnauthorized, err, "gcp.authorizeToken; error parsing gcp token")
 	}
 	if len(jwt.Headers) == 0 {
-		return nil, errors.New("error parsing token: header is missing")
+		return nil, errs.Unauthorized("gcp.authorizeToken; error parsing gcp token - header is missing")
 	}
 
 	var found bool
@@ -288,7 +281,7 @@ func (p *GCP) authorizeToken(token string) (*gcpPayload, error) {
 		}
 	}
 	if !found {
-		return nil, errors.Errorf("failed to validate payload: cannot find key for kid %s", kid)
+		return nil, errs.Unauthorized("gcp.authorizeToken; failed to validate gcp token payload - cannot find key for kid %s", kid)
 	}
 
 	// According to "rfc7519 JSON Web Token" acceptable skew should be no
@@ -298,12 +291,12 @@ func (p *GCP) authorizeToken(token string) (*gcpPayload, error) {
 		Issuer: "https://accounts.google.com",
 		Time:   now,
 	}, time.Minute); err != nil {
-		return nil, errors.Wrapf(err, "invalid token")
+		return nil, errs.Wrap(http.StatusUnauthorized, err, "gcp.authorizeToken; invalid gcp token payload")
 	}
 
 	// validate audiences with the defaults
 	if !matchesAudience(claims.Audience, p.audiences.Sign) {
-		return nil, errors.New("invalid token: invalid audience claim (aud)")
+		return nil, errs.Unauthorized("gcp.authorizeToken; invalid gcp token - invalid audience claim (aud)")
 	}
 
 	// validate subject (service account)
@@ -316,7 +309,7 @@ func (p *GCP) authorizeToken(token string) (*gcpPayload, error) {
 			}
 		}
 		if !found {
-			return nil, errors.New("invalid token: invalid subject claim")
+			return nil, errs.Unauthorized("gcp.authorizeToken; invalid gcp token - invalid subject claim")
 		}
 	}
 
@@ -330,61 +323,77 @@ func (p *GCP) authorizeToken(token string) (*gcpPayload, error) {
 			}
 		}
 		if !found {
-			return nil, errors.New("invalid token: invalid project id")
+			return nil, errs.Unauthorized("gcp.authorizeToken; invalid gcp token - invalid project id")
 		}
 	}
 
 	// validate instance age
 	if d := p.InstanceAge.Value(); d > 0 {
 		if now.Sub(claims.Google.ComputeEngine.InstanceCreationTimestamp.Time()) > d {
-			return nil, errors.New("token google.compute_engine.instance_creation_timestamp is too old")
+			return nil, errs.Unauthorized("gcp.authorizeToken; token google.compute_engine.instance_creation_timestamp is too old")
 		}
 	}
 
 	switch {
 	case claims.Google.ComputeEngine.InstanceID == "":
-		return nil, errors.New("token google.compute_engine.instance_id cannot be empty")
+		return nil, errs.Unauthorized("gcp.authorizeToken; gcp token google.compute_engine.instance_id cannot be empty")
 	case claims.Google.ComputeEngine.InstanceName == "":
-		return nil, errors.New("token google.compute_engine.instance_name cannot be empty")
+		return nil, errs.Unauthorized("gcp.authorizeToken; gcp token google.compute_engine.instance_name cannot be empty")
 	case claims.Google.ComputeEngine.ProjectID == "":
-		return nil, errors.New("token google.compute_engine.project_id cannot be empty")
+		return nil, errs.Unauthorized("gcp.authorizeToken; gcp token google.compute_engine.project_id cannot be empty")
 	case claims.Google.ComputeEngine.Zone == "":
-		return nil, errors.New("token google.compute_engine.zone cannot be empty")
+		return nil, errs.Unauthorized("gcp.authorizeToken; gcp token google.compute_engine.zone cannot be empty")
 	}
 
 	return &claims, nil
 }
 
-// authorizeSSHSign returns the list of SignOption for a SignSSH request.
-func (p *GCP) authorizeSSHSign(claims *gcpPayload) ([]SignOption, error) {
+// AuthorizeSSHSign returns the list of SignOption for a SignSSH request.
+func (p *GCP) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption, error) {
+	if !p.claimer.IsSSHCAEnabled() {
+		return nil, errs.Unauthorized("gcp.AuthorizeSSHSign; sshCA is disabled for gcp provisioner %s", p.GetID())
+	}
+	claims, err := p.authorizeToken(token)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "gcp.AuthorizeSSHSign")
+	}
+
 	ce := claims.Google.ComputeEngine
 
 	signOptions := []SignOption{
-		// set the key id to the token subject
-		sshCertificateKeyIDModifier(ce.InstanceName),
+		// set the key id to the instance name
+		sshCertKeyIDModifier(ce.InstanceName),
+	}
+
+	// Only enforce known principals if disable custom sans is true.
+	var principals []string
+	if p.DisableCustomSANs {
+		principals = []string{
+			fmt.Sprintf("%s.c.%s.internal", ce.InstanceName, ce.ProjectID),
+			fmt.Sprintf("%s.%s.c.%s.internal", ce.InstanceName, ce.Zone, ce.ProjectID),
+		}
 	}
 
 	// Default to host + known hostnames
 	defaults := SSHOptions{
-		CertType: SSHHostCert,
-		Principals: []string{
-			fmt.Sprintf("%s.c.%s.internal", ce.InstanceName, ce.ProjectID),
-			fmt.Sprintf("%s.%s.c.%s.internal", ce.InstanceName, ce.Zone, ce.ProjectID),
-		},
+		CertType:   SSHHostCert,
+		Principals: principals,
 	}
 	// Validate user options
-	signOptions = append(signOptions, sshCertificateOptionsValidator(defaults))
+	signOptions = append(signOptions, sshCertOptionsValidator(defaults))
 	// Set defaults if not given as user options
-	signOptions = append(signOptions, sshCertificateDefaultsModifier(defaults))
+	signOptions = append(signOptions, sshCertDefaultsModifier(defaults))
 
 	return append(signOptions,
-		// set the default extensions
+		// Set the default extensions
 		&sshDefaultExtensionModifier{},
-		// checks the validity bounds, and set the validity if has not been set
-		&sshCertificateValidityModifier{p.claimer},
-		// validate public key
+		// Set the validity bounds if not set.
+		&sshDefaultDuration{p.claimer},
+		// Validate public key
 		&sshDefaultPublicKeyValidator{},
-		// require all the fields in the SSH certificate
-		&sshCertificateDefaultValidator{},
+		// Validate the validity period.
+		&sshCertValidityValidator{p.claimer},
+		// Require all the fields in the SSH certificate
+		&sshCertDefaultValidator{},
 	), nil
 }

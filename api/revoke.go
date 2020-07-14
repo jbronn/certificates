@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
-	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
 	"golang.org/x/crypto/ocsp"
 )
@@ -27,13 +29,13 @@ type RevokeRequest struct {
 // or an error if something is wrong.
 func (r *RevokeRequest) Validate() (err error) {
 	if r.Serial == "" {
-		return BadRequest(errors.New("missing serial"))
+		return errs.BadRequest("missing serial")
 	}
 	if r.ReasonCode < ocsp.Unspecified || r.ReasonCode > ocsp.AACompromise {
-		return BadRequest(errors.New("reasonCode out of bounds"))
+		return errs.BadRequest("reasonCode out of bounds")
 	}
 	if !r.Passive {
-		return NotImplemented(errors.New("non-passive revocation not implemented"))
+		return errs.NotImplemented("non-passive revocation not implemented")
 	}
 
 	return
@@ -47,7 +49,7 @@ func (r *RevokeRequest) Validate() (err error) {
 func (h *caHandler) Revoke(w http.ResponseWriter, r *http.Request) {
 	var body RevokeRequest
 	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, BadRequest(errors.Wrap(err, "error reading request body")))
+		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
 		return
 	}
 
@@ -63,26 +65,38 @@ func (h *caHandler) Revoke(w http.ResponseWriter, r *http.Request) {
 		PassiveOnly: body.Passive,
 	}
 
+	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.RevokeMethod)
 	// A token indicates that we are using the api via a provisioner token,
 	// otherwise it is assumed that the certificate is revoking itself over mTLS.
 	if len(body.OTT) > 0 {
 		logOtt(w, body.OTT)
+		if _, err := h.Authority.Authorize(ctx, body.OTT); err != nil {
+			WriteError(w, errs.UnauthorizedErr(err))
+			return
+		}
 		opts.OTT = body.OTT
 	} else {
 		// If no token is present, then the request must be made over mTLS and
 		// the client certificate Serial Number must match the serial number
 		// being revoked.
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			WriteError(w, BadRequest(errors.New("missing ott or peer certificate")))
+			WriteError(w, errs.BadRequest("missing ott or peer certificate"))
 			return
 		}
 		opts.Crt = r.TLS.PeerCertificates[0]
+		if opts.Crt.SerialNumber.String() != opts.Serial {
+			WriteError(w, errs.BadRequest("revoke: serial number in mtls certificate different than body"))
+			return
+		}
+		// TODO: should probably be checking if the certificate was revoked here.
+		// Will need to thread that request down to the authority, so will need
+		// to add API for that.
 		logCertificate(w, opts.Crt)
 		opts.MTLS = true
 	}
 
-	if err := h.Authority.Revoke(opts); err != nil {
-		WriteError(w, Forbidden(err))
+	if err := h.Authority.Revoke(ctx, opts); err != nil {
+		WriteError(w, errs.ForbiddenErr(err))
 		return
 	}
 
