@@ -27,5 +27,7 @@ require (
 	gopkg.in/square/go-jose.v2 v2.4.0
 )
 
-replace github.com/smallstep/cli => github.com/jbronn/cli
+replace (
+     github.com/smallstep/cli v0.14.6 => github.com/jbronn/cli v0.14.6
+)
 //replace github.com/smallstep/nosql => ../nosql
