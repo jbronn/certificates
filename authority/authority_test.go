@@ -15,14 +15,14 @@ import (
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
-	"github.com/smallstep/cli/crypto/pemutil"
-	stepJOSE "github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
 )
 
 func testAuthority(t *testing.T, opts ...Option) *Authority {
-	maxjwk, err := stepJOSE.ParseKey("testdata/secrets/max_pub.jwk")
+	maxjwk, err := jose.ReadKey("testdata/secrets/max_pub.jwk")
 	assert.FatalError(t, err)
-	clijwk, err := stepJOSE.ParseKey("testdata/secrets/step_cli_key_pub.jwk")
+	clijwk, err := jose.ReadKey("testdata/secrets/step_cli_key_pub.jwk")
 	assert.FatalError(t, err)
 	disableRenewal := true
 	enableSSHCA := true
@@ -103,7 +103,7 @@ func TestAuthorityNew(t *testing.T) {
 			c.Root = []string{"foo"}
 			return &newTest{
 				config: c,
-				err:    errors.New("open foo failed: no such file or directory"),
+				err:    errors.New("error reading foo: no such file or directory"),
 			}
 		},
 		"fail bad password": func(t *testing.T) *newTest {
@@ -121,7 +121,7 @@ func TestAuthorityNew(t *testing.T) {
 			c.IntermediateCert = "wrong"
 			return &newTest{
 				config: c,
-				err:    errors.New("open wrong failed: no such file or directory"),
+				err:    errors.New("error reading wrong: no such file or directory"),
 			}
 		},
 	}
@@ -143,8 +143,7 @@ func TestAuthorityNew(t *testing.T) {
 					assert.Equals(t, auth.rootX509Certs[0], root)
 
 					assert.True(t, auth.initOnce)
-					assert.NotNil(t, auth.x509Signer)
-					assert.NotNil(t, auth.x509Issuer)
+					assert.NotNil(t, auth.x509CAService)
 					for _, p := range tc.config.AuthorityConfig.Provisioners {
 						var _p provisioner.Interface
 						_p, ok = auth.provisioners.Load(p.GetID())
@@ -256,8 +255,7 @@ func TestNewEmbedded(t *testing.T) {
 			if err == nil {
 				assert.True(t, got.initOnce)
 				assert.NotNil(t, got.rootX509Certs)
-				assert.NotNil(t, got.x509Signer)
-				assert.NotNil(t, got.x509Issuer)
+				assert.NotNil(t, got.x509CAService)
 			}
 		})
 	}
@@ -283,7 +281,7 @@ func TestNewEmbedded_Sign(t *testing.T) {
 	csr, err := x509.ParseCertificateRequest(cr)
 	assert.FatalError(t, err)
 
-	cert, err := a.Sign(csr, provisioner.Options{})
+	cert, err := a.Sign(csr, provisioner.SignOptions{})
 	assert.FatalError(t, err)
 	assert.Equals(t, []string{"foo.bar.zar"}, cert[0].DNSNames)
 	assert.Equals(t, crt, cert[1])

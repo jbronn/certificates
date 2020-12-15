@@ -9,9 +9,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/randutil"
 )
 
 func TestX5C_Getters(t *testing.T) {
@@ -154,7 +154,7 @@ M46l92gdOozT
 func TestX5C_authorizeToken(t *testing.T) {
 	x5cCerts, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 	assert.FatalError(t, err)
-	x5cJWK, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+	x5cJWK, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 	assert.FatalError(t, err)
 
 	type test struct {
@@ -402,7 +402,7 @@ lgsqsR63is+0YQ==
 func TestX5C_AuthorizeSign(t *testing.T) {
 	certs, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 	assert.FatalError(t, err)
-	jwk, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+	jwk, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 	assert.FatalError(t, err)
 
 	type test struct {
@@ -463,9 +463,10 @@ func TestX5C_AuthorizeSign(t *testing.T) {
 			} else {
 				if assert.Nil(t, tc.err) {
 					if assert.NotNil(t, opts) {
-						assert.Equals(t, len(opts), 6)
+						assert.Equals(t, len(opts), 7)
 						for _, o := range opts {
 							switch v := o.(type) {
+							case certificateOptionsFunc:
 							case *provisionerExtensionOption:
 								assert.Equals(t, v.Type, int(TypeX5C))
 								assert.Equals(t, v.Name, tc.p.GetName())
@@ -517,7 +518,7 @@ func TestX5C_AuthorizeRevoke(t *testing.T) {
 		"ok": func(t *testing.T) test {
 			certs, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 			assert.FatalError(t, err)
-			jwk, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+			jwk, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 			assert.FatalError(t, err)
 
 			p, err := generateX5C(nil)
@@ -598,7 +599,7 @@ func TestX5C_AuthorizeRenew(t *testing.T) {
 func TestX5C_AuthorizeSSHSign(t *testing.T) {
 	x5cCerts, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 	assert.FatalError(t, err)
-	x5cJWK, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+	x5cJWK, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 	assert.FatalError(t, err)
 
 	_, fn := mockNow()
@@ -695,8 +696,9 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 					Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
 					Audience:  []string{testAudiences.SSHSign[0]},
 				},
-				Step: &stepPayload{SSH: &SSHOptions{
+				Step: &stepPayload{SSH: &SignSSHOptions{
 					CertType:    SSHHostCert,
+					KeyID:       "foo",
 					Principals:  []string{"max", "mariano", "alan"},
 					ValidAfter:  TimeDuration{d: 5 * time.Minute},
 					ValidBefore: TimeDuration{d: 10 * time.Minute},
@@ -727,7 +729,7 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 					Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
 					Audience:  []string{testAudiences.SSHSign[0]},
 				},
-				Step: &stepPayload{SSH: &SSHOptions{}},
+				Step: &stepPayload{SSH: &SignSSHOptions{}},
 			}
 			tok, err := generateX5CSSHToken(x5cJWK, claims, withX5CHdr(x5cCerts))
 			assert.FatalError(t, err)
@@ -752,43 +754,40 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 				if assert.Nil(t, tc.err) {
 					if assert.NotNil(t, opts) {
 						tot := 0
+						firstValidator := true
 						nw := now()
 						for _, o := range opts {
 							switch v := o.(type) {
 							case sshCertOptionsValidator:
 								tc.claims.Step.SSH.ValidAfter.t = time.Time{}
 								tc.claims.Step.SSH.ValidBefore.t = time.Time{}
-								assert.Equals(t, SSHOptions(v), *tc.claims.Step.SSH)
-							case sshCertKeyIDModifier:
-								assert.Equals(t, string(v), "foo")
-							case sshCertTypeModifier:
-								assert.Equals(t, string(v), tc.claims.Step.SSH.CertType)
-							case sshCertPrincipalsModifier:
-								assert.Equals(t, []string(v), tc.claims.Step.SSH.Principals)
+								if firstValidator {
+									assert.Equals(t, SignSSHOptions(v), *tc.claims.Step.SSH)
+								} else {
+									assert.Equals(t, SignSSHOptions(v), SignSSHOptions{KeyID: tc.claims.Subject})
+								}
+								firstValidator = false
 							case sshCertValidAfterModifier:
 								assert.Equals(t, int64(v), tc.claims.Step.SSH.ValidAfter.RelativeTime(nw).Unix())
 							case sshCertValidBeforeModifier:
 								assert.Equals(t, int64(v), tc.claims.Step.SSH.ValidBefore.RelativeTime(nw).Unix())
 							case sshCertDefaultsModifier:
-								assert.Equals(t, SSHOptions(v), SSHOptions{CertType: SSHUserCert})
+								assert.Equals(t, SignSSHOptions(v), SignSSHOptions{CertType: SSHUserCert})
 							case *sshLimitDuration:
 								assert.Equals(t, v.Claimer, tc.p.claimer)
 								assert.Equals(t, v.NotAfter, x5cCerts[0].NotAfter)
 							case *sshCertValidityValidator:
 								assert.Equals(t, v.Claimer, tc.p.claimer)
-							case *sshDefaultExtensionModifier, *sshDefaultPublicKeyValidator,
-								*sshCertDefaultValidator:
-							case sshCertKeyIDValidator:
-								assert.Equals(t, string(v), "foo")
+							case *sshDefaultPublicKeyValidator, *sshCertDefaultValidator, sshCertificateOptionsFunc:
 							default:
 								assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
 							}
 							tot++
 						}
 						if len(tc.claims.Step.SSH.CertType) > 0 {
-							assert.Equals(t, tot, 13)
-						} else {
 							assert.Equals(t, tot, 9)
+						} else {
+							assert.Equals(t, tot, 7)
 						}
 					}
 				}

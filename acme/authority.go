@@ -14,8 +14,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
 	database "github.com/smallstep/certificates/db"
-	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/nosql"
+	"go.step.sm/crypto/jose"
 )
 
 // Interface is the acme authority interface.
@@ -233,7 +233,11 @@ func (a *Authority) GetOrder(ctx context.Context, accID, orderID string) (*Order
 
 // GetOrdersByAccount returns the list of order urls owned by the account.
 func (a *Authority) GetOrdersByAccount(ctx context.Context, id string) ([]string, error) {
-	oids, err := getOrderIDsByAccount(a.db, id)
+	ordersByAccountMux.Lock()
+	defer ordersByAccountMux.Unlock()
+
+	var oiba = orderIDsByAccount{}
+	oids, err := oiba.unsafeGetOrderIDsByAccount(a.db, id)
 	if err != nil {
 		return nil, err
 	}

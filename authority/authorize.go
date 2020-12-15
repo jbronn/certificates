@@ -2,13 +2,15 @@ package authority
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -69,8 +71,13 @@ func (a *Authority) authorizeToken(ctx context.Context, token string) (provision
 	}
 
 	// Store the token to protect against reuse unless it's skipped.
+	// If we cannot get a token id from the provisioner, just hash the token.
 	if !SkipTokenReuseFromContext(ctx) {
 		if reuseKey, err := p.GetTokenID(token); err == nil {
+			if reuseKey == "" {
+				sum := sha256.Sum256([]byte(token))
+				reuseKey = strings.ToLower(hex.EncodeToString(sum[:]))
+			}
 			ok, err := a.db.UseToken(reuseKey, token)
 			if err != nil {
 				return nil, errs.Wrap(http.StatusInternalServerError, err,

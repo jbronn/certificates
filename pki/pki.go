@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"context"
 	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
@@ -14,21 +15,23 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca"
+	"github.com/smallstep/certificates/cas"
+	"github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/cli/config"
-	"github.com/smallstep/cli/crypto/keys"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/tlsutil"
-	"github.com/smallstep/cli/crypto/x509util"
 	"github.com/smallstep/cli/errs"
-	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/cli/ui"
 	"github.com/smallstep/cli/utils"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/keyutil"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/x509util"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -114,6 +117,18 @@ func GetProvisioners(caURL, rootFile string) (provisioner.List, error) {
 	}
 }
 
+func generateDefaultKey() (crypto.Signer, error) {
+	priv, err := keyutil.GenerateDefaultKey()
+	if err != nil {
+		return nil, err
+	}
+	signer, ok := priv.(crypto.Signer)
+	if !ok {
+		return nil, errors.Errorf("type %T is not a cyrpto.Signer", priv)
+	}
+	return signer, nil
+}
+
 // GetProvisionerKey returns the encrypted provisioner key with the for the
 // given kid.
 func GetProvisionerKey(caURL, rootFile, kid string) (string, error) {
@@ -145,6 +160,7 @@ type PKI struct {
 	dnsNames                       []string
 	caURL                          string
 	enableSSH                      bool
+	authorityOptions               *apiv1.Options
 }
 
 // New creates a new PKI configuration.
@@ -221,6 +237,12 @@ func (p *PKI) GetRootFingerprint() string {
 	return p.rootFingerprint
 }
 
+// SetAuthorityOptions sets the authority options object, these options are used
+// to configure a registration authority.
+func (p *PKI) SetAuthorityOptions(opts *apiv1.Options) {
+	p.authorityOptions = opts
+}
+
 // SetProvisioner sets the provisioner name of the OTT keys.
 func (p *PKI) SetProvisioner(s string) {
 	p.provisioner = s
@@ -255,25 +277,35 @@ func (p *PKI) GenerateKeyPairs(pass []byte) error {
 
 // GenerateRootCertificate generates a root certificate with the given name.
 func (p *PKI) GenerateRootCertificate(name string, pass []byte) (*x509.Certificate, interface{}, error) {
-	rootProfile, err := x509util.NewRootProfile(name)
+	signer, err := generateDefaultKey()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rootBytes, err := rootProfile.CreateWriteCertificate(p.root, p.rootKey, string(pass))
+	cr, err := x509util.CreateCertificateRequest(name, []string{}, signer)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	rootCrt, err := x509.ParseCertificate(rootBytes)
+	data := x509util.CreateTemplateData(name, []string{})
+	cert, err := x509util.NewCertificate(cr, x509util.WithTemplate(x509util.DefaultRootTemplate, data))
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "error parsing root certificate")
+		return nil, nil, err
 	}
 
-	sum := sha256.Sum256(rootCrt.Raw)
-	p.rootFingerprint = strings.ToLower(hex.EncodeToString(sum[:]))
+	template := cert.GetCertificate()
+	template.NotBefore = time.Now()
+	template.NotAfter = template.NotBefore.AddDate(10, 0, 0)
+	rootCrt, err := x509util.CreateCertificate(template, template, signer.Public(), signer)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	return rootCrt, rootProfile.SubjectPrivateKey(), nil
+	if err := p.WriteRootCertificate(rootCrt, signer, pass); err != nil {
+		return nil, nil, err
+	}
+
+	return rootCrt, signer, nil
 }
 
 // WriteRootCertificate writes to disk the given certificate and key.
@@ -285,9 +317,11 @@ func (p *PKI) WriteRootCertificate(rootCrt *x509.Certificate, rootKey interface{
 		return err
 	}
 
-	_, err := pemutil.Serialize(rootKey, pemutil.WithPassword([]byte(pass)), pemutil.ToFile(p.rootKey, 0600))
-	if err != nil {
-		return err
+	if rootKey != nil {
+		_, err := pemutil.Serialize(rootKey, pemutil.WithPassword(pass), pemutil.ToFile(p.rootKey, 0600))
+		if err != nil {
+			return err
+		}
 	}
 
 	sum := sha256.Sum256(rootCrt.Raw)
@@ -296,15 +330,80 @@ func (p *PKI) WriteRootCertificate(rootCrt *x509.Certificate, rootKey interface{
 	return nil
 }
 
-// GenerateIntermediateCertificate generates an intermediate certificate with
-// the given name.
-func (p *PKI) GenerateIntermediateCertificate(name string, rootCrt *x509.Certificate, rootKey interface{}, pass []byte) error {
-	interProfile, err := x509util.NewIntermediateProfile(name, rootCrt, rootKey)
+// GetCertificateAuthority attempts to load the certificate authority from the
+// RA.
+func (p *PKI) GetCertificateAuthority() error {
+	ca, err := cas.New(context.Background(), *p.authorityOptions)
 	if err != nil {
 		return err
 	}
-	_, err = interProfile.CreateWriteCertificate(p.intermediate, p.intermediateKey, string(pass))
-	return err
+
+	srv, ok := ca.(apiv1.CertificateAuthorityGetter)
+	if !ok {
+		return nil
+	}
+
+	resp, err := srv.GetCertificateAuthority(&apiv1.GetCertificateAuthorityRequest{
+		Name: p.authorityOptions.CertificateAuthority,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := p.WriteRootCertificate(resp.RootCertificate, nil, nil); err != nil {
+		return err
+	}
+
+	// Issuer is in the RA
+	p.intermediate = ""
+	p.intermediateKey = ""
+
+	return nil
+}
+
+// GenerateIntermediateCertificate generates an intermediate certificate with
+// the given name.
+func (p *PKI) GenerateIntermediateCertificate(name string, rootCrt *x509.Certificate, rootKey interface{}, pass []byte) error {
+	key, err := generateDefaultKey()
+	if err != nil {
+		return err
+	}
+
+	cr, err := x509util.CreateCertificateRequest(name, []string{}, key)
+	if err != nil {
+		return err
+	}
+
+	data := x509util.CreateTemplateData(name, []string{})
+	cert, err := x509util.NewCertificate(cr, x509util.WithTemplate(x509util.DefaultIntermediateTemplate, data))
+	if err != nil {
+		return err
+	}
+
+	template := cert.GetCertificate()
+	template.NotBefore = rootCrt.NotBefore
+	template.NotAfter = rootCrt.NotAfter
+	intermediateCrt, err := x509util.CreateCertificate(template, rootCrt, key.Public(), rootKey.(crypto.Signer))
+	if err != nil {
+		return err
+	}
+
+	return p.WriteIntermediateCertificate(intermediateCrt, key, pass)
+}
+
+// WriteIntermediateCertificate writes to disk the given certificate and key.
+func (p *PKI) WriteIntermediateCertificate(crt *x509.Certificate, key interface{}, pass []byte) error {
+	if err := utils.WriteFile(p.intermediate, pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: crt.Raw,
+	}), 0600); err != nil {
+		return err
+	}
+	_, err := pemutil.Serialize(key, pemutil.WithPassword(pass), pemutil.ToFile(p.intermediateKey, 0600))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // GenerateSSHSigningKeys generates and encrypts a private key used for signing
@@ -313,7 +412,7 @@ func (p *PKI) GenerateSSHSigningKeys(password []byte) error {
 	var pubNames = []string{p.sshHostPubKey, p.sshUserPubKey}
 	var privNames = []string{p.sshHostKey, p.sshUserKey}
 	for i := 0; i < 2; i++ {
-		pub, priv, err := keys.GenerateDefaultKeyPair()
+		pub, priv, err := keyutil.GenerateDefaultKeyPair()
 		if err != nil {
 			return err
 		}
@@ -345,7 +444,7 @@ func (p *PKI) askFeedback() {
 	ui.Println("      phone home. But your feedback is extremely valuable. Any information you")
 	ui.Println("      can provide regarding how you’re using `step` helps. Please send us a")
 	ui.Println("      sentence or two, good or bad: \033[1mfeedback@smallstep.com\033[0m or join")
-	ui.Println("      \033[1mhttps://gitter.im/smallstep/community\033[0m.")
+	ui.Println("      \033[1mhttps://github.com/smallstep/certificates/discussions\033[0m.")
 }
 
 // TellPKI outputs the locations of public and private keys generated
@@ -358,11 +457,18 @@ func (p *PKI) TellPKI() {
 
 func (p *PKI) tellPKI() {
 	ui.Println()
-	ui.PrintSelected("Root certificate", p.root)
-	ui.PrintSelected("Root private key", p.rootKey)
-	ui.PrintSelected("Root fingerprint", p.rootFingerprint)
-	ui.PrintSelected("Intermediate certificate", p.intermediate)
-	ui.PrintSelected("Intermediate private key", p.intermediateKey)
+	if p.authorityOptions == nil || p.authorityOptions.Is(apiv1.SoftCAS) {
+		ui.PrintSelected("Root certificate", p.root)
+		ui.PrintSelected("Root private key", p.rootKey)
+		ui.PrintSelected("Root fingerprint", p.rootFingerprint)
+		ui.PrintSelected("Intermediate certificate", p.intermediate)
+		ui.PrintSelected("Intermediate private key", p.intermediateKey)
+	} else if p.rootFingerprint != "" {
+		ui.PrintSelected("Root certificate", p.root)
+		ui.PrintSelected("Root fingerprint", p.rootFingerprint)
+	} else {
+		ui.Printf(`{{ "%s" | red }} {{ "Root certificate:" | bold }} failed to retrieve it from RA`+"\n", ui.IconBad)
+	}
 	if p.enableSSH {
 		ui.PrintSelected("SSH user root certificate", p.sshUserPubKey)
 		ui.PrintSelected("SSH user root private key", p.sshUserKey)
@@ -429,14 +535,15 @@ func (p *PKI) GenerateConfig(opt ...Option) (*authority.Config, error) {
 			DataSource: GetDBPath(),
 		},
 		AuthorityConfig: &authority.AuthConfig{
+			Options:              p.authorityOptions,
 			DisableIssuedAtCheck: false,
 			Provisioners:         provisioner.List{prov},
 		},
-		TLS: &tlsutil.TLSOptions{
-			MinVersion:    x509util.DefaultTLSMinVersion,
-			MaxVersion:    x509util.DefaultTLSMaxVersion,
-			Renegotiation: x509util.DefaultTLSRenegotiation,
-			CipherSuites:  x509util.DefaultTLSCipherSuites,
+		TLS: &authority.TLSOptions{
+			MinVersion:    authority.DefaultTLSMinVersion,
+			MaxVersion:    authority.DefaultTLSMaxVersion,
+			Renegotiation: authority.DefaultTLSRenegotiation,
+			CipherSuites:  authority.DefaultTLSCipherSuites,
 		},
 		Templates: p.getTemplates(),
 	}
@@ -446,9 +553,19 @@ func (p *PKI) GenerateConfig(opt ...Option) (*authority.Config, error) {
 			HostKey: p.sshHostKey,
 			UserKey: p.sshUserKey,
 		}
+		// Enable SSH authorization for default JWK provisioner
 		prov.Claims = &provisioner.Claims{
 			EnableSSHCA: &enableSSHCA,
 		}
+		// Add default SSHPOP provisioner
+		sshpop := &provisioner.SSHPOP{
+			Type: "SSHPOP",
+			Name: "sshpop",
+			Claims: &provisioner.Claims{
+				EnableSSHCA: &enableSSHCA,
+			},
+		}
+		config.AuthorityConfig.Provisioners = append(config.AuthorityConfig.Provisioners, sshpop)
 	}
 
 	// Apply configuration modifiers
@@ -472,7 +589,7 @@ func (p *PKI) Save(opt ...Option) error {
 		return err
 	}
 
-	b, err := json.MarshalIndent(config, "", "   ")
+	b, err := json.MarshalIndent(config, "", "\t")
 	if err != nil {
 		return errors.Wrapf(err, "error marshaling %s", p.config)
 	}
@@ -502,7 +619,7 @@ func (p *PKI) Save(opt ...Option) error {
 		CAUrl:       p.caURL,
 		Fingerprint: p.rootFingerprint,
 	}
-	b, err = json.MarshalIndent(defaults, "", "   ")
+	b, err = json.MarshalIndent(defaults, "", "\t")
 	if err != nil {
 		return errors.Wrapf(err, "error marshaling %s", p.defaults)
 	}
@@ -525,7 +642,11 @@ func (p *PKI) Save(opt ...Option) error {
 	ui.PrintSelected("Default configuration", p.defaults)
 	ui.PrintSelected("Certificate Authority configuration", p.config)
 	ui.Println()
-	ui.Println("Your PKI is ready to go. To generate certificates for individual services see 'step help ca'.")
+	if p.authorityOptions == nil || p.authorityOptions.Is(apiv1.SoftCAS) {
+		ui.Println("Your PKI is ready to go. To generate certificates for individual services see 'step help ca'.")
+	} else {
+		ui.Println("Your registration authority is ready to go. To generate certificates for individual services see 'step help ca'.")
+	}
 
 	p.askFeedback()
 

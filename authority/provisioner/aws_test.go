@@ -20,7 +20,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
 )
 
 func TestAWS_Getters(t *testing.T) {
@@ -104,36 +104,42 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 	p2.Accounts = p1.Accounts
 	p2.config.identityURL = srv.URL + "/bad-document"
 	p2.config.signatureURL = p1.config.signatureURL
+	p2.config.tokenURL = p1.config.tokenURL
 
 	p3, err := generateAWS()
 	assert.FatalError(t, err)
 	p3.Accounts = p1.Accounts
 	p3.config.signatureURL = srv.URL
 	p3.config.identityURL = p1.config.identityURL
+	p3.config.tokenURL = p1.config.tokenURL
 
 	p4, err := generateAWS()
 	assert.FatalError(t, err)
 	p4.Accounts = p1.Accounts
 	p4.config.signatureURL = srv.URL + "/bad-signature"
 	p4.config.identityURL = p1.config.identityURL
+	p4.config.tokenURL = p1.config.tokenURL
 
 	p5, err := generateAWS()
 	assert.FatalError(t, err)
 	p5.Accounts = p1.Accounts
 	p5.config.identityURL = "https://1234.1234.1234.1234"
 	p5.config.signatureURL = p1.config.signatureURL
+	p5.config.tokenURL = p1.config.tokenURL
 
 	p6, err := generateAWS()
 	assert.FatalError(t, err)
 	p6.Accounts = p1.Accounts
 	p6.config.identityURL = p1.config.identityURL
 	p6.config.signatureURL = "https://1234.1234.1234.1234"
+	p6.config.tokenURL = p1.config.tokenURL
 
 	p7, err := generateAWS()
 	assert.FatalError(t, err)
 	p7.Accounts = p1.Accounts
 	p7.config.identityURL = srv.URL + "/bad-json"
 	p7.config.signatureURL = p1.config.signatureURL
+	p7.config.tokenURL = p1.config.tokenURL
 
 	caURL := "https://ca.smallstep.com"
 	u, err := url.Parse(caURL)
@@ -172,13 +178,64 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 					assert.Equals(t, tt.args.subject, c.Subject)
 					assert.Equals(t, jose.Audience{u.ResolveReference(&url.URL{Path: "/1.0/sign", Fragment: tt.aws.GetID()}).String()}, c.Audience)
 					assert.Equals(t, tt.aws.Accounts[0], c.document.AccountID)
-					err = tt.aws.config.certificate.CheckSignature(
-						tt.aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+					for _, crt := range tt.aws.config.certificates {
+						err = crt.CheckSignature(tt.aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+						if err == nil {
+							break
+						}
+					}
 					assert.NoError(t, err)
 				}
 			}
 		})
 	}
+}
+
+func TestAWS_GetIdentityToken_V1Only(t *testing.T) {
+	aws, srv, err := generateAWSWithServerV1Only()
+	assert.FatalError(t, err)
+	defer srv.Close()
+
+	subject := "foo.local"
+	caURL := "https://ca.smallstep.com"
+	u, err := url.Parse(caURL)
+	assert.Nil(t, err)
+
+	token, err := aws.GetIdentityToken(subject, caURL)
+	assert.Nil(t, err)
+
+	_, c, err := parseAWSToken(token)
+	if assert.NoError(t, err) {
+		assert.Equals(t, awsIssuer, c.Issuer)
+		assert.Equals(t, subject, c.Subject)
+		assert.Equals(t, jose.Audience{u.ResolveReference(&url.URL{Path: "/1.0/sign", Fragment: aws.GetID()}).String()}, c.Audience)
+		assert.Equals(t, aws.Accounts[0], c.document.AccountID)
+		for _, crt := range aws.config.certificates {
+			err = crt.CheckSignature(aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+			if err == nil {
+				break
+			}
+		}
+		assert.NoError(t, err)
+	}
+}
+
+func TestAWS_GetIdentityToken_BadIDMS(t *testing.T) {
+	aws, srv, err := generateAWSWithServer()
+
+	aws.IMDSVersions = []string{"bad"}
+
+	assert.FatalError(t, err)
+	defer srv.Close()
+
+	subject := "foo.local"
+	caURL := "https://ca.smallstep.com"
+
+	token, err := aws.GetIdentityToken(subject, caURL)
+	assert.Equals(t, token, "")
+
+	badIDMS := errors.New("bad: not a supported AWS Instance Metadata Service version")
+	assert.HasSuffix(t, err.Error(), badIDMS.Error())
 }
 
 func TestAWS_Init(t *testing.T) {
@@ -197,6 +254,8 @@ func TestAWS_Init(t *testing.T) {
 		DisableCustomSANs      bool
 		DisableTrustOnFirstUse bool
 		InstanceAge            Duration
+		IMDSVersions           []string
+		IIDRoots               string
 		Claims                 *Claims
 	}
 	type args struct {
@@ -208,12 +267,19 @@ func TestAWS_Init(t *testing.T) {
 		args    args
 		wantErr bool
 	}{
-		{"ok", fields{"AWS", "name", []string{"account"}, false, false, zero, nil}, args{config}, false},
-		{"ok", fields{"AWS", "name", []string{"account"}, true, true, Duration{Duration: 1 * time.Minute}, nil}, args{config}, false},
-		{"fail type ", fields{"", "name", []string{"account"}, false, false, zero, nil}, args{config}, true},
-		{"fail name", fields{"AWS", "", []string{"account"}, false, false, zero, nil}, args{config}, true},
-		{"bad instance age", fields{"AWS", "name", []string{"account"}, false, false, Duration{Duration: -1 * time.Minute}, nil}, args{config}, true},
-		{"fail claims", fields{"AWS", "name", []string{"account"}, false, false, zero, badClaims}, args{config}, true},
+		{"ok", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", nil}, args{config}, false},
+		{"ok/v1", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1"}, "", nil}, args{config}, false},
+		{"ok/v2", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v2"}, "", nil}, args{config}, false},
+		{"ok/empty", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{}, "", nil}, args{config}, false},
+		{"ok/duration", fields{"AWS", "name", []string{"account"}, true, true, Duration{Duration: 1 * time.Minute}, []string{"v1", "v2"}, "", nil}, args{config}, false},
+		{"ok/cert", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "testdata/certs/aws.crt", nil}, args{config}, false},
+		{"fail type ", fields{"", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", nil}, args{config}, true},
+		{"fail name", fields{"AWS", "", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", nil}, args{config}, true},
+		{"bad instance age", fields{"AWS", "name", []string{"account"}, false, false, Duration{Duration: -1 * time.Minute}, []string{"v1", "v2"}, "", nil}, args{config}, true},
+		{"fail/imds", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, "", nil}, args{config}, true},
+		{"fail/missing", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, "testdata/missing.crt", nil}, args{config}, true},
+		{"fail/cert", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, "testdata/certs/rsa.csr", nil}, args{config}, true},
+		{"fail claims", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", badClaims}, args{config}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -224,6 +290,8 @@ func TestAWS_Init(t *testing.T) {
 				DisableCustomSANs:      tt.fields.DisableCustomSANs,
 				DisableTrustOnFirstUse: tt.fields.DisableTrustOnFirstUse,
 				InstanceAge:            tt.fields.InstanceAge,
+				IMDSVersions:           tt.fields.IMDSVersions,
+				IIDRoots:               tt.fields.IIDRoots,
 				Claims:                 tt.fields.Claims,
 			}
 			if err := p.Init(tt.args.config); (err != nil) != tt.wantErr {
@@ -402,8 +470,34 @@ func TestAWS_authorizeToken(t *testing.T) {
 				err:   errors.New("aws.authorizeToken; aws identity document pendingTime is too old"),
 			}
 		},
+		"fail/identityCert": func(t *testing.T) test {
+			p, err := generateAWS()
+			p.IIDRoots = "testdata/certs/aws.crt"
+			assert.FatalError(t, err)
+			tok, err := generateAWSToken(
+				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				"127.0.0.1", "us-west-1", time.Now(), key)
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: tok,
+			}
+		},
 		"ok": func(t *testing.T) test {
 			p, err := generateAWS()
+			assert.FatalError(t, err)
+			tok, err := generateAWSToken(
+				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				"127.0.0.1", "us-west-1", time.Now(), key)
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: tok,
+			}
+		},
+		"ok/identityCert": func(t *testing.T) test {
+			p, err := generateAWS()
+			p.IIDRoots = "testdata/certs/aws-test.crt"
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
 				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
@@ -540,11 +634,11 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 		code    int
 		wantErr bool
 	}{
-		{"ok", p1, args{t1, "foo.local"}, 5, http.StatusOK, false},
-		{"ok", p2, args{t2, "instance-id"}, 9, http.StatusOK, false},
-		{"ok", p2, args{t2Hostname, "ip-127-0-0-1.us-west-1.compute.internal"}, 9, http.StatusOK, false},
-		{"ok", p2, args{t2PrivateIP, "127.0.0.1"}, 9, http.StatusOK, false},
-		{"ok", p1, args{t4, "instance-id"}, 5, http.StatusOK, false},
+		{"ok", p1, args{t1, "foo.local"}, 6, http.StatusOK, false},
+		{"ok", p2, args{t2, "instance-id"}, 10, http.StatusOK, false},
+		{"ok", p2, args{t2Hostname, "ip-127-0-0-1.us-west-1.compute.internal"}, 10, http.StatusOK, false},
+		{"ok", p2, args{t2PrivateIP, "127.0.0.1"}, 10, http.StatusOK, false},
+		{"ok", p1, args{t4, "instance-id"}, 6, http.StatusOK, false},
 		{"fail account", p3, args{token: t3}, 0, http.StatusUnauthorized, true},
 		{"fail token", p1, args{token: "token"}, 0, http.StatusUnauthorized, true},
 		{"fail subject", p1, args{token: failSubject}, 0, http.StatusUnauthorized, true},
@@ -574,6 +668,7 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 				assert.Len(t, tt.wantLen, got)
 				for _, o := range got {
 					switch v := o.(type) {
+					case certificateOptionsFunc:
 					case *provisionerExtensionOption:
 						assert.Equals(t, v.Type, int(TypeAWS))
 						assert.Equals(t, v.Name, tt.aws.GetName())
@@ -646,51 +741,51 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 	assert.FatalError(t, err)
 
 	hostDuration := p1.claimer.DefaultHostSSHCertDuration()
-	expectedHostOptions := &SSHOptions{
+	expectedHostOptions := &SignSSHOptions{
 		CertType: "host", Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
-	expectedHostOptionsIP := &SSHOptions{
+	expectedHostOptionsIP := &SignSSHOptions{
 		CertType: "host", Principals: []string{"127.0.0.1"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
-	expectedHostOptionsHostname := &SSHOptions{
+	expectedHostOptionsHostname := &SignSSHOptions{
 		CertType: "host", Principals: []string{"ip-127-0-0-1.us-west-1.compute.internal"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
-	expectedCustomOptions := &SSHOptions{
+	expectedCustomOptions := &SignSSHOptions{
 		CertType: "host", Principals: []string{"foo.local"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
 
 	type args struct {
 		token   string
-		sshOpts SSHOptions
+		sshOpts SignSSHOptions
 		key     interface{}
 	}
 	tests := []struct {
 		name        string
 		aws         *AWS
 		args        args
-		expected    *SSHOptions
+		expected    *SignSSHOptions
 		code        int
 		wantErr     bool
 		wantSignErr bool
 	}{
-		{"ok", p1, args{t1, SSHOptions{}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-rsa2048", p1, args{t1, SSHOptions{}, rsa2048.Public()}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-type", p1, args{t1, SSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-principals", p1, args{t1, SSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-principal-ip", p1, args{t1, SSHOptions{Principals: []string{"127.0.0.1"}}, pub}, expectedHostOptionsIP, http.StatusOK, false, false},
-		{"ok-principal-hostname", p1, args{t1, SSHOptions{Principals: []string{"ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptionsHostname, http.StatusOK, false, false},
-		{"ok-options", p1, args{t1, SSHOptions{CertType: "host", Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-custom", p2, args{t2, SSHOptions{Principals: []string{"foo.local"}}, pub}, expectedCustomOptions, http.StatusOK, false, false},
-		{"fail-rsa1024", p1, args{t1, SSHOptions{}, rsa1024.Public()}, expectedHostOptions, http.StatusOK, false, true},
-		{"fail-type", p1, args{t1, SSHOptions{CertType: "user"}, pub}, nil, http.StatusOK, false, true},
-		{"fail-principal", p1, args{t1, SSHOptions{Principals: []string{"smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
-		{"fail-extra-principal", p1, args{t1, SSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal", "smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
-		{"fail-sshCA-disabled", p3, args{"foo", SSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
-		{"fail-invalid-token", p1, args{"foo", SSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
+		{"ok", p1, args{t1, SignSSHOptions{}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-rsa2048", p1, args{t1, SignSSHOptions{}, rsa2048.Public()}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-type", p1, args{t1, SignSSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-principals", p1, args{t1, SignSSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-principal-ip", p1, args{t1, SignSSHOptions{Principals: []string{"127.0.0.1"}}, pub}, expectedHostOptionsIP, http.StatusOK, false, false},
+		{"ok-principal-hostname", p1, args{t1, SignSSHOptions{Principals: []string{"ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptionsHostname, http.StatusOK, false, false},
+		{"ok-options", p1, args{t1, SignSSHOptions{CertType: "host", Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-custom", p2, args{t2, SignSSHOptions{Principals: []string{"foo.local"}}, pub}, expectedCustomOptions, http.StatusOK, false, false},
+		{"fail-rsa1024", p1, args{t1, SignSSHOptions{}, rsa1024.Public()}, expectedHostOptions, http.StatusOK, false, true},
+		{"fail-type", p1, args{t1, SignSSHOptions{CertType: "user"}, pub}, nil, http.StatusOK, false, true},
+		{"fail-principal", p1, args{t1, SignSSHOptions{Principals: []string{"smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
+		{"fail-extra-principal", p1, args{t1, SignSSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal", "smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
+		{"fail-sshCA-disabled", p3, args{"foo", SignSSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
+		{"fail-invalid-token", p1, args{"foo", SignSSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -707,6 +802,7 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 			} else if assert.NotNil(t, got) {
 				cert, err := signSSHCertificate(tt.args.key, tt.args.sshOpts, got, signer.Key.(crypto.Signer))
 				if (err != nil) != tt.wantSignErr {
+
 					t.Errorf("SignSSH error = %v, wantSignErr %v", err, tt.wantSignErr)
 				} else {
 					if tt.wantSignErr {

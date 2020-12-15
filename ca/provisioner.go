@@ -7,10 +7,10 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/jose"
 	"github.com/smallstep/cli/token"
 	"github.com/smallstep/cli/token/provision"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/randutil"
 )
 
 const tokenLifetime = 5 * time.Minute
@@ -133,7 +133,7 @@ func (p *Provisioner) SSHToken(certType, keyID string, principals []string) (str
 		token.WithIssuer(p.name),
 		token.WithAudience(p.sshAudience),
 		token.WithValidity(notBefore, notAfter),
-		token.WithSSH(provisioner.SSHOptions{
+		token.WithSSH(provisioner.SignSSHOptions{
 			CertType:   certType,
 			Principals: principals,
 			KeyID:      keyID,

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto"
 	"crypto/dsa"
 	"crypto/ecdsa"
 	"crypto/rsa"
@@ -22,7 +23,6 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
-	"github.com/smallstep/cli/crypto/tlsutil"
 )
 
 // Authority is the interface implemented by a CA authority.
@@ -31,10 +31,11 @@ type Authority interface {
 	// context specifies the Authorize[Sign|Revoke|etc.] method.
 	Authorize(ctx context.Context, ott string) ([]provisioner.SignOption, error)
 	AuthorizeSign(ott string) ([]provisioner.SignOption, error)
-	GetTLSOptions() *tlsutil.TLSOptions
+	GetTLSOptions() *authority.TLSOptions
 	Root(shasum string) (*x509.Certificate, error)
-	Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
+	Sign(cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
 	Renew(peer *x509.Certificate) ([]*x509.Certificate, error)
+	Rekey(peer *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
 	LoadProvisionerByCertificate(*x509.Certificate) (provisioner.Interface, error)
 	LoadProvisionerByID(string) (provisioner.Interface, error)
 	GetProvisioners(cursor string, limit int) (provisioner.List, string, error)
@@ -249,6 +250,7 @@ func (h *caHandler) Route(r Router) {
 	r.MethodFunc("GET", "/root/{sha}", h.Root)
 	r.MethodFunc("POST", "/sign", h.Sign)
 	r.MethodFunc("POST", "/renew", h.Renew)
+	r.MethodFunc("POST", "/rekey", h.Rekey)
 	r.MethodFunc("POST", "/revoke", h.Revoke)
 	r.MethodFunc("GET", "/provisioners", h.Provisioners)
 	r.MethodFunc("GET", "/provisioners/{kid}/encrypted-key", h.ProvisionerKey)
@@ -392,7 +394,8 @@ func logOtt(w http.ResponseWriter, token string) {
 	}
 }
 
-func logCertificate(w http.ResponseWriter, cert *x509.Certificate) {
+// LogCertificate add certificate fields to the log message.
+func LogCertificate(w http.ResponseWriter, cert *x509.Certificate) {
 	if rl, ok := w.(logging.ResponseLogger); ok {
 		m := map[string]interface{}{
 			"serial":      cert.SerialNumber,
@@ -410,7 +413,11 @@ func logCertificate(w http.ResponseWriter, cert *x509.Certificate) {
 				if err != nil || len(rest) > 0 {
 					break
 				}
-				m["provisioner"] = fmt.Sprintf("%s (%s)", val.Name, val.CredentialID)
+				if len(val.CredentialID) > 0 {
+					m["provisioner"] = fmt.Sprintf("%s (%s)", val.Name, val.CredentialID)
+				} else {
+					m["provisioner"] = fmt.Sprintf("%s", val.Name)
+				}
 				break
 			}
 		}

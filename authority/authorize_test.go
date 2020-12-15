@@ -17,11 +17,10 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/randutil"
 	"golang.org/x/crypto/ssh"
-	"gopkg.in/square/go-jose.v2/jwt"
 )
 
 var testAudiences = provisioner.Audiences{
@@ -84,7 +83,7 @@ func generateToken(sub, iss, aud string, sans []string, iat time.Time, jwk *jose
 func TestAuthority_authorizeToken(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -112,16 +111,16 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			}
 		},
 		"fail/prehistoric-token": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
-				IssuedAt:  jwt.NewNumericDate(now.Add(-time.Hour)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				IssuedAt:  jose.NewNumericDate(now.Add(-time.Hour)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -131,11 +130,11 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			}
 		},
 		"fail/provisioner-not-found": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "44",
 			}
@@ -143,7 +142,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 				(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "foo"))
 			assert.FatalError(t, err)
 
-			raw, err := jwt.Signed(_sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(_sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -153,15 +152,15 @@ func TestAuthority_authorizeToken(t *testing.T) {
 			}
 		},
 		"ok/simpledb": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -170,15 +169,50 @@ func TestAuthority_authorizeToken(t *testing.T) {
 		},
 		"fail/simpledb/token-already-used": func(t *testing.T) *authorizeTest {
 			_a := testAuthority(t)
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+			assert.FatalError(t, err)
+			_, err = _a.authorizeToken(context.Background(), raw)
+			assert.FatalError(t, err)
+			return &authorizeTest{
+				auth:  _a,
+				token: raw,
+				err:   errors.New("authority.authorizeToken: token already used"),
+				code:  http.StatusUnauthorized,
+			}
+		},
+		"ok/sha256": func(t *testing.T) *authorizeTest {
+			cl := jose.Claims{
+				Subject:   "test.smallstep.com",
+				Issuer:    validIssuer,
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				Audience:  validAudience,
+			}
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+			assert.FatalError(t, err)
+			return &authorizeTest{
+				auth:  a,
+				token: raw,
+			}
+		},
+		"fail/sha256/token-already-used": func(t *testing.T) *authorizeTest {
+			_a := testAuthority(t)
+			cl := jose.Claims{
+				Subject:   "test.smallstep.com",
+				Issuer:    validIssuer,
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				Audience:  validAudience,
+			}
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			_, err = _a.authorizeToken(context.Background(), raw)
 			assert.FatalError(t, err)
@@ -197,15 +231,15 @@ func TestAuthority_authorizeToken(t *testing.T) {
 				},
 			}
 
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  _a,
@@ -220,15 +254,15 @@ func TestAuthority_authorizeToken(t *testing.T) {
 				},
 			}
 
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  _a,
@@ -245,15 +279,15 @@ func TestAuthority_authorizeToken(t *testing.T) {
 				},
 			}
 
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  _a,
@@ -288,7 +322,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 func TestAuthority_authorizeRevoke(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -316,15 +350,15 @@ func TestAuthority_authorizeRevoke(t *testing.T) {
 			}
 		},
 		"fail/token/invalid-subject": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -334,15 +368,15 @@ func TestAuthority_authorizeRevoke(t *testing.T) {
 			}
 		},
 		"ok/token": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "44",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -372,7 +406,7 @@ func TestAuthority_authorizeRevoke(t *testing.T) {
 func TestAuthority_authorizeSign(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -400,15 +434,15 @@ func TestAuthority_authorizeSign(t *testing.T) {
 			}
 		},
 		"fail/invalid-subject": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -418,15 +452,15 @@ func TestAuthority_authorizeSign(t *testing.T) {
 			}
 		},
 		"ok": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "44",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -449,7 +483,7 @@ func TestAuthority_authorizeSign(t *testing.T) {
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Len(t, 6, got)
+					assert.Len(t, 7, got)
 				}
 			}
 		})
@@ -459,7 +493,7 @@ func TestAuthority_authorizeSign(t *testing.T) {
 func TestAuthority_Authorize(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -496,15 +530,15 @@ func TestAuthority_Authorize(t *testing.T) {
 			}
 		},
 		"ok/sign": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  testAudiences.Sign,
 				ID:        "1",
 			}
-			token, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			token, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -522,15 +556,15 @@ func TestAuthority_Authorize(t *testing.T) {
 			}
 		},
 		"ok/revoke": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  testAudiences.Revoke,
 				ID:        "2",
 			}
-			token, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			token, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -622,15 +656,15 @@ func TestAuthority_Authorize(t *testing.T) {
 			}
 		},
 		"ok/sshRevoke": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "test.smallstep.com",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  testAudiences.SSHRevoke,
 				ID:        "3",
 			}
-			token, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			token, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -830,17 +864,17 @@ func TestAuthority_authorizeRenew(t *testing.T) {
 }
 
 func generateSimpleSSHUserToken(iss, aud string, jwk *jose.JSONWebKey) (string, error) {
-	return generateSSHToken("subject@localhost", iss, aud, time.Now(), &provisioner.SSHOptions{
+	return generateSSHToken("subject@localhost", iss, aud, time.Now(), &provisioner.SignSSHOptions{
 		CertType:   "user",
 		Principals: []string{"name"},
 	}, jwk)
 }
 
 type stepPayload struct {
-	SSH *provisioner.SSHOptions `json:"ssh,omitempty"`
+	SSH *provisioner.SignSSHOptions `json:"ssh,omitempty"`
 }
 
-func generateSSHToken(sub, iss, aud string, iat time.Time, sshOpts *provisioner.SSHOptions, jwk *jose.JSONWebKey) (string, error) {
+func generateSSHToken(sub, iss, aud string, iat time.Time, sshOpts *provisioner.SignSSHOptions, jwk *jose.JSONWebKey) (string, error) {
 	sig, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
 		new(jose.SignerOptions).WithType("JWT").WithHeader("kid", jwk.KeyID),
@@ -892,7 +926,7 @@ func createSSHCert(cert *ssh.Certificate, signer ssh.Signer) (*ssh.Certificate, 
 func TestAuthority_authorizeSSHSign(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -920,15 +954,15 @@ func TestAuthority_authorizeSSHSign(t *testing.T) {
 			}
 		},
 		"fail/invalid-subject": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  validAudience,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -961,7 +995,7 @@ func TestAuthority_authorizeSSHSign(t *testing.T) {
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Len(t, 11, got)
+					assert.Len(t, 7, got)
 				}
 			}
 		})
@@ -971,7 +1005,7 @@ func TestAuthority_authorizeSSHSign(t *testing.T) {
 func TestAuthority_authorizeSSHRenew(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -999,15 +1033,15 @@ func TestAuthority_authorizeSSHRenew(t *testing.T) {
 			}
 		},
 		"fail/sshRenew-unimplemented-jwk-provisioner": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  testAudiences.SSHRenew,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -1073,7 +1107,7 @@ func TestAuthority_authorizeSSHRevoke(t *testing.T) {
 		},
 	})}...)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -1100,15 +1134,15 @@ func TestAuthority_authorizeSSHRevoke(t *testing.T) {
 			}
 		},
 		"fail/invalid-subject": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  testAudiences.SSHRevoke,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,
@@ -1164,7 +1198,7 @@ func TestAuthority_authorizeSSHRevoke(t *testing.T) {
 func TestAuthority_authorizeSSHRekey(t *testing.T) {
 	a := testAuthority(t)
 
-	jwk, err := jose.ParseKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
+	jwk, err := jose.ReadKey("testdata/secrets/step_cli_key_priv.jwk", jose.WithPassword([]byte("pass")))
 	assert.FatalError(t, err)
 
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key},
@@ -1192,15 +1226,15 @@ func TestAuthority_authorizeSSHRekey(t *testing.T) {
 			}
 		},
 		"fail/sshRekey-unimplemented-jwk-provisioner": func(t *testing.T) *authorizeTest {
-			cl := jwt.Claims{
+			cl := jose.Claims{
 				Subject:   "",
 				Issuer:    validIssuer,
-				NotBefore: jwt.NewNumericDate(now),
-				Expiry:    jwt.NewNumericDate(now.Add(time.Minute)),
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
 				Audience:  testAudiences.SSHRekey,
 				ID:        "43",
 			}
-			raw, err := jwt.Signed(sig).Claims(cl).CompactSerialize()
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 			assert.FatalError(t, err)
 			return &authorizeTest{
 				auth:  a,

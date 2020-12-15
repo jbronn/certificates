@@ -12,14 +12,13 @@ import (
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/sshutil"
 	"github.com/smallstep/certificates/templates"
 	"golang.org/x/crypto/ssh"
 )
 
 // SSHAuthority is the interface implemented by a SSH CA authority.
 type SSHAuthority interface {
-	SignSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
+	SignSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
 	RenewSSH(ctx context.Context, cert *ssh.Certificate) (*ssh.Certificate, error)
 	RekeySSH(ctx context.Context, cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
 	SignSSHAddUser(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error)
@@ -27,7 +26,7 @@ type SSHAuthority interface {
 	GetSSHFederation(ctx context.Context) (*authority.SSHKeys, error)
 	GetSSHConfig(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error)
 	CheckSSHHost(ctx context.Context, principal string, token string) (bool, error)
-	GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]sshutil.Host, error)
+	GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]authority.Host, error)
 	GetSSHBastion(ctx context.Context, user string, hostname string) (*authority.Bastion, error)
 }
 
@@ -36,12 +35,13 @@ type SSHSignRequest struct {
 	PublicKey        []byte             `json:"publicKey"` // base64 encoded
 	OTT              string             `json:"ott"`
 	CertType         string             `json:"certType,omitempty"`
+	KeyID            string             `json:"keyID,omitempty"`
 	Principals       []string           `json:"principals,omitempty"`
 	ValidAfter       TimeDuration       `json:"validAfter,omitempty"`
 	ValidBefore      TimeDuration       `json:"validBefore,omitempty"`
 	AddUserPublicKey []byte             `json:"addUserPublicKey,omitempty"`
-	KeyID            string             `json:"keyID"`
 	IdentityCSR      CertificateRequest `json:"identityCSR,omitempty"`
+	TemplateData     json.RawMessage    `json:"templateData,omitempty"`
 }
 
 // Validate validates the SSHSignRequest.
@@ -86,7 +86,7 @@ type SSHCertificate struct {
 // SSHGetHostsResponse is the response object that returns the list of valid
 // hosts for SSH.
 type SSHGetHostsResponse struct {
-	Hosts []sshutil.Host `json:"hosts"`
+	Hosts []authority.Host `json:"hosts"`
 }
 
 // MarshalJSON implements the json.Marshaler interface. Returns a quoted,
@@ -274,12 +274,13 @@ func (h *caHandler) SSHSign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	opts := provisioner.SSHOptions{
-		CertType:    body.CertType,
-		KeyID:       body.KeyID,
-		Principals:  body.Principals,
-		ValidBefore: body.ValidBefore,
-		ValidAfter:  body.ValidAfter,
+	opts := provisioner.SignSSHOptions{
+		CertType:     body.CertType,
+		KeyID:        body.KeyID,
+		Principals:   body.Principals,
+		ValidBefore:  body.ValidBefore,
+		ValidAfter:   body.ValidAfter,
+		TemplateData: body.TemplateData,
 	}
 
 	ctx := provisioner.NewContextWithMethod(r.Context(), provisioner.SSHSignMethod)
@@ -322,7 +323,7 @@ func (h *caHandler) SSHSign(w http.ResponseWriter, r *http.Request) {
 			NotAfter:  time.Unix(int64(cert.ValidBefore), 0),
 		})
 
-		certChain, err := h.Authority.Sign(cr, provisioner.Options{}, signOpts...)
+		certChain, err := h.Authority.Sign(cr, provisioner.SignOptions{}, signOpts...)
 		if err != nil {
 			WriteError(w, errs.ForbiddenErr(err))
 			return

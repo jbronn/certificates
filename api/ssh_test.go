@@ -22,7 +22,6 @@ import (
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/logging"
-	"github.com/smallstep/certificates/sshutil"
 	"github.com/smallstep/certificates/templates"
 	"golang.org/x/crypto/ssh"
 )
@@ -319,13 +318,13 @@ func Test_caHandler_SSHSign(t *testing.T) {
 				authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
 					return []provisioner.SignOption{}, tt.authErr
 				},
-				signSSH: func(ctx context.Context, key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
+				signSSH: func(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
 					return tt.signCert, tt.signErr
 				},
 				signSSHAddUser: func(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error) {
 					return tt.addUserCert, tt.addUserErr
 				},
-				sign: func(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
+				sign: func(cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
 					return tt.tlsSignCerts, tt.tlsSignErr
 				},
 			}).(*caHandler)
@@ -569,29 +568,29 @@ func Test_caHandler_SSHCheckHost(t *testing.T) {
 }
 
 func Test_caHandler_SSHGetHosts(t *testing.T) {
-	hosts := []sshutil.Host{
-		{HostID: "1", HostTags: []sshutil.HostTag{{ID: "1", Name: "group", Value: "1"}}, Hostname: "host1"},
-		{HostID: "2", HostTags: []sshutil.HostTag{{ID: "1", Name: "group", Value: "1"}, {ID: "2", Name: "group", Value: "2"}}, Hostname: "host2"},
+	hosts := []authority.Host{
+		{HostID: "1", HostTags: []authority.HostTag{{ID: "1", Name: "group", Value: "1"}}, Hostname: "host1"},
+		{HostID: "2", HostTags: []authority.HostTag{{ID: "1", Name: "group", Value: "1"}, {ID: "2", Name: "group", Value: "2"}}, Hostname: "host2"},
 	}
 	hostsJSON, err := json.Marshal(hosts)
 	assert.FatalError(t, err)
 
 	tests := []struct {
 		name       string
-		hosts      []sshutil.Host
+		hosts      []authority.Host
 		err        error
 		body       []byte
 		statusCode int
 	}{
 		{"ok", hosts, nil, []byte(fmt.Sprintf(`{"hosts":%s}`, hostsJSON)), http.StatusOK},
-		{"empty (array)", []sshutil.Host{}, nil, []byte(`{"hosts":[]}`), http.StatusOK},
+		{"empty (array)", []authority.Host{}, nil, []byte(`{"hosts":[]}`), http.StatusOK},
 		{"empty (nil)", nil, nil, []byte(`{"hosts":null}`), http.StatusOK},
 		{"error", nil, fmt.Errorf("an error"), nil, http.StatusInternalServerError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := New(&mockAuthority{
-				getSSHHosts: func(context.Context, *x509.Certificate) ([]sshutil.Host, error) {
+				getSSHHosts: func(context.Context, *x509.Certificate) ([]authority.Host, error) {
 					return tt.hosts, tt.err
 				},
 			}).(*caHandler)

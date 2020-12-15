@@ -222,13 +222,12 @@ After=syslog.target network.target
 
 [Service]
 
-User=smallstep
-Group=smallstep
-ExecStart=/bin/sh -c '/bin/step-ca /home/smallstep/.step/config/ca.json --password-file=/home/smallstep/.step/pwd >>   /var/log/smallstep/output.log 2>&1'
+User=step
+Group=step
+ExecStart=/bin/sh -c '/bin/step-ca /home/step/.step/config/ca.json --password-file=/home/step/.step/pwd >> /var/log/step-ca/output.log 2>&1'
 Type=simple
 Restart=on-failure
 RestartSec=10
-
 
 [Install]
 WantedBy=multi-user.target
@@ -243,7 +242,7 @@ $ systemctl status step-ca
 # Configure the `step-ca` process to startup on reboot automatically
 $ systemctl enable step-ca
 # Start the `step-ca` service.
-$ systemctl start smallstep
+$ systemctl start step-ca
 ```
 
 ## Configure Your Environment
@@ -719,6 +718,11 @@ A few things to consider / implement when running multiple instances of `step-ca
 * Use `MySQL` DB: The default `Badger` DB cannot be read / written by more than one
 process simultaneously. The only supported DB that can support multiple instances
 is `MySQL`. See the [database documentation][4] for guidance on configuring `MySQL`.
+  * The ACME server has known concurrency limitations when using the same account to
+  manage multiple orders. The recommended temporary workaround is to generate
+  an ephemeral account keypair for each new ACME order, or to ensure that ACME
+  orders owned by the same account are managed serially. The issue tracking
+  this limitation can be found [here](https://github.com/smallstep/certificates/issues/341).
 
 * Synchronize `ca.json` across instances: `step-ca` reads all of it's
 configuration (and all of the provisioner configuration) from the `ca.json` file

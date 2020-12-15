@@ -14,7 +14,9 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/sshutil"
+	"go.step.sm/crypto/x509util"
 )
 
 // azureOIDCBaseURL is the base discovery url for Microsoft Azure tokens.
@@ -90,6 +92,7 @@ type Azure struct {
 	DisableCustomSANs      bool     `json:"disableCustomSANs"`
 	DisableTrustOnFirstUse bool     `json:"disableTrustOnFirstUse"`
 	Claims                 *Claims  `json:"claims,omitempty"`
+	Options                *Options `json:"options,omitempty"`
 	claimer                *Claimer
 	config                 *azureConfig
 	oidcConfig             openIDConfiguration
@@ -276,6 +279,13 @@ func (p *Azure) AuthorizeSign(ctx context.Context, token string) ([]SignOption, 
 		}
 	}
 
+	// Template options
+	data := x509util.NewTemplateData()
+	data.SetCommonName(name)
+	if v, err := unsafeParseSigned(token); err == nil {
+		data.SetToken(v)
+	}
+
 	// Enforce known common name and default DNS if configured.
 	// By default we'll accept the CN and SANs in the CSR.
 	// There's no way to trust them other than TOFU.
@@ -287,9 +297,18 @@ func (p *Azure) AuthorizeSign(ctx context.Context, token string) ([]SignOption, 
 		so = append(so, ipAddressesValidator(nil))
 		so = append(so, emailAddressesValidator(nil))
 		so = append(so, urisValidator(nil))
+
+		// Enforce SANs in the template.
+		data.SetSANs([]string{name})
+	}
+
+	templateOptions, err := CustomTemplateOptions(p.Options, data, x509util.DefaultIIDLeafTemplate)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "aws.AuthorizeSign")
 	}
 
 	return append(so,
+		templateOptions,
 		// modifiers / withOptions
 		newProvisionerExtensionOption(TypeAzure, p.Name, p.TenantID),
 		profileDefaultDuration(p.claimer.DefaultTLSCertDuration()),
@@ -320,30 +339,42 @@ func (p *Azure) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOptio
 	if err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "azure.AuthorizeSSHSign")
 	}
-	signOptions := []SignOption{
-		// set the key id to the instance name
-		sshCertKeyIDModifier(name),
+
+	signOptions := []SignOption{}
+
+	// Enforce host certificate.
+	defaults := SignSSHOptions{
+		CertType: SSHHostCert,
 	}
+
+	// Validated principals.
+	principals := []string{name}
 
 	// Only enforce known principals if disable custom sans is true.
-	var principals []string
 	if p.DisableCustomSANs {
-		principals = []string{name}
+		defaults.Principals = principals
+	} else {
+		// Check that at least one principal is sent in the request.
+		signOptions = append(signOptions, &sshCertOptionsRequireValidator{
+			Principals: true,
+		})
 	}
 
-	// Default to host + known hostnames
-	defaults := SSHOptions{
-		CertType:   SSHHostCert,
-		Principals: principals,
+	// Certificate templates.
+	data := sshutil.CreateTemplateData(sshutil.HostCert, name, principals)
+	if v, err := unsafeParseSigned(token); err == nil {
+		data.SetToken(v)
 	}
-	// Validate user options
-	signOptions = append(signOptions, sshCertOptionsValidator(defaults))
-	// Set defaults if not given as user options
-	signOptions = append(signOptions, sshCertDefaultsModifier(defaults))
+
+	templateOptions, err := CustomSSHTemplateOptions(p.Options, data, sshutil.DefaultIIDTemplate)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "azure.AuthorizeSSHSign")
+	}
+	signOptions = append(signOptions, templateOptions)
 
 	return append(signOptions,
-		// Set the default extensions.
-		&sshDefaultExtensionModifier{},
+		// Validate user SignSSHOptions.
+		sshCertOptionsValidator(defaults),
 		// Set the validity bounds if not set.
 		&sshDefaultDuration{p.claimer},
 		// Validate public key

@@ -245,7 +245,7 @@ func (l *List) UnmarshalJSON(data []byte) error {
 			continue
 		}
 		if err := json.Unmarshal(data, p); err != nil {
-			return errors.Errorf("error unmarshaling provisioner")
+			return errors.Wrap(err, "error unmarshaling provisioner")
 		}
 		*l = append(*l, p)
 	}
@@ -326,7 +326,14 @@ func (b *base) AuthorizeSSHRekey(ctx context.Context, token string) (*ssh.Certif
 // Identity is the type representing an externally supplied identity that is used
 // by provisioners to populate certificate fields.
 type Identity struct {
-	Usernames []string `json:"usernames"`
+	Usernames   []string `json:"usernames"`
+	Permissions `json:"permissions"`
+}
+
+// Permissions defines extra extensions and critical options to grant to an SSH certificate.
+type Permissions struct {
+	Extensions      map[string]string `json:"extensions"`
+	CriticalOptions map[string]string `json:"criticalOptions"`
 }
 
 // GetIdentityFunc is a function that returns an identity.

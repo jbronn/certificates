@@ -2,19 +2,21 @@ package api
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"net/http"
 
+	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/tlsutil"
 )
 
 // SignRequest is the request body for a certificate signature request.
 type SignRequest struct {
-	CsrPEM    CertificateRequest `json:"csr"`
-	OTT       string             `json:"ott"`
-	NotAfter  TimeDuration       `json:"notAfter"`
-	NotBefore TimeDuration       `json:"notBefore"`
+	CsrPEM       CertificateRequest `json:"csr"`
+	OTT          string             `json:"ott"`
+	NotAfter     TimeDuration       `json:"notAfter,omitempty"`
+	NotBefore    TimeDuration       `json:"notBefore,omitempty"`
+	TemplateData json.RawMessage    `json:"templateData,omitempty"`
 }
 
 // Validate checks the fields of the SignRequest and returns nil if they are ok
@@ -35,11 +37,11 @@ func (s *SignRequest) Validate() error {
 
 // SignResponse is the response object of the certificate signature request.
 type SignResponse struct {
-	ServerPEM    Certificate          `json:"crt"`
-	CaPEM        Certificate          `json:"ca"`
-	CertChainPEM []Certificate        `json:"certChain"`
-	TLSOptions   *tlsutil.TLSOptions  `json:"tlsOptions,omitempty"`
-	TLS          *tls.ConnectionState `json:"-"`
+	ServerPEM    Certificate           `json:"crt"`
+	CaPEM        Certificate           `json:"ca"`
+	CertChainPEM []Certificate         `json:"certChain"`
+	TLSOptions   *authority.TLSOptions `json:"tlsOptions,omitempty"`
+	TLS          *tls.ConnectionState  `json:"-"`
 }
 
 // Sign is an HTTP handler that reads a certificate request and an
@@ -58,9 +60,10 @@ func (h *caHandler) Sign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opts := provisioner.Options{
-		NotBefore: body.NotBefore,
-		NotAfter:  body.NotAfter,
+	opts := provisioner.SignOptions{
+		NotBefore:    body.NotBefore,
+		NotAfter:     body.NotAfter,
+		TemplateData: body.TemplateData,
 	}
 
 	signOpts, err := h.Authority.AuthorizeSign(body.OTT)
@@ -79,7 +82,7 @@ func (h *caHandler) Sign(w http.ResponseWriter, r *http.Request) {
 	if len(certChainPEM) > 1 {
 		caPEM = certChainPEM[1]
 	}
-	logCertificate(w, certChain[0])
+	LogCertificate(w, certChain[0])
 	JSONStatus(w, &SignResponse{
 		ServerPEM:    certChainPEM[0],
 		CaPEM:        caPEM,

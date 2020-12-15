@@ -6,14 +6,19 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/nosql"
+	"go.step.sm/crypto/x509util"
 )
 
 var defaultOrderExpiry = time.Hour * 24
+
+// Mutex for locking ordersByAccount index operations.
+var ordersByAccountMux sync.Mutex
 
 // Order contains order metadata for the ACME protocol order type.
 type Order struct {
@@ -110,17 +115,81 @@ func newOrder(db nosql.DB, ops OrderOptions) (*order, error) {
 		return nil, err
 	}
 
-	// Update the "order IDs by account ID" index //
-	oids, err := getOrderIDsByAccount(db, ops.AccountID)
+	var oidHelper = orderIDsByAccount{}
+	_, err = oidHelper.addOrderID(db, ops.AccountID, o.ID)
 	if err != nil {
 		return nil, err
 	}
-	newOids := append(oids, o.ID)
-	if err = orderIDs(newOids).save(db, oids, o.AccountID); err != nil {
-		db.Del(orderTable, []byte(o.ID))
+	return o, nil
+}
+
+type orderIDsByAccount struct{}
+
+// addOrderID adds an order ID to a users index of in progress order IDs.
+// This method will also cull any orders that are no longer in the `pending`
+// state from the index before returning it.
+func (oiba orderIDsByAccount) addOrderID(db nosql.DB, accID string, oid string) ([]string, error) {
+	ordersByAccountMux.Lock()
+	defer ordersByAccountMux.Unlock()
+
+	// Update the "order IDs by account ID" index
+	oids, err := oiba.unsafeGetOrderIDsByAccount(db, accID)
+	if err != nil {
 		return nil, err
 	}
-	return o, nil
+	newOids := append(oids, oid)
+	if err = orderIDs(newOids).save(db, oids, accID); err != nil {
+		// Delete the entire order if storing the index fails.
+		db.Del(orderTable, []byte(oid))
+		return nil, err
+	}
+	return newOids, nil
+}
+
+// unsafeGetOrderIDsByAccount retrieves a list of Order IDs that were created by the
+// account.
+func (oiba orderIDsByAccount) unsafeGetOrderIDsByAccount(db nosql.DB, accID string) ([]string, error) {
+	b, err := db.Get(ordersByAccountIDTable, []byte(accID))
+	if err != nil {
+		if nosql.IsErrNotFound(err) {
+			return []string{}, nil
+		}
+		return nil, ServerInternalErr(errors.Wrapf(err, "error loading orderIDs for account %s", accID))
+	}
+	var oids []string
+	if err := json.Unmarshal(b, &oids); err != nil {
+		return nil, ServerInternalErr(errors.Wrapf(err, "error unmarshaling orderIDs for account %s", accID))
+	}
+
+	// Remove any order that is not in PENDING state and update the stored list
+	// before returning.
+	//
+	// According to RFC 8555:
+	// The server SHOULD include pending orders and SHOULD NOT include orders
+	// that are invalid in the array of URLs.
+	pendOids := []string{}
+	for _, oid := range oids {
+		o, err := getOrder(db, oid)
+		if err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error loading order %s for account %s", oid, accID))
+		}
+		if o, err = o.updateStatus(db); err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error updating order %s for account %s", oid, accID))
+		}
+		if o.Status == StatusPending {
+			pendOids = append(pendOids, oid)
+		}
+	}
+	// If the number of pending orders is less than the number of orders in the
+	// list, then update the pending order list.
+	if len(pendOids) != len(oids) {
+		if err = orderIDs(pendOids).save(db, oids, accID); err != nil {
+			return nil, ServerInternalErr(errors.Wrapf(err, "error storing orderIDs as part of getOrderIDsByAccount logic: "+
+				"len(orderIDs) = %d", len(pendOids)))
+		}
+	}
+
+	return pendOids, nil
 }
 
 type orderIDs []string
@@ -270,6 +339,7 @@ func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAut
 	if o, err = o.updateStatus(db); err != nil {
 		return nil, err
 	}
+
 	switch o.Status {
 	case StatusInvalid:
 		return nil, OrderNotReadyErr(errors.Errorf("order %s has been abandoned", o.ID))
@@ -299,23 +369,23 @@ func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAut
 	orderNames = uniqueLowerNames(orderNames)
 
 	// Validate identifier names against CSR alternative names.
+	//
+	// Note that with certificate templates we are not going to check for the
+	// absence of other SANs as they will only be set if the templates allows
+	// them.
 	if len(csr.DNSNames) != len(orderNames) {
 		return nil, BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly: CSR names = %v, Order names = %v", csr.DNSNames, orderNames))
 	}
+
+	sans := make([]x509util.SubjectAlternativeName, len(csr.DNSNames))
 	for i := range csr.DNSNames {
 		if csr.DNSNames[i] != orderNames[i] {
 			return nil, BadCSRErr(errors.Errorf("CSR names do not match identifiers exactly: CSR names = %v, Order names = %v", csr.DNSNames, orderNames))
 		}
-	}
-
-	if len(csr.IPAddresses) > 0 {
-		return nil, BadCSRErr(errors.Errorf("CSR contains IP Address SANs, but should only contain DNS Names"))
-	}
-	if len(csr.EmailAddresses) > 0 {
-		return nil, BadCSRErr(errors.Errorf("CSR contains Email Address SANs, but should only contain DNS Names"))
-	}
-	if len(csr.URIs) > 0 {
-		return nil, BadCSRErr(errors.Errorf("CSR contains URI SANs, but should only contain DNS Names"))
+		sans[i] = x509util.SubjectAlternativeName{
+			Type:  x509util.DNSType,
+			Value: csr.DNSNames[i],
+		}
 	}
 
 	// Get authorizations from the ACME provisioner.
@@ -325,8 +395,19 @@ func (o *order) finalize(db nosql.DB, csr *x509.CertificateRequest, auth SignAut
 		return nil, ServerInternalErr(errors.Wrapf(err, "error retrieving authorization options from ACME provisioner"))
 	}
 
+	// Template data
+	data := x509util.NewTemplateData()
+	data.SetCommonName(csr.Subject.CommonName)
+	data.Set(x509util.SANsKey, sans)
+
+	templateOptions, err := provisioner.TemplateOptions(p.GetOptions(), data)
+	if err != nil {
+		return nil, ServerInternalErr(errors.Wrapf(err, "error creating template options from ACME provisioner"))
+	}
+	signOps = append(signOps, templateOptions)
+
 	// Create and store a new certificate.
-	certChain, err := auth.Sign(csr, provisioner.Options{
+	certChain, err := auth.Sign(csr, provisioner.SignOptions{
 		NotBefore: provisioner.NewTimeDuration(o.NotBefore),
 		NotAfter:  provisioner.NewTimeDuration(o.NotAfter),
 	}, signOps...)

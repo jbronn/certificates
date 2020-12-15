@@ -8,9 +8,10 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/cas"
+	casapi "github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/kms"
-	"github.com/smallstep/certificates/sshutil"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -64,7 +65,7 @@ func WithSSHBastionFunc(fn func(ctx context.Context, user, host string) (*Bastio
 
 // WithSSHGetHosts sets a custom function to get the bastion for a
 // given user-host pair.
-func WithSSHGetHosts(fn func(ctx context.Context, cert *x509.Certificate) ([]sshutil.Host, error)) Option {
+func WithSSHGetHosts(fn func(ctx context.Context, cert *x509.Certificate) ([]Host, error)) Option {
 	return func(a *Authority) error {
 		a.sshGetHostsFunc = fn
 		return nil
@@ -93,8 +94,15 @@ func WithKeyManager(k kms.KeyManager) Option {
 // WithX509Signer defines the signer used to sign X509 certificates.
 func WithX509Signer(crt *x509.Certificate, s crypto.Signer) Option {
 	return func(a *Authority) error {
-		a.x509Issuer = crt
-		a.x509Signer = s
+		srv, err := cas.New(context.Background(), casapi.Options{
+			Type:   casapi.SoftCAS,
+			Issuer: crt,
+			Signer: s,
+		})
+		if err != nil {
+			return err
+		}
+		a.x509CAService = srv
 		return nil
 	}
 }
