@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/dsa"
+	"crypto/dsa" //nolint
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,7 +16,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -166,382 +167,6 @@ func parseCertificateRequest(data string) *x509.CertificateRequest {
 	return csr
 }
 
-func TestNewCertificate(t *testing.T) {
-	cert := parseCertificate(rootPEM)
-	if !reflect.DeepEqual(Certificate{Certificate: cert}, NewCertificate(cert)) {
-		t.Errorf("NewCertificate failed, got %v, wants %v", NewCertificate(cert), Certificate{Certificate: cert})
-	}
-}
-
-func TestCertificate_MarshalJSON(t *testing.T) {
-	type fields struct {
-		Certificate *x509.Certificate
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		want    []byte
-		wantErr bool
-	}{
-		{"nil", fields{Certificate: nil}, []byte("null"), false},
-		{"empty", fields{Certificate: &x509.Certificate{Raw: nil}}, []byte(`"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"`), false},
-		{"root", fields{Certificate: parseCertificate(rootPEM)}, []byte(`"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"`), false},
-		{"cert", fields{Certificate: parseCertificate(certPEM)}, []byte(`"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n"`), false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := Certificate{
-				Certificate: tt.fields.Certificate,
-			}
-			got, err := c.MarshalJSON()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Certificate.MarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Certificate.MarshalJSON() = %s, want %s", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCertificate_UnmarshalJSON(t *testing.T) {
-	tests := []struct {
-		name     string
-		data     []byte
-		wantCert bool
-		wantErr  bool
-	}{
-		{"no data", nil, false, true},
-		{"incomplete string 1", []byte(`"foobar`), false, true}, {"incomplete string 2", []byte(`foobar"`), false, true},
-		{"invalid string", []byte(`"foobar"`), false, true},
-		{"invalid bytes 0", []byte{}, false, true}, {"invalid bytes 1", []byte{1}, false, true},
-		{"empty csr", []byte(`"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE----\n"`), false, true},
-		{"invalid type", []byte(`"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `"`), false, true},
-		{"empty string", []byte(`""`), false, false},
-		{"json null", []byte(`null`), false, false},
-		{"valid root", []byte(`"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `"`), true, false},
-		{"valid cert", []byte(`"` + strings.Replace(certPEM, "\n", `\n`, -1) + `"`), true, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var c Certificate
-			if err := c.UnmarshalJSON(tt.data); (err != nil) != tt.wantErr {
-				t.Errorf("Certificate.UnmarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantCert && c.Certificate == nil {
-				t.Error("Certificate.UnmarshalJSON() failed, Certificate is nil")
-			}
-		})
-	}
-}
-
-func TestCertificate_UnmarshalJSON_json(t *testing.T) {
-	tests := []struct {
-		name     string
-		data     string
-		wantCert bool
-		wantErr  bool
-	}{
-		{"invalid type (bool)", `{"crt":true}`, false, true},
-		{"invalid type (number)", `{"crt":123}`, false, true},
-		{"invalid type (object)", `{"crt":{}}`, false, true},
-		{"empty crt (null)", `{"crt":null}`, false, false},
-		{"empty crt (string)", `{"crt":""}`, false, false},
-		{"empty crt", `{"crt":"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE----\n"}`, false, true},
-		{"valid crt", `{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `"}`, true, false},
-	}
-
-	type request struct {
-		Cert Certificate `json:"crt"`
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var body request
-			if err := json.Unmarshal([]byte(tt.data), &body); (err != nil) != tt.wantErr {
-				t.Errorf("json.Unmarshal() error = %v, wantErr %v", err, tt.wantErr)
-			}
-
-			switch tt.wantCert {
-			case true:
-				if body.Cert.Certificate == nil {
-					t.Error("json.Unmarshal() failed, Certificate is nil")
-				}
-			case false:
-				if body.Cert.Certificate != nil {
-					t.Error("json.Unmarshal() failed, Certificate is not nil")
-				}
-			}
-		})
-	}
-}
-func TestNewCertificateRequest(t *testing.T) {
-	csr := parseCertificateRequest(csrPEM)
-	if !reflect.DeepEqual(CertificateRequest{CertificateRequest: csr}, NewCertificateRequest(csr)) {
-		t.Errorf("NewCertificateRequest failed, got %v, wants %v", NewCertificateRequest(csr), CertificateRequest{CertificateRequest: csr})
-	}
-}
-
-func TestCertificateRequest_MarshalJSON(t *testing.T) {
-	type fields struct {
-		CertificateRequest *x509.CertificateRequest
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		want    []byte
-		wantErr bool
-	}{
-		{"nil", fields{CertificateRequest: nil}, []byte("null"), false},
-		{"empty", fields{CertificateRequest: &x509.CertificateRequest{}}, []byte(`"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n"`), false},
-		{"csr", fields{CertificateRequest: parseCertificateRequest(csrPEM)}, []byte(`"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `\n"`), false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := CertificateRequest{
-				CertificateRequest: tt.fields.CertificateRequest,
-			}
-			got, err := c.MarshalJSON()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("CertificateRequest.MarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("CertificateRequest.MarshalJSON() = %s, want %s", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCertificateRequest_UnmarshalJSON(t *testing.T) {
-	tests := []struct {
-		name     string
-		data     []byte
-		wantCert bool
-		wantErr  bool
-	}{
-		{"no data", nil, false, true},
-		{"incomplete string 1", []byte(`"foobar`), false, true}, {"incomplete string 2", []byte(`foobar"`), false, true},
-		{"invalid string", []byte(`"foobar"`), false, true},
-		{"invalid bytes 0", []byte{}, false, true}, {"invalid bytes 1", []byte{1}, false, true},
-		{"empty csr", []byte(`"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST----\n"`), false, true},
-		{"invalid type", []byte(`"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `"`), false, true},
-		{"empty string", []byte(`""`), false, false},
-		{"json null", []byte(`null`), false, false},
-		{"valid csr", []byte(`"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `"`), true, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var c CertificateRequest
-			if err := c.UnmarshalJSON(tt.data); (err != nil) != tt.wantErr {
-				t.Errorf("CertificateRequest.UnmarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantCert && c.CertificateRequest == nil {
-				t.Error("CertificateRequest.UnmarshalJSON() failed, CertificateRequet is nil")
-			}
-		})
-	}
-}
-
-func TestCertificateRequest_UnmarshalJSON_json(t *testing.T) {
-	tests := []struct {
-		name     string
-		data     string
-		wantCert bool
-		wantErr  bool
-	}{
-		{"invalid type (bool)", `{"csr":true}`, false, true},
-		{"invalid type (number)", `{"csr":123}`, false, true},
-		{"invalid type (object)", `{"csr":{}}`, false, true},
-		{"empty csr (null)", `{"csr":null}`, false, false},
-		{"empty csr (string)", `{"csr":""}`, false, false},
-		{"empty csr", `{"csr":"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST----\n"}`, false, true},
-		{"valid csr", `{"csr":"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `"}`, true, false},
-	}
-
-	type request struct {
-		CSR CertificateRequest `json:"csr"`
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var body request
-			if err := json.Unmarshal([]byte(tt.data), &body); (err != nil) != tt.wantErr {
-				t.Errorf("json.Unmarshal() error = %v, wantErr %v", err, tt.wantErr)
-			}
-
-			switch tt.wantCert {
-			case true:
-				if body.CSR.CertificateRequest == nil {
-					t.Error("json.Unmarshal() failed, CertificateRequest is nil")
-				}
-			case false:
-				if body.CSR.CertificateRequest != nil {
-					t.Error("json.Unmarshal() failed, CertificateRequest is not nil")
-				}
-			}
-		})
-	}
-}
-
-func TestSignRequest_Validate(t *testing.T) {
-	csr := parseCertificateRequest(csrPEM)
-	bad := parseCertificateRequest(csrPEM)
-	bad.Signature[0]++
-	type fields struct {
-		CsrPEM    CertificateRequest
-		OTT       string
-		NotBefore time.Time
-		NotAfter  time.Time
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		err    error
-	}{
-		{"missing csr", fields{CertificateRequest{}, "foobarzar", time.Time{}, time.Time{}}, errors.New("missing csr")},
-		{"invalid csr", fields{CertificateRequest{bad}, "foobarzar", time.Time{}, time.Time{}}, errors.New("invalid csr")},
-		{"missing ott", fields{CertificateRequest{csr}, "", time.Time{}, time.Time{}}, errors.New("missing ott")},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &SignRequest{
-				CsrPEM:    tt.fields.CsrPEM,
-				OTT:       tt.fields.OTT,
-				NotAfter:  NewTimeDuration(tt.fields.NotAfter),
-				NotBefore: NewTimeDuration(tt.fields.NotBefore),
-			}
-			if err := s.Validate(); err != nil {
-				if assert.NotNil(t, tt.err) {
-					assert.HasPrefix(t, err.Error(), tt.err.Error())
-				}
-			} else {
-				assert.Nil(t, tt.err)
-			}
-		})
-	}
-}
-
-type mockProvisioner struct {
-	ret1, ret2, ret3   interface{}
-	err                error
-	getID              func() string
-	getTokenID         func(string) (string, error)
-	getName            func() string
-	getType            func() provisioner.Type
-	getEncryptedKey    func() (string, string, bool)
-	init               func(provisioner.Config) error
-	authorizeRenew     func(ctx context.Context, cert *x509.Certificate) error
-	authorizeRevoke    func(ctx context.Context, token string) error
-	authorizeSign      func(ctx context.Context, ott string) ([]provisioner.SignOption, error)
-	authorizeRenewal   func(*x509.Certificate) error
-	authorizeSSHSign   func(ctx context.Context, token string) ([]provisioner.SignOption, error)
-	authorizeSSHRevoke func(ctx context.Context, token string) error
-	authorizeSSHRenew  func(ctx context.Context, token string) (*ssh.Certificate, error)
-	authorizeSSHRekey  func(ctx context.Context, token string) (*ssh.Certificate, []provisioner.SignOption, error)
-}
-
-func (m *mockProvisioner) GetID() string {
-	if m.getID != nil {
-		return m.getID()
-	}
-	return m.ret1.(string)
-}
-
-func (m *mockProvisioner) GetTokenID(token string) (string, error) {
-	if m.getTokenID != nil {
-		return m.getTokenID(token)
-	}
-	if m.ret1 == nil {
-		return "", m.err
-	}
-	return m.ret1.(string), m.err
-}
-
-func (m *mockProvisioner) GetName() string {
-	if m.getName != nil {
-		return m.getName()
-	}
-	return m.ret1.(string)
-}
-
-func (m *mockProvisioner) GetType() provisioner.Type {
-	if m.getType != nil {
-		return m.getType()
-	}
-	return m.ret1.(provisioner.Type)
-}
-
-func (m *mockProvisioner) GetEncryptedKey() (string, string, bool) {
-	if m.getEncryptedKey != nil {
-		return m.getEncryptedKey()
-	}
-	return m.ret1.(string), m.ret2.(string), m.ret3.(bool)
-}
-
-func (m *mockProvisioner) Init(c provisioner.Config) error {
-	if m.init != nil {
-		return m.init(c)
-	}
-	return m.err
-}
-
-func (m *mockProvisioner) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
-	if m.authorizeRenew != nil {
-		return m.authorizeRenew(ctx, cert)
-	}
-	return m.err
-}
-
-func (m *mockProvisioner) AuthorizeRevoke(ctx context.Context, token string) error {
-	if m.authorizeRevoke != nil {
-		return m.authorizeRevoke(ctx, token)
-	}
-	return m.err
-}
-
-func (m *mockProvisioner) AuthorizeSign(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
-	if m.authorizeSign != nil {
-		return m.authorizeSign(ctx, ott)
-	}
-	return m.ret1.([]provisioner.SignOption), m.err
-}
-
-func (m *mockProvisioner) AuthorizeRenewal(c *x509.Certificate) error {
-	if m.authorizeRenewal != nil {
-		return m.authorizeRenewal(c)
-	}
-	return m.err
-}
-
-func (m *mockProvisioner) AuthorizeSSHSign(ctx context.Context, token string) ([]provisioner.SignOption, error) {
-	if m.authorizeSSHSign != nil {
-		return m.authorizeSSHSign(ctx, token)
-	}
-	return m.ret1.([]provisioner.SignOption), m.err
-}
-func (m *mockProvisioner) AuthorizeSSHRevoke(ctx context.Context, token string) error {
-	if m.authorizeSSHRevoke != nil {
-		return m.authorizeSSHRevoke(ctx, token)
-	}
-	return m.err
-}
-func (m *mockProvisioner) AuthorizeSSHRenew(ctx context.Context, token string) (*ssh.Certificate, error) {
-	if m.authorizeSSHRenew != nil {
-		return m.authorizeSSHRenew(ctx, token)
-	}
-	return m.ret1.(*ssh.Certificate), m.err
-}
-func (m *mockProvisioner) AuthorizeSSHRekey(ctx context.Context, token string) (*ssh.Certificate, []provisioner.SignOption, error) {
-	if m.authorizeSSHRekey != nil {
-		return m.authorizeSSHRekey(ctx, token)
-	}
-	return m.ret1.(*ssh.Certificate), m.ret2.([]provisioner.SignOption), m.err
-}
-
 type mockAuthority struct {
 	ret1, ret2                   interface{}
 	err                          error
@@ -552,7 +177,7 @@ type mockAuthority struct {
 	renew                        func(cert *x509.Certificate) ([]*x509.Certificate, error)
 	rekey                        func(oldCert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
 	loadProvisionerByCertificate func(cert *x509.Certificate) (provisioner.Interface, error)
-	loadProvisionerByID          func(provID string) (provisioner.Interface, error)
+	loadProvisionerByName        func(name string) (provisioner.Interface, error)
 	getProvisioners              func(nextCursor string, limit int) (provisioner.List, string, error)
 	revoke                       func(context.Context, *authority.RevokeOptions) error
 	getEncryptedKey              func(kid string) (string, error)
@@ -632,9 +257,9 @@ func (m *mockAuthority) LoadProvisionerByCertificate(cert *x509.Certificate) (pr
 	return m.ret1.(provisioner.Interface), m.err
 }
 
-func (m *mockAuthority) LoadProvisionerByID(provID string) (provisioner.Interface, error) {
-	if m.loadProvisionerByID != nil {
-		return m.loadProvisionerByID(provID)
+func (m *mockAuthority) LoadProvisionerByName(name string) (provisioner.Interface, error) {
+	if m.loadProvisionerByName != nil {
+		return m.loadProvisionerByName(name)
 	}
 	return m.ret1.(provisioner.Interface), m.err
 }
@@ -730,7 +355,7 @@ func (m *mockAuthority) CheckSSHHost(ctx context.Context, principal, token strin
 	return m.ret1.(bool), m.err
 }
 
-func (m *mockAuthority) GetSSHBastion(ctx context.Context, user string, hostname string) (*authority.Bastion, error) {
+func (m *mockAuthority) GetSSHBastion(ctx context.Context, user, hostname string) (*authority.Bastion, error) {
 	if m.getSSHBastion != nil {
 		return m.getSSHBastion(ctx, user, hostname)
 	}
@@ -742,6 +367,390 @@ func (m *mockAuthority) Version() authority.Version {
 		return m.version()
 	}
 	return m.ret1.(authority.Version)
+}
+
+func TestNewCertificate(t *testing.T) {
+	cert := parseCertificate(rootPEM)
+	if !reflect.DeepEqual(Certificate{Certificate: cert}, NewCertificate(cert)) {
+		t.Errorf("NewCertificate failed, got %v, wants %v", NewCertificate(cert), Certificate{Certificate: cert})
+	}
+}
+
+func TestCertificate_MarshalJSON(t *testing.T) {
+	type fields struct {
+		Certificate *x509.Certificate
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		want    []byte
+		wantErr bool
+	}{
+		{"nil", fields{Certificate: nil}, []byte("null"), false},
+		{"empty", fields{Certificate: &x509.Certificate{Raw: nil}}, []byte(`"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"`), false},
+		{"root", fields{Certificate: parseCertificate(rootPEM)}, []byte(`"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"`), false},
+		{"cert", fields{Certificate: parseCertificate(certPEM)}, []byte(`"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n"`), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Certificate{
+				Certificate: tt.fields.Certificate,
+			}
+			got, err := c.MarshalJSON()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Certificate.MarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Certificate.MarshalJSON() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCertificate_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		wantCert bool
+		wantErr  bool
+	}{
+		{"no data", nil, false, true},
+		{"incomplete string 1", []byte(`"foobar`), false, true}, {"incomplete string 2", []byte(`foobar"`), false, true},
+		{"invalid string", []byte(`"foobar"`), false, true},
+		{"invalid bytes 0", []byte{}, false, true}, {"invalid bytes 1", []byte{1}, false, true},
+		{"empty csr", []byte(`"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE----\n"`), false, true},
+		{"invalid type", []byte(`"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `"`), false, true},
+		{"empty string", []byte(`""`), false, false},
+		{"json null", []byte(`null`), false, false},
+		{"valid root", []byte(`"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `"`), true, false},
+		{"valid cert", []byte(`"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `"`), true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c Certificate
+			if err := c.UnmarshalJSON(tt.data); (err != nil) != tt.wantErr {
+				t.Errorf("Certificate.UnmarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantCert && c.Certificate == nil {
+				t.Error("Certificate.UnmarshalJSON() failed, Certificate is nil")
+			}
+		})
+	}
+}
+
+func TestCertificate_UnmarshalJSON_json(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     string
+		wantCert bool
+		wantErr  bool
+	}{
+		{"invalid type (bool)", `{"crt":true}`, false, true},
+		{"invalid type (number)", `{"crt":123}`, false, true},
+		{"invalid type (object)", `{"crt":{}}`, false, true},
+		{"empty crt (null)", `{"crt":null}`, false, false},
+		{"empty crt (string)", `{"crt":""}`, false, false},
+		{"empty crt", `{"crt":"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE----\n"}`, false, true},
+		{"valid crt", `{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `"}`, true, false},
+	}
+
+	type request struct {
+		Cert Certificate `json:"crt"`
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body request
+			if err := json.Unmarshal([]byte(tt.data), &body); (err != nil) != tt.wantErr {
+				t.Errorf("json.Unmarshal() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			switch tt.wantCert {
+			case true:
+				if body.Cert.Certificate == nil {
+					t.Error("json.Unmarshal() failed, Certificate is nil")
+				}
+			case false:
+				if body.Cert.Certificate != nil {
+					t.Error("json.Unmarshal() failed, Certificate is not nil")
+				}
+			}
+		})
+	}
+}
+func TestNewCertificateRequest(t *testing.T) {
+	csr := parseCertificateRequest(csrPEM)
+	if !reflect.DeepEqual(CertificateRequest{CertificateRequest: csr}, NewCertificateRequest(csr)) {
+		t.Errorf("NewCertificateRequest failed, got %v, wants %v", NewCertificateRequest(csr), CertificateRequest{CertificateRequest: csr})
+	}
+}
+
+func TestCertificateRequest_MarshalJSON(t *testing.T) {
+	type fields struct {
+		CertificateRequest *x509.CertificateRequest
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		want    []byte
+		wantErr bool
+	}{
+		{"nil", fields{CertificateRequest: nil}, []byte("null"), false},
+		{"empty", fields{CertificateRequest: &x509.CertificateRequest{}}, []byte(`"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n"`), false},
+		{"csr", fields{CertificateRequest: parseCertificateRequest(csrPEM)}, []byte(`"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `\n"`), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := CertificateRequest{
+				CertificateRequest: tt.fields.CertificateRequest,
+			}
+			got, err := c.MarshalJSON()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CertificateRequest.MarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("CertificateRequest.MarshalJSON() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCertificateRequest_UnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		wantCert bool
+		wantErr  bool
+	}{
+		{"no data", nil, false, true},
+		{"incomplete string 1", []byte(`"foobar`), false, true}, {"incomplete string 2", []byte(`foobar"`), false, true},
+		{"invalid string", []byte(`"foobar"`), false, true},
+		{"invalid bytes 0", []byte{}, false, true}, {"invalid bytes 1", []byte{1}, false, true},
+		{"empty csr", []byte(`"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST----\n"`), false, true},
+		{"invalid type", []byte(`"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `"`), false, true},
+		{"empty string", []byte(`""`), false, false},
+		{"json null", []byte(`null`), false, false},
+		{"valid csr", []byte(`"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `"`), true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c CertificateRequest
+			if err := c.UnmarshalJSON(tt.data); (err != nil) != tt.wantErr {
+				t.Errorf("CertificateRequest.UnmarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantCert && c.CertificateRequest == nil {
+				t.Error("CertificateRequest.UnmarshalJSON() failed, CertificateRequet is nil")
+			}
+		})
+	}
+}
+
+func TestCertificateRequest_UnmarshalJSON_json(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     string
+		wantCert bool
+		wantErr  bool
+	}{
+		{"invalid type (bool)", `{"csr":true}`, false, true},
+		{"invalid type (number)", `{"csr":123}`, false, true},
+		{"invalid type (object)", `{"csr":{}}`, false, true},
+		{"empty csr (null)", `{"csr":null}`, false, false},
+		{"empty csr (string)", `{"csr":""}`, false, false},
+		{"empty csr", `{"csr":"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST----\n"}`, false, true},
+		{"valid csr", `{"csr":"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `"}`, true, false},
+	}
+
+	type request struct {
+		CSR CertificateRequest `json:"csr"`
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body request
+			if err := json.Unmarshal([]byte(tt.data), &body); (err != nil) != tt.wantErr {
+				t.Errorf("json.Unmarshal() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			switch tt.wantCert {
+			case true:
+				if body.CSR.CertificateRequest == nil {
+					t.Error("json.Unmarshal() failed, CertificateRequest is nil")
+				}
+			case false:
+				if body.CSR.CertificateRequest != nil {
+					t.Error("json.Unmarshal() failed, CertificateRequest is not nil")
+				}
+			}
+		})
+	}
+}
+
+func TestSignRequest_Validate(t *testing.T) {
+	csr := parseCertificateRequest(csrPEM)
+	bad := parseCertificateRequest(csrPEM)
+	bad.Signature[0]++
+	type fields struct {
+		CsrPEM    CertificateRequest
+		OTT       string
+		NotBefore time.Time
+		NotAfter  time.Time
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		err    error
+	}{
+		{"missing csr", fields{CertificateRequest{}, "foobarzar", time.Time{}, time.Time{}}, errors.New("missing csr")},
+		{"invalid csr", fields{CertificateRequest{bad}, "foobarzar", time.Time{}, time.Time{}}, errors.New("invalid csr")},
+		{"missing ott", fields{CertificateRequest{csr}, "", time.Time{}, time.Time{}}, errors.New("missing ott")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &SignRequest{
+				CsrPEM:    tt.fields.CsrPEM,
+				OTT:       tt.fields.OTT,
+				NotAfter:  NewTimeDuration(tt.fields.NotAfter),
+				NotBefore: NewTimeDuration(tt.fields.NotBefore),
+			}
+			if err := s.Validate(); err != nil {
+				if assert.NotNil(t, tt.err) {
+					assert.HasPrefix(t, err.Error(), tt.err.Error())
+				}
+			} else {
+				assert.Nil(t, tt.err)
+			}
+		})
+	}
+}
+
+type mockProvisioner struct {
+	ret1, ret2, ret3   interface{}
+	err                error
+	getID              func() string
+	getIDForToken      func() string
+	getTokenID         func(string) (string, error)
+	getName            func() string
+	getType            func() provisioner.Type
+	getEncryptedKey    func() (string, string, bool)
+	init               func(provisioner.Config) error
+	authorizeRenew     func(ctx context.Context, cert *x509.Certificate) error
+	authorizeRevoke    func(ctx context.Context, token string) error
+	authorizeSign      func(ctx context.Context, ott string) ([]provisioner.SignOption, error)
+	authorizeRenewal   func(*x509.Certificate) error
+	authorizeSSHSign   func(ctx context.Context, token string) ([]provisioner.SignOption, error)
+	authorizeSSHRevoke func(ctx context.Context, token string) error
+	authorizeSSHRenew  func(ctx context.Context, token string) (*ssh.Certificate, error)
+	authorizeSSHRekey  func(ctx context.Context, token string) (*ssh.Certificate, []provisioner.SignOption, error)
+}
+
+func (m *mockProvisioner) GetID() string {
+	if m.getID != nil {
+		return m.getID()
+	}
+	return m.ret1.(string)
+}
+
+func (m *mockProvisioner) GetIDForToken() string {
+	if m.getIDForToken != nil {
+		return m.getIDForToken()
+	}
+	return m.ret1.(string)
+}
+
+func (m *mockProvisioner) GetTokenID(token string) (string, error) {
+	if m.getTokenID != nil {
+		return m.getTokenID(token)
+	}
+	if m.ret1 == nil {
+		return "", m.err
+	}
+	return m.ret1.(string), m.err
+}
+
+func (m *mockProvisioner) GetName() string {
+	if m.getName != nil {
+		return m.getName()
+	}
+	return m.ret1.(string)
+}
+
+func (m *mockProvisioner) GetType() provisioner.Type {
+	if m.getType != nil {
+		return m.getType()
+	}
+	return m.ret1.(provisioner.Type)
+}
+
+func (m *mockProvisioner) GetEncryptedKey() (string, string, bool) {
+	if m.getEncryptedKey != nil {
+		return m.getEncryptedKey()
+	}
+	return m.ret1.(string), m.ret2.(string), m.ret3.(bool)
+}
+
+func (m *mockProvisioner) Init(c provisioner.Config) error {
+	if m.init != nil {
+		return m.init(c)
+	}
+	return m.err
+}
+
+func (m *mockProvisioner) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
+	if m.authorizeRenew != nil {
+		return m.authorizeRenew(ctx, cert)
+	}
+	return m.err
+}
+
+func (m *mockProvisioner) AuthorizeRevoke(ctx context.Context, token string) error {
+	if m.authorizeRevoke != nil {
+		return m.authorizeRevoke(ctx, token)
+	}
+	return m.err
+}
+
+func (m *mockProvisioner) AuthorizeSign(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
+	if m.authorizeSign != nil {
+		return m.authorizeSign(ctx, ott)
+	}
+	return m.ret1.([]provisioner.SignOption), m.err
+}
+
+func (m *mockProvisioner) AuthorizeRenewal(c *x509.Certificate) error {
+	if m.authorizeRenewal != nil {
+		return m.authorizeRenewal(c)
+	}
+	return m.err
+}
+
+func (m *mockProvisioner) AuthorizeSSHSign(ctx context.Context, token string) ([]provisioner.SignOption, error) {
+	if m.authorizeSSHSign != nil {
+		return m.authorizeSSHSign(ctx, token)
+	}
+	return m.ret1.([]provisioner.SignOption), m.err
+}
+func (m *mockProvisioner) AuthorizeSSHRevoke(ctx context.Context, token string) error {
+	if m.authorizeSSHRevoke != nil {
+		return m.authorizeSSHRevoke(ctx, token)
+	}
+	return m.err
+}
+func (m *mockProvisioner) AuthorizeSSHRenew(ctx context.Context, token string) (*ssh.Certificate, error) {
+	if m.authorizeSSHRenew != nil {
+		return m.authorizeSSHRenew(ctx, token)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+func (m *mockProvisioner) AuthorizeSSHRekey(ctx context.Context, token string) (*ssh.Certificate, []provisioner.SignOption, error) {
+	if m.authorizeSSHRekey != nil {
+		return m.authorizeSSHRekey(ctx, token)
+	}
+	return m.ret1.(*ssh.Certificate), m.ret2.([]provisioner.SignOption), m.err
 }
 
 func Test_caHandler_Route(t *testing.T) {
@@ -779,7 +788,7 @@ func Test_caHandler_Health(t *testing.T) {
 		t.Errorf("caHandler.Health StatusCode = %d, wants 200", res.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
 		t.Errorf("caHandler.Health unexpected error = %v", err)
@@ -807,7 +816,7 @@ func Test_caHandler_Root(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/root/efc7d6b475a56fe587650bcdb999a4a308f815ba44db4bf0371ea68a786ccd36", nil)
 	req = req.WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, chiCtx))
 
-	expected := []byte(`{"ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"}`)
+	expected := []byte(`{"ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -820,7 +829,7 @@ func Test_caHandler_Root(t *testing.T) {
 				t.Errorf("caHandler.Root StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Root unexpected error = %v", err)
@@ -851,8 +860,8 @@ func Test_caHandler_Sign(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expected1 := []byte(`{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
-	expected2 := []byte(`{"crt":"` + strings.Replace(stepCertPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(stepCertPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected1 := []byte(`{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
+	expected2 := []byte(`{"crt":"` + strings.ReplaceAll(stepCertPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(stepCertPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	tests := []struct {
 		name         string
@@ -893,7 +902,7 @@ func Test_caHandler_Sign(t *testing.T) {
 				t.Errorf("caHandler.Root StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Root unexpected error = %v", err)
@@ -925,7 +934,7 @@ func Test_caHandler_Renew(t *testing.T) {
 		{"renew error", cs, nil, nil, errs.Forbidden("an error"), http.StatusForbidden},
 	}
 
-	expected := []byte(`{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -945,7 +954,7 @@ func Test_caHandler_Renew(t *testing.T) {
 				t.Errorf("caHandler.Renew StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Renew unexpected error = %v", err)
@@ -986,7 +995,7 @@ func Test_caHandler_Rekey(t *testing.T) {
 		{"json read error", "{", cs, nil, nil, nil, http.StatusBadRequest},
 	}
 
-	expected := []byte(`{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1006,7 +1015,7 @@ func Test_caHandler_Rekey(t *testing.T) {
 				t.Errorf("caHandler.Rekey StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Rekey unexpected error = %v", err)
@@ -1029,12 +1038,12 @@ func Test_caHandler_Provisioners(t *testing.T) {
 		r *http.Request
 	}
 
-	req, err := http.NewRequest("GET", "http://example.com/provisioners?cursor=foo&limit=20", nil)
+	req, err := http.NewRequest("GET", "http://example.com/provisioners?cursor=foo&limit=20", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	reqLimitFail, err := http.NewRequest("GET", "http://example.com/provisioners?limit=abc", nil)
+	reqLimitFail, err := http.NewRequest("GET", "http://example.com/provisioners?limit=abc", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1078,7 +1087,7 @@ func Test_caHandler_Provisioners(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedError400 := errs.BadRequest("force")
+	expectedError400 := errs.BadRequest("limit 'abc' is not an integer")
 	expectedError400Bytes, err := json.Marshal(expectedError400)
 	assert.FatalError(t, err)
 	expectedError500 := errs.InternalServer("force")
@@ -1096,7 +1105,7 @@ func Test_caHandler_Provisioners(t *testing.T) {
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Provisioners StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Provisioners unexpected error = %v", err)
@@ -1166,7 +1175,7 @@ func Test_caHandler_ProvisionerKey(t *testing.T) {
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Provisioners StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Provisioners unexpected error = %v", err)
@@ -1201,7 +1210,7 @@ func Test_caHandler_Roots(t *testing.T) {
 		{"fail", cs, nil, nil, fmt.Errorf("an error"), http.StatusForbidden},
 	}
 
-	expected := []byte(`{"crts":["` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crts":["` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1216,7 +1225,7 @@ func Test_caHandler_Roots(t *testing.T) {
 				t.Errorf("caHandler.Roots StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Roots unexpected error = %v", err)
@@ -1247,7 +1256,7 @@ func Test_caHandler_Federation(t *testing.T) {
 		{"fail", cs, nil, nil, fmt.Errorf("an error"), http.StatusForbidden},
 	}
 
-	expected := []byte(`{"crts":["` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crts":["` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1262,7 +1271,7 @@ func Test_caHandler_Federation(t *testing.T) {
 				t.Errorf("caHandler.Federation StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Federation unexpected error = %v", err)
@@ -1285,6 +1294,10 @@ func Test_fmtPublicKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var dsa2048 dsa.PrivateKey
 	if err := dsa.GenerateParameters(&dsa2048.Parameters, rand.Reader, dsa.L2048N256); err != nil {
 		t.Fatal(err)
@@ -1304,6 +1317,7 @@ func Test_fmtPublicKey(t *testing.T) {
 	}{
 		{"p256", args{p256.Public(), p256, nil}, "ECDSA P-256"},
 		{"rsa1024", args{rsa1024.Public(), rsa1024, nil}, "RSA 1024"},
+		{"ed25519", args{edPub, edPriv, nil}, "Ed25519"},
 		{"dsa2048", args{cert: &x509.Certificate{PublicKeyAlgorithm: x509.DSA, PublicKey: &dsa2048.PublicKey}}, "DSA 2048"},
 		{"unknown", args{cert: &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: []byte("12345678")}}, "ECDSA unknown"},
 	}

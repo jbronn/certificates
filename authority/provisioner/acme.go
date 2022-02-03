@@ -13,16 +13,31 @@ import (
 // provisioning flow.
 type ACME struct {
 	*base
-	Type    string   `json:"type"`
-	Name    string   `json:"name"`
-	ForceCN bool     `json:"forceCN,omitempty"`
-	Claims  *Claims  `json:"claims,omitempty"`
-	Options *Options `json:"options,omitempty"`
-	claimer *Claimer
+	ID      string `json:"-"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	ForceCN bool   `json:"forceCN,omitempty"`
+	// RequireEAB makes the provisioner require ACME EAB to be provided
+	// by clients when creating a new Account. If set to true, the provided
+	// EAB will be verified. If set to false and an EAB is provided, it is
+	// not verified. Defaults to false.
+	RequireEAB bool     `json:"requireEAB,omitempty"`
+	Claims     *Claims  `json:"claims,omitempty"`
+	Options    *Options `json:"options,omitempty"`
+	claimer    *Claimer
 }
 
 // GetID returns the provisioner unique identifier.
 func (p ACME) GetID() string {
+	if p.ID != "" {
+		return p.ID
+	}
+	return p.GetIDForToken()
+}
+
+// GetIDForToken returns an identifier that will be used to load the provisioner
+// from a token.
+func (p *ACME) GetIDForToken() string {
 	return "acme/" + p.Name
 }
 
@@ -89,13 +104,22 @@ func (p *ACME) AuthorizeSign(ctx context.Context, token string) ([]SignOption, e
 	}, nil
 }
 
+// AuthorizeRevoke is called just before the certificate is to be revoked by
+// the CA. It can be used to authorize revocation of a certificate. It
+// currently is a no-op.
+// TODO(hs): add configuration option that toggles revocation? Or change function signature to make it more useful?
+// Or move certain logic out of the Revoke API to here? Would likely involve some more stuff in the ctx.
+func (p *ACME) AuthorizeRevoke(ctx context.Context, token string) error {
+	return nil
+}
+
 // AuthorizeRenew returns an error if the renewal is disabled.
 // NOTE: This method does not actually validate the certificate or check it's
 // revocation status. Just confirms that the provisioner that created the
 // certificate was configured to allow renewals.
 func (p *ACME) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
 	if p.claimer.IsDisableRenewal() {
-		return errs.Unauthorized("acme.AuthorizeRenew; renew is disabled for acme provisioner %s", p.GetID())
+		return errs.Unauthorized("acme.AuthorizeRenew; renew is disabled for acme provisioner '%s'", p.GetName())
 	}
 	return nil
 }

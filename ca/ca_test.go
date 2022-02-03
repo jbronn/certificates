@@ -115,7 +115,7 @@ func TestCASign(t *testing.T) {
 				ca:     ca,
 				body:   "invalid json",
 				status: http.StatusBadRequest,
-				errMsg: errs.BadRequestDefaultMsg,
+				errMsg: errs.BadRequestPrefix,
 			}
 		},
 		"fail invalid-csr-sig": func(t *testing.T) *signTest {
@@ -153,7 +153,7 @@ ZEp7knvU2psWRw==
 				ca:     ca,
 				body:   string(body),
 				status: http.StatusBadRequest,
-				errMsg: errs.BadRequestDefaultMsg,
+				errMsg: errs.BadRequestPrefix,
 			}
 		},
 		"fail unauthorized-ott": func(t *testing.T) *signTest {
@@ -200,8 +200,8 @@ ZEp7knvU2psWRw==
 			return &signTest{
 				ca:     ca,
 				body:   string(body),
-				status: http.StatusUnauthorized,
-				errMsg: errs.UnauthorizedDefaultMsg,
+				status: http.StatusForbidden,
+				errMsg: errs.ForbiddenPrefix,
 			}
 		},
 		"ok": func(t *testing.T) *signTest {
@@ -294,15 +294,15 @@ ZEp7knvU2psWRw==
 					assert.Equals(t, leaf.NotBefore, now.Truncate(time.Second))
 					assert.Equals(t, leaf.NotAfter, leafExpiry.Truncate(time.Second))
 
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							Country:       []string{asn1dn.Country},
 							Organization:  []string{asn1dn.Organization},
 							Locality:      []string{asn1dn.Locality},
 							StreetAddress: []string{asn1dn.StreetAddress},
 							Province:      []string{asn1dn.Province},
 							CommonName:    asn1dn.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -322,7 +322,7 @@ ZEp7knvU2psWRw==
 					assert.Equals(t, intermediate, realIntermediate)
 				} else {
 					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -375,7 +375,7 @@ func TestCAProvisioners(t *testing.T) {
 					assert.Equals(t, a, b)
 				} else {
 					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -436,7 +436,7 @@ func TestCAProvisionerEncryptedKey(t *testing.T) {
 					assert.Equals(t, ek.Key, tc.expectedKey)
 				} else {
 					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -497,7 +497,7 @@ func TestCARoot(t *testing.T) {
 					assert.Equals(t, root.RootPEM.Certificate, rootCrt)
 				} else {
 					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)
@@ -588,7 +588,7 @@ func TestCARenew(t *testing.T) {
 				ca:           ca,
 				tlsConnState: nil,
 				status:       http.StatusBadRequest,
-				errMsg:       errs.BadRequestDefaultMsg,
+				errMsg:       errs.BadRequestPrefix,
 			}
 		},
 		"request-missing-peer-certificate": func(t *testing.T) *renewTest {
@@ -596,7 +596,7 @@ func TestCARenew(t *testing.T) {
 				ca:           ca,
 				tlsConnState: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{}},
 				status:       http.StatusBadRequest,
-				errMsg:       errs.BadRequestDefaultMsg,
+				errMsg:       errs.BadRequestPrefix,
 			}
 		},
 		"success": func(t *testing.T) *renewTest {
@@ -641,10 +641,10 @@ func TestCARenew(t *testing.T) {
 					assert.Equals(t, leaf.NotBefore, now.Truncate(time.Second))
 					assert.Equals(t, leaf.NotAfter, leafExpiry.Truncate(time.Second))
 
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							CommonName: asn1dn.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -665,7 +665,7 @@ func TestCARenew(t *testing.T) {
 					assert.Equals(t, *sign.TLSOptions, authority.DefaultTLSOptions)
 				} else {
 					err := readError(body)
-					if len(tc.errMsg) == 0 {
+					if tc.errMsg == "" {
 						assert.FatalError(t, errors.New("must validate response error"))
 					}
 					assert.HasPrefix(t, err.Error(), tc.errMsg)

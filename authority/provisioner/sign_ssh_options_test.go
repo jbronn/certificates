@@ -44,19 +44,19 @@ func TestSSHOptions_Modify(t *testing.T) {
 		valid func(*ssh.Certificate)
 		err   error
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"fail/unexpected-cert-type": func() test {
 			return test{
 				so:   SignSSHOptions{CertType: "foo"},
 				cert: new(ssh.Certificate),
-				err:  errors.Errorf("ssh certificate has an unknown type - foo"),
+				err:  errors.Errorf("ssh certificate has an unknown type 'foo'"),
 			}
 		},
 		"fail/validAfter-greater-validBefore": func() test {
 			return test{
 				so:   SignSSHOptions{CertType: "user"},
 				cert: &ssh.Certificate{ValidAfter: uint64(15), ValidBefore: uint64(10)},
-				err:  errors.Errorf("ssh certificate valid after cannot be greater than valid before"),
+				err:  errors.Errorf("ssh certificate validAfter cannot be greater than validBefore"),
 			}
 		},
 		"ok/user-cert": func() test {
@@ -117,7 +117,7 @@ func TestSSHOptions_Match(t *testing.T) {
 		cmp SignSSHOptions
 		err error
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"fail/cert-type": func() test {
 			return test{
 				so:  SignSSHOptions{CertType: "foo"},
@@ -136,14 +136,14 @@ func TestSSHOptions_Match(t *testing.T) {
 			return test{
 				so:  SignSSHOptions{ValidAfter: NewTimeDuration(time.Now().Add(1 * time.Minute))},
 				cmp: SignSSHOptions{ValidAfter: NewTimeDuration(time.Now().Add(5 * time.Minute))},
-				err: errors.Errorf("ssh certificate valid after does not match"),
+				err: errors.Errorf("ssh certificate validAfter does not match"),
 			}
 		},
 		"fail/validBefore": func() test {
 			return test{
 				so:  SignSSHOptions{ValidBefore: NewTimeDuration(time.Now().Add(1 * time.Minute))},
 				cmp: SignSSHOptions{ValidBefore: NewTimeDuration(time.Now().Add(5 * time.Minute))},
-				err: errors.Errorf("ssh certificate valid before does not match"),
+				err: errors.Errorf("ssh certificate validBefore does not match"),
 			}
 		},
 		"ok/original-empty": func() test {
@@ -208,7 +208,7 @@ func Test_sshCertPrincipalsModifier_Modify(t *testing.T) {
 		cert     *ssh.Certificate
 		expected []string
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"ok": func() test {
 			a := []string{"foo", "bar"}
 			return test{
@@ -234,7 +234,7 @@ func Test_sshCertKeyIDModifier_Modify(t *testing.T) {
 		cert     *ssh.Certificate
 		expected string
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"ok": func() test {
 			a := "foo"
 			return test{
@@ -260,7 +260,7 @@ func Test_sshCertTypeModifier_Modify(t *testing.T) {
 		cert     *ssh.Certificate
 		expected uint32
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"ok/user": func() test {
 			return test{
 				modifier: sshCertTypeModifier("user"),
@@ -299,7 +299,7 @@ func Test_sshCertValidAfterModifier_Modify(t *testing.T) {
 		cert     *ssh.Certificate
 		expected uint64
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"ok": func() test {
 			return test{
 				modifier: sshCertValidAfterModifier(15),
@@ -324,7 +324,7 @@ func Test_sshCertDefaultsModifier_Modify(t *testing.T) {
 		cert     *ssh.Certificate
 		valid    func(*ssh.Certificate)
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"ok/changes": func() test {
 			n := time.Now()
 			va := NewTimeDuration(n.Add(1 * time.Minute))
@@ -388,13 +388,13 @@ func Test_sshDefaultExtensionModifier_Modify(t *testing.T) {
 		valid    func(*ssh.Certificate)
 		err      error
 	}
-	tests := map[string](func() test){
+	tests := map[string]func() test{
 		"fail/unexpected-cert-type": func() test {
 			cert := &ssh.Certificate{CertType: 3}
 			return test{
 				modifier: sshDefaultExtensionModifier{},
 				cert:     cert,
-				err:      errors.New("ssh certificate type has not been set or is invalid"),
+				err:      errors.New("ssh certificate has an unknown type '3'"),
 			}
 		},
 		"ok/host": func() test {
@@ -518,7 +518,7 @@ func Test_sshCertDefaultValidator_Valid(t *testing.T) {
 			"fail/unexpected-cert-type",
 			// UserCert = 1, HostCert = 2
 			&ssh.Certificate{Nonce: []byte("foo"), Key: sshPub, CertType: 3, Serial: 1},
-			errors.New("ssh certificate has an unknown type: 3"),
+			errors.New("ssh certificate has an unknown type '3'"),
 		},
 		{
 			"fail/empty-cert-key-id",
@@ -725,7 +725,7 @@ func Test_sshCertValidityValidator(t *testing.T) {
 				ValidBefore: uint64(now().Add(10 * time.Minute).Unix()),
 			},
 			SignSSHOptions{},
-			errors.New("unknown ssh certificate type 3"),
+			errors.New("ssh certificate has an unknown type '3'"),
 		},
 		{
 			"fail/duration<min",

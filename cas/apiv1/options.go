@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 
 	"github.com/pkg/errors"
+	"github.com/smallstep/certificates/kms"
 )
 
 // Options represents the configuration options used to select and configure the
@@ -13,17 +14,63 @@ type Options struct {
 	// The type of the CAS to use.
 	Type string `json:"type"`
 
-	// Path to the credentials file used in CloudCAS
-	CredentialsFile string `json:"credentialsFile"`
+	// CertificateAuthority reference:
+	// In StepCAS the value is the CA url, e.g. "https://ca.smallstep.com:9000".
+	// In CloudCAS the format is "projects/*/locations/*/certificateAuthorities/*".
+	CertificateAuthority string `json:"certificateAuthority,omitempty"`
 
-	// CertificateAuthority reference. In CloudCAS the format is
-	// `projects/*/locations/*/certificateAuthorities/*`.
-	CertificateAuthority string `json:"certificateAuthority"`
+	// CertificateAuthorityFingerprint is the root fingerprint used to
+	// authenticate the connection to the CA when using StepCAS.
+	CertificateAuthorityFingerprint string `json:"certificateAuthorityFingerprint,omitempty"`
 
-	// Issuer and signer are the issuer certificate and signer used in SoftCAS.
-	// They are configured in ca.json crt and key properties.
-	Issuer *x509.Certificate `json:"-"`
-	Signer crypto.Signer     `json:"-"`
+	// CertificateIssuer contains the configuration used in StepCAS.
+	CertificateIssuer *CertificateIssuer `json:"certificateIssuer,omitempty"`
+
+	// Path to the credentials file used in CloudCAS. If not defined the default
+	// authentication mechanism provided by Google SDK will be used. See
+	// https://cloud.google.com/docs/authentication.
+	CredentialsFile string `json:"credentialsFile,omitempty"`
+
+	// Certificate and signer are the issuer certificate, along with any other
+	// bundled certificates to be returned in the chain for consumers, and
+	// signer used in SoftCAS. They are configured in ca.json crt and key
+	// properties.
+	CertificateChain []*x509.Certificate `json:"-"`
+	Signer           crypto.Signer       `json:"-"`
+
+	// IsCreator is set to true when we're creating a certificate authority. It
+	// is used to skip some validations when initializing a
+	// CertificateAuthority. This option is used on SoftCAS and CloudCAS.
+	IsCreator bool `json:"-"`
+
+	// IsCAGetter is set to true when we're just using the
+	// CertificateAuthorityGetter interface to retrieve the root certificate. It
+	// is used to skip some validations when initializing a
+	// CertificateAuthority. This option is used on StepCAS.
+	IsCAGetter bool `json:"-"`
+
+	// KeyManager is the KMS used to generate keys in SoftCAS.
+	KeyManager kms.KeyManager `json:"-"`
+
+	// Project, Location, CaPool and GCSBucket are parameters used in CloudCAS
+	// to create a new certificate authority. If a CaPool does not exist it will
+	// be created. GCSBucket is optional, if not provided GCloud will create a
+	// managed bucket.
+	Project    string `json:"-"`
+	Location   string `json:"-"`
+	CaPool     string `json:"-"`
+	CaPoolTier string `json:"-"`
+	GCSBucket  string `json:"-"`
+}
+
+// CertificateIssuer contains the properties used to use the StepCAS certificate
+// authority service.
+type CertificateIssuer struct {
+	Type        string `json:"type"`
+	Provisioner string `json:"provisioner,omitempty"`
+	Certificate string `json:"crt,omitempty"`
+	Key         string `json:"key,omitempty"`
+	Password    string `json:"password,omitempty"`
 }
 
 // Validate checks the fields in Options.

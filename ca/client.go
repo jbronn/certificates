@@ -10,10 +10,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,11 +28,14 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca/identity"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/config"
+	"go.step.sm/cli-utils/step"
+	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/pemutil"
 	"go.step.sm/crypto/x509util"
 	"golang.org/x/net/http2"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/square/go-jose.v2/jwt"
 )
 
@@ -56,9 +60,7 @@ func newClient(transport http.RoundTripper) *uaClient {
 func newInsecureClient() *uaClient {
 	return &uaClient{
 		Client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+			Transport: getDefaultTransport(&tls.Config{InsecureSkipVerify: true}),
 		},
 	}
 }
@@ -71,21 +73,26 @@ func (c *uaClient) SetTransport(tr http.RoundTripper) {
 	c.Client.Transport = tr
 }
 
-func (c *uaClient) Get(url string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func (c *uaClient) Get(u string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", u, http.NoBody)
 	if err != nil {
-		return nil, errors.Wrapf(err, "new request GET %s failed", url)
+		return nil, errors.Wrapf(err, "new request GET %s failed", u)
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	return c.Client.Do(req)
 }
 
-func (c *uaClient) Post(url, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest("POST", url, body)
+func (c *uaClient) Post(u, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", u, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", UserAgent)
+	return c.Client.Do(req)
+}
+
+func (c *uaClient) Do(req *http.Request) (*http.Response, error) {
 	req.Header.Set("User-Agent", UserAgent)
 	return c.Client.Do(req)
 }
@@ -98,12 +105,19 @@ type RetryFunc func(code int) bool
 type ClientOption func(o *clientOptions) error
 
 type clientOptions struct {
-	transport    http.RoundTripper
-	rootSHA256   string
-	rootFilename string
-	rootBundle   []byte
-	certificate  tls.Certificate
-	retryFunc    RetryFunc
+	transport            http.RoundTripper
+	rootSHA256           string
+	rootFilename         string
+	rootBundle           []byte
+	certificate          tls.Certificate
+	getClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	retryFunc            RetryFunc
+	x5cJWK               *jose.JSONWebKey
+	x5cCertFile          string
+	x5cCertStrs          []string
+	x5cCert              *x509.Certificate
+	x5cIssuer            string
+	x5cSubject           string
 }
 
 func (o *clientOptions) apply(opts []ClientOption) (err error) {
@@ -138,6 +152,7 @@ func (o *clientOptions) applyDefaultIdentity() error {
 		return nil
 	}
 	o.certificate = crt
+	o.getClientCertificate = i.GetClientCertificateFunc()
 	return nil
 }
 
@@ -192,6 +207,7 @@ func (o *clientOptions) getTransport(endpoint string) (tr http.RoundTripper, err
 			}
 			if len(tr.TLSClientConfig.Certificates) == 0 && tr.TLSClientConfig.GetClientCertificate == nil {
 				tr.TLSClientConfig.Certificates = []tls.Certificate{o.certificate}
+				tr.TLSClientConfig.GetClientCertificate = o.getClientCertificate
 			}
 		case *http2.Transport:
 			if tr.TLSClientConfig == nil {
@@ -199,6 +215,7 @@ func (o *clientOptions) getTransport(endpoint string) (tr http.RoundTripper, err
 			}
 			if len(tr.TLSClientConfig.Certificates) == 0 && tr.TLSClientConfig.GetClientCertificate == nil {
 				tr.TLSClientConfig.Certificates = []tls.Certificate{o.certificate}
+				tr.TLSClientConfig.GetClientCertificate = o.getClientCertificate
 			}
 		default:
 			return nil, errors.Errorf("unsupported transport type %T", tr)
@@ -208,7 +225,7 @@ func (o *clientOptions) getTransport(endpoint string) (tr http.RoundTripper, err
 	return tr, nil
 }
 
-// WithTransport adds a custom transport to the Client.  It will fail if a
+// WithTransport adds a custom transport to the Client. It will fail if a
 // previous option to create the transport has been configured.
 func WithTransport(tr http.RoundTripper) ClientOption {
 	return func(o *clientOptions) error {
@@ -216,6 +233,17 @@ func WithTransport(tr http.RoundTripper) ClientOption {
 			return err
 		}
 		o.transport = tr
+		return nil
+	}
+}
+
+// WithInsecure adds a insecure transport that bypasses TLS verification.
+func WithInsecure() ClientOption {
+	return func(o *clientOptions) error {
+		o.transport = &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
 		return nil
 	}
 }
@@ -259,9 +287,66 @@ func WithCABundle(bundle []byte) ClientOption {
 
 // WithCertificate will set the given certificate as the TLS client certificate
 // in the client.
-func WithCertificate(crt tls.Certificate) ClientOption {
+func WithCertificate(cert tls.Certificate) ClientOption {
 	return func(o *clientOptions) error {
-		o.certificate = crt
+		o.certificate = cert
+		return nil
+	}
+}
+
+var (
+	stepOIDRoot        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64}
+	stepOIDProvisioner = append(asn1.ObjectIdentifier(nil), append(stepOIDRoot, 1)...)
+)
+
+type stepProvisionerASN1 struct {
+	Type          int
+	Name          []byte
+	CredentialID  []byte
+	KeyValuePairs []string `asn1:"optional,omitempty"`
+}
+
+// WithAdminX5C will set the given file as the X5C certificate for use
+// by the client.
+func WithAdminX5C(certs []*x509.Certificate, key interface{}, passwordFile string) ClientOption {
+	return func(o *clientOptions) error {
+		// Get private key from given key file
+		var (
+			err  error
+			opts []jose.Option
+		)
+		if passwordFile != "" {
+			opts = append(opts, jose.WithPasswordFile(passwordFile))
+		}
+		blk, err := pemutil.Serialize(key)
+		if err != nil {
+			return errors.Wrap(err, "error serializing private key")
+		}
+		o.x5cJWK, err = jose.ParseKey(pem.EncodeToMemory(blk), opts...)
+		if err != nil {
+			return err
+		}
+		o.x5cCertStrs, err = jose.ValidateX5C(certs, o.x5cJWK.Key)
+		if err != nil {
+			return errors.Wrap(err, "error validating x5c certificate chain and key for use in x5c header")
+		}
+
+		o.x5cCert = certs[0]
+		o.x5cSubject = o.x5cCert.Subject.CommonName
+
+		for _, e := range o.x5cCert.Extensions {
+			if e.Id.Equal(stepOIDProvisioner) {
+				var prov stepProvisionerASN1
+				if _, err := asn1.Unmarshal(e.Value, &prov); err != nil {
+					return errors.Wrap(err, "error unmarshaling provisioner OID from certificate")
+				}
+				o.x5cIssuer = string(prov.Name)
+			}
+		}
+		if o.x5cIssuer == "" {
+			return errors.New("provisioner extension not found in certificate")
+		}
+
 		return nil
 	}
 }
@@ -275,7 +360,7 @@ func WithRetryFunc(fn RetryFunc) ClientOption {
 }
 
 func getTransportFromFile(filename string) (http.RoundTripper, error) {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error reading %s", filename)
 	}
@@ -287,7 +372,7 @@ func getTransportFromFile(filename string) (http.RoundTripper, error) {
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  pool,
-	})
+	}), nil
 }
 
 func getTransportFromSHA256(endpoint, sum string) (http.RoundTripper, error) {
@@ -306,7 +391,7 @@ func getTransportFromSHA256(endpoint, sum string) (http.RoundTripper, error) {
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  pool,
-	})
+	}), nil
 }
 
 func getTransportFromCABundle(bundle []byte) (http.RoundTripper, error) {
@@ -318,7 +403,7 @@ func getTransportFromCABundle(bundle []byte) (http.RoundTripper, error) {
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  pool,
-	})
+	}), nil
 }
 
 // parseEndpoint parses and validates the given endpoint. It supports general
@@ -365,6 +450,8 @@ type ProvisionerOption func(o *provisionerOptions) error
 type provisionerOptions struct {
 	cursor string
 	limit  int
+	id     string
+	name   string
 }
 
 func (o *provisionerOptions) apply(opts []ProvisionerOption) (err error) {
@@ -384,6 +471,12 @@ func (o *provisionerOptions) rawQuery() string {
 	if o.limit > 0 {
 		v.Set("limit", strconv.Itoa(o.limit))
 	}
+	if len(o.id) > 0 {
+		v.Set("id", o.id)
+	}
+	if len(o.name) > 0 {
+		v.Set("name", o.name)
+	}
 	return v.Encode()
 }
 
@@ -399,6 +492,22 @@ func WithProvisionerCursor(cursor string) ProvisionerOption {
 func WithProvisionerLimit(limit int) ProvisionerOption {
 	return func(o *provisionerOptions) error {
 		o.limit = limit
+		return nil
+	}
+}
+
+// WithProvisionerID will request the given provisioner.
+func WithProvisionerID(id string) ProvisionerOption {
+	return func(o *provisionerOptions) error {
+		o.id = id
+		return nil
+	}
+}
+
+// WithProvisionerName will request the given provisioner.
+func WithProvisionerName(name string) ProvisionerOption {
+	return func(o *provisionerOptions) error {
+		o.name = name
 		return nil
 	}
 }
@@ -532,7 +641,7 @@ retry:
 // do not match.
 func (c *Client) Root(sha256Sum string) (*api.RootResponse, error) {
 	var retried bool
-	sha256Sum = strings.ToLower(strings.Replace(sha256Sum, "-", "", -1))
+	sha256Sum = strings.ToLower(strings.ReplaceAll(sha256Sum, "-", ""))
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/root/" + sha256Sum})
 retry:
 	resp, err := newInsecureClient().Get(u.String())
@@ -552,8 +661,8 @@ retry:
 	}
 	// verify the sha256
 	sum := sha256.Sum256(root.RootPEM.Raw)
-	if sha256Sum != strings.ToLower(hex.EncodeToString(sum[:])) {
-		return nil, errs.BadRequest("client.Root; root certificate SHA256 fingerprint do not match")
+	if !strings.EqualFold(sha256Sum, strings.ToLower(hex.EncodeToString(sum[:]))) {
+		return nil, errs.BadRequest("root certificate fingerprint does not match")
 	}
 	return &root, nil
 }
@@ -610,6 +719,36 @@ retry:
 	var sign api.SignResponse
 	if err := readJSON(resp.Body, &sign); err != nil {
 		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Renew; error reading %s", u)
+	}
+	return &sign, nil
+}
+
+// Rekey performs the rekey request to the CA and returns the api.SignResponse
+// struct.
+func (c *Client) Rekey(req *api.RekeyRequest, tr http.RoundTripper) (*api.SignResponse, error) {
+	var retried bool
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshaling request")
+	}
+
+	u := c.endpoint.ResolveReference(&url.URL{Path: "/rekey"})
+	client := &http.Client{Transport: tr}
+retry:
+	resp, err := client.Post(u.String(), "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Rekey; client POST %s failed", u)
+	}
+	if resp.StatusCode >= 400 {
+		if !retried && c.retryOnError(resp) {
+			retried = true
+			goto retry
+		}
+		return nil, readError(resp.Body)
+	}
+	var sign api.SignResponse
+	if err := readJSON(resp.Body, &sign); err != nil {
+		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Rekey; error reading %s", u)
 	}
 	return &sign, nil
 }
@@ -937,16 +1076,16 @@ retry:
 		}
 		return nil, readError(resp.Body)
 	}
-	var config api.SSHConfigResponse
-	if err := readJSON(resp.Body, &config); err != nil {
+	var cfg api.SSHConfigResponse
+	if err := readJSON(resp.Body, &cfg); err != nil {
 		return nil, errors.Wrapf(err, "error reading %s", u)
 	}
-	return &config, nil
+	return &cfg, nil
 }
 
 // SSHCheckHost performs the POST /ssh/check-host request to the CA with the
 // given principal.
-func (c *Client) SSHCheckHost(principal string, token string) (*api.SSHCheckPrincipalResponse, error) {
+func (c *Client) SSHCheckHost(principal, token string) (*api.SSHCheckPrincipalResponse, error) {
 	var retried bool
 	body, err := json.Marshal(&api.SSHCheckPrincipalRequest{
 		Type:      provisioner.SSHHostCert,
@@ -969,8 +1108,7 @@ retry:
 			retried = true
 			goto retry
 		}
-
-		return nil, errs.StatusCodeError(resp.StatusCode, readError(resp.Body))
+		return nil, readError(resp.Body)
 	}
 	var check api.SSHCheckPrincipalResponse
 	if err := readJSON(resp.Body, &check); err != nil {
@@ -1166,12 +1304,21 @@ func createCertificateRequest(commonName string, sans []string, key crypto.Priva
 // getRootCAPath returns the path where the root CA is stored based on the
 // STEPPATH environment variable.
 func getRootCAPath() string {
-	return filepath.Join(config.StepPath(), "certs", "root_ca.crt")
+	return filepath.Join(step.Path(), "certs", "root_ca.crt")
 }
 
 func readJSON(r io.ReadCloser, v interface{}) error {
 	defer r.Close()
 	return json.NewDecoder(r).Decode(v)
+}
+
+func readProtoJSON(r io.ReadCloser, m proto.Message) error {
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	return protojson.Unmarshal(data, m)
 }
 
 func readError(r io.ReadCloser) error {

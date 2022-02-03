@@ -10,9 +10,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -187,7 +188,7 @@ func generateJWK() (*JWK, error) {
 }
 
 func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
-	fooPubB, err := ioutil.ReadFile("./testdata/certs/foo.pub")
+	fooPubB, err := os.ReadFile("./testdata/certs/foo.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +196,7 @@ func generateK8sSA(inputPubKey interface{}) (*K8sSA, error) {
 	if err != nil {
 		return nil, err
 	}
-	barPubB, err := ioutil.ReadFile("./testdata/certs/bar.pub")
+	barPubB, err := os.ReadFile("./testdata/certs/bar.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +234,7 @@ func generateSSHPOP() (*SSHPOP, error) {
 		return nil, err
 	}
 
-	userB, err := ioutil.ReadFile("./testdata/certs/ssh_user_ca_key.pub")
+	userB, err := os.ReadFile("./testdata/certs/ssh_user_ca_key.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +242,7 @@ func generateSSHPOP() (*SSHPOP, error) {
 	if err != nil {
 		return nil, err
 	}
-	hostB, err := ioutil.ReadFile("./testdata/certs/ssh_host_ca_key.pub")
+	hostB, err := os.ReadFile("./testdata/certs/ssh_host_ca_key.pub")
 	if err != nil {
 		return nil, err
 	}
@@ -731,7 +732,7 @@ func withSSHPOPFile(cert *ssh.Certificate) tokOption {
 	}
 }
 
-func generateToken(sub, iss, aud string, email string, sans []string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
+func generateToken(sub, iss, aud, email string, sans []string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
 	so := new(jose.SignerOptions)
 	so.WithType("JWT")
 	so.WithHeader("kid", jwk.KeyID)
@@ -768,6 +769,47 @@ func generateToken(sub, iss, aud string, email string, sans []string, iat time.T
 		},
 		Email: email,
 		SANS:  sans,
+	}
+	return jose.Signed(sig).Claims(claims).CompactSerialize()
+}
+
+func generateOIDCToken(sub, iss, aud, email, preferredUsername string, iat time.Time, jwk *jose.JSONWebKey, tokOpts ...tokOption) (string, error) {
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("kid", jwk.KeyID)
+
+	for _, o := range tokOpts {
+		if err := o(so); err != nil {
+			return "", err
+		}
+	}
+
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jwk.Key}, so)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := randutil.ASCII(64)
+	if err != nil {
+		return "", err
+	}
+
+	claims := struct {
+		jose.Claims
+		Email             string `json:"email"`
+		PreferredUsername string `json:"preferred_username,omitempty"`
+	}{
+		Claims: jose.Claims{
+			ID:        id,
+			Subject:   sub,
+			Issuer:    iss,
+			IssuedAt:  jose.NewNumericDate(iat),
+			NotBefore: jose.NewNumericDate(iat),
+			Expiry:    jose.NewNumericDate(iat.Add(5 * time.Minute)),
+			Audience:  []string{aud},
+		},
+		Email:             email,
+		PreferredUsername: preferredUsername,
 	}
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
@@ -910,7 +952,7 @@ func generateGCPToken(sub, iss, aud, instanceID, instanceName, projectID, zone s
 	return jose.Signed(sig).Claims(claims).CompactSerialize()
 }
 
-func generateAWSToken(sub, iss, aud, accountID, instanceID, privateIP, region string, iat time.Time, key crypto.Signer) (string, error) {
+func generateAWSToken(p *AWS, sub, iss, aud, accountID, instanceID, privateIP, region string, iat time.Time, key crypto.Signer) (string, error) {
 	doc, err := json.MarshalIndent(awsInstanceIdentityDocument{
 		AccountID:        accountID,
 		Architecture:     "x86_64",
@@ -946,8 +988,12 @@ func generateAWSToken(sub, iss, aud, accountID, instanceID, privateIP, region st
 		return "", err
 	}
 
+	unique := fmt.Sprintf("%s.%s", p.GetID(), instanceID)
+	sum = sha256.Sum256([]byte(unique))
+
 	claims := awsPayload{
 		Claims: jose.Claims{
+			ID:        strings.ToLower(hex.EncodeToString(sum[:])),
 			Subject:   sub,
 			Issuer:    iss,
 			IssuedAt:  jose.NewNumericDate(iat),

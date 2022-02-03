@@ -7,14 +7,27 @@ to manage issues, etc.
 
 ## Table of Contents
 
-* [Building From Source](#building-from-source)
-* [Asking Support Questions](#asking-support-questions)
-* [Reporting Issues](#reporting-issues)
-* [Submitting Patches](#submitting-patches)
-  * [Code Contribution Guidelines](#code-contribution-guidelines)
-  * [Git Commit Message Guidelines](#git-commit-message-guidelines)
+- [Contributing to `step certificates`](#contributing-to-step-certificates)
+  - [Table of Contents](#table-of-contents)
+  - [Building From Source](#building-from-source)
+    - [Build a standard `step-ca`](#build-a-standard-step-ca)
+    - [Build `step-ca` using CGO](#build-step-ca-using-cgo)
+      - [The CGO build enables PKCS #11 and YubiKey PIV support](#the-cgo-build-enables-pkcs-11-and-yubikey-piv-support)
+      - [1. Install PCSC support](#1-install-pcsc-support)
+      - [2. Build `step-ca`](#2-build-step-ca)
+  - [Asking Support Questions](#asking-support-questions)
+  - [Reporting Issues](#reporting-issues)
+  - [Code Contribution](#code-contribution)
+  - [Submitting Patches](#submitting-patches)
+    - [Code Contribution Guidelines](#code-contribution-guidelines)
+    - [Git Commit Message Guidelines](#git-commit-message-guidelines)
 
 ## Building From Source
+
+Clone this repository to get a bleeding-edge build, 
+or download the source archive for [the latest stable release](https://github.com/smallstep/certificates/releases/latest).
+
+### Build a standard `step-ca`
 
 The only prerequisites are [`go`](https://golang.org/) and make.
 
@@ -22,12 +35,53 @@ To build from source:
 
     make bootstrap && make
 
+Find your binaries in `bin/`.
+
+### Build `step-ca` using CGO
+
+#### The CGO build enables PKCS #11 and YubiKey PIV support
+
+To build the CGO version of `step-ca`, you will need [`go`](https://golang.org/), make, and a C compiler.
+
+You'll also need PCSC support on your operating system, as required by the `go-piv` module.
+On Linux, the [`libpcsclite-dev`](https://pcsclite.apdu.fr/) package provides PCSC support.
+On macOS and Windows, PCSC support is built into the OS.
+
+#### 1. Install PCSC support
+
+On Debian-based distributions, run:
+
+```shell
+sudo apt-get install libpcsclite-dev
+```
+
+On Fedora:
+
+```shell
+sudo yum install pcsc-lite-devel
+```
+
+On CentOS:
+
+```
+sudo yum install 'dnf-command(config-manager)'
+sudo yum config-manager --set-enabled PowerTools
+sudo yum install pcsc-lite-devel
+```
+
+#### 2. Build `step-ca`
+
+To build `step-ca`, clone this repository and run the following:
+
+```shell
+make bootstrap && make build GOFLAGS=""
+```
+
+When the build is complete, you will find binaries in `bin/`.
 
 ## Asking Support Questions
 
-Users and developers can ask questions over email (info@smallstep.com) or
-[twitter](https://twitter.com/smallsteplabs). Please don't use the GitHub
-issue tracker to ask questions.
+Feel free to post a question on our [GitHub Discussions](https://github.com/smallstep/certificates/discussions) page, or find us on [Discord](https://bit.ly/step-discord).
 
 ## Reporting Issues
 

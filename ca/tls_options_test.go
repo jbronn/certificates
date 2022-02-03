@@ -4,8 +4,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
 	"sort"
 	"testing"
@@ -149,7 +149,7 @@ func TestAddRootCA(t *testing.T) {
 				t.Errorf("AddRootCA() error = %v", err)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config, tt.want) {
+			if !reflect.DeepEqual(ctx.Config, tt.want) && !equalPools(ctx.Config.RootCAs, tt.want.RootCAs) {
 				t.Errorf("AddRootCA() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
@@ -181,7 +181,7 @@ func TestAddClientCA(t *testing.T) {
 				t.Errorf("AddClientCA() error = %v", err)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config, tt.want) {
+			if !reflect.DeepEqual(ctx.Config, tt.want) && !equalPools(ctx.Config.ClientCAs, tt.want.ClientCAs) {
 				t.Errorf("AddClientCA() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
@@ -202,7 +202,7 @@ func TestAddRootsToRootCAs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestAddRootsToRootCAs(t *testing.T) {
 				t.Errorf("AddRootsToRootCAs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config.RootCAs, tt.want.RootCAs) {
+			if !equalPools(ctx.Config.RootCAs, tt.want.RootCAs) {
 				t.Errorf("AddRootsToRootCAs() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
@@ -256,7 +256,7 @@ func TestAddRootsToClientCAs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestAddRootsToClientCAs(t *testing.T) {
 				t.Errorf("AddRootsToClientCAs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config.ClientCAs, tt.want.ClientCAs) {
+			if !equalPools(ctx.Config.ClientCAs, tt.want.ClientCAs) {
 				t.Errorf("AddRootsToClientCAs() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
@@ -310,12 +310,12 @@ func TestAddFederationToRootCAs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	federated, err := ioutil.ReadFile("testdata/secrets/federated_ca.crt")
+	federated, err := os.ReadFile("testdata/secrets/federated_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,12 +374,12 @@ func TestAddFederationToClientCAs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	federated, err := ioutil.ReadFile("testdata/secrets/federated_ca.crt")
+	federated, err := os.ReadFile("testdata/secrets/federated_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +438,7 @@ func TestAddRootsToCAs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestAddRootsToCAs(t *testing.T) {
 				t.Errorf("AddRootsToCAs() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(ctx.Config.RootCAs, tt.want.RootCAs) || !reflect.DeepEqual(ctx.Config.ClientCAs, tt.want.ClientCAs) {
+			if !equalPools(ctx.Config.RootCAs, tt.want.RootCAs) || !equalPools(ctx.Config.ClientCAs, tt.want.ClientCAs) {
 				t.Errorf("AddRootsToCAs() = %v, want %v", ctx.Config, tt.want)
 			}
 		})
@@ -492,12 +492,12 @@ func TestAddFederationToCAs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root, err := ioutil.ReadFile("testdata/secrets/root_ca.crt")
+	root, err := os.ReadFile("testdata/secrets/root_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	federated, err := ioutil.ReadFile("testdata/secrets/federated_ca.crt")
+	federated, err := os.ReadFile("testdata/secrets/federated_ca.crt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,6 +543,9 @@ func TestAddFederationToCAs(t *testing.T) {
 }
 
 func equalPools(a, b *x509.CertPool) bool {
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
 	subjects := a.Subjects()
 	sA := make([]string, len(subjects))
 	for i := range subjects {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	gax "github.com/googleapis/gax-go/v2"
 	"github.com/smallstep/certificates/kms/apiv1"
 	"go.step.sm/crypto/pemutil"
+	"google.golang.org/api/option"
 	kmspb "google.golang.org/genproto/googleapis/cloud/kms/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -50,26 +50,63 @@ func TestParent(t *testing.T) {
 }
 
 func TestNew(t *testing.T) {
+	tmp := newKeyManagementClient
+	t.Cleanup(func() {
+		newKeyManagementClient = tmp
+	})
+	newKeyManagementClient = func(ctx context.Context, opts ...option.ClientOption) (KeyManagementClient, error) {
+		if len(opts) > 0 {
+			return nil, fmt.Errorf("test error")
+		}
+		return &MockClient{}, nil
+	}
+
 	type args struct {
 		ctx  context.Context
 		opts apiv1.Options
 	}
 	tests := []struct {
-		name     string
-		skipOnCI bool
-		args     args
-		want     *CloudKMS
-		wantErr  bool
+		name    string
+		args    args
+		want    *CloudKMS
+		wantErr bool
 	}{
-		{"fail authentication", true, args{context.Background(), apiv1.Options{}}, nil, true},
-		{"fail credentials", false, args{context.Background(), apiv1.Options{CredentialsFile: "testdata/missing"}}, nil, true},
+		{"ok", args{context.Background(), apiv1.Options{}}, &CloudKMS{client: &MockClient{}}, false},
+		{"ok with uri", args{context.Background(), apiv1.Options{URI: "cloudkms:"}}, &CloudKMS{client: &MockClient{}}, false},
+		{"fail credentials", args{context.Background(), apiv1.Options{CredentialsFile: "testdata/missing"}}, nil, true},
+		{"fail with uri", args{context.Background(), apiv1.Options{URI: "cloudkms:credentials-file=testdata/missing"}}, nil, true},
+		{"fail schema", args{context.Background(), apiv1.Options{URI: "pkcs11:"}}, nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.skipOnCI && os.Getenv("CI") == "true" {
-				t.SkipNow()
+			got, err := New(tt.args.ctx, tt.args.opts)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("New() error = %v, wantErr %v", err, tt.wantErr)
+				return
 			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("New() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
+func TestNew_real(t *testing.T) {
+	type args struct {
+		ctx  context.Context
+		opts apiv1.Options
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    *CloudKMS
+		wantErr bool
+	}{
+		{"fail credentials", args{context.Background(), apiv1.Options{CredentialsFile: "testdata/missing"}}, nil, true},
+		{"fail with uri", args{context.Background(), apiv1.Options{URI: "cloudkms:credentials-file=testdata/missing"}}, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			got, err := New(tt.args.ctx, tt.args.opts)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("New() error = %v, wantErr %v", err, tt.wantErr)
@@ -128,6 +165,15 @@ func TestCloudKMS_Close(t *testing.T) {
 
 func TestCloudKMS_CreateSigner(t *testing.T) {
 	keyName := "projects/p/locations/l/keyRings/k/cryptoKeys/c/cryptoKeyVersions/1"
+	pemBytes, err := os.ReadFile("testdata/pub.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, err := pemutil.ParseKey(pemBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	type fields struct {
 		client KeyManagementClient
 	}
@@ -141,8 +187,16 @@ func TestCloudKMS_CreateSigner(t *testing.T) {
 		want    crypto.Signer
 		wantErr bool
 	}{
-		{"ok", fields{&MockClient{}}, args{&apiv1.CreateSignerRequest{SigningKey: keyName}}, &Signer{client: &MockClient{}, signingKey: keyName}, false},
-		{"fail", fields{&MockClient{}}, args{&apiv1.CreateSignerRequest{SigningKey: ""}}, nil, true},
+		{"ok", fields{&MockClient{
+			getPublicKey: func(_ context.Context, _ *kmspb.GetPublicKeyRequest, _ ...gax.CallOption) (*kmspb.PublicKey, error) {
+				return &kmspb.PublicKey{Pem: string(pemBytes)}, nil
+			},
+		}}, args{&apiv1.CreateSignerRequest{SigningKey: keyName}}, &Signer{client: &MockClient{}, signingKey: keyName, publicKey: pk}, false},
+		{"fail", fields{&MockClient{
+			getPublicKey: func(_ context.Context, _ *kmspb.GetPublicKeyRequest, _ ...gax.CallOption) (*kmspb.PublicKey, error) {
+				return nil, fmt.Errorf("test error")
+			},
+		}}, args{&apiv1.CreateSignerRequest{SigningKey: ""}}, nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -153,6 +207,9 @@ func TestCloudKMS_CreateSigner(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("CloudKMS.CreateSigner() error = %v, wantErr %v", err, tt.wantErr)
 				return
+			}
+			if signer, ok := got.(*Signer); ok {
+				signer.client = &MockClient{}
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("CloudKMS.CreateSigner() = %v, want %v", got, tt.want)
@@ -166,7 +223,7 @@ func TestCloudKMS_CreateKey(t *testing.T) {
 	testError := fmt.Errorf("an error")
 	alreadyExists := status.Error(codes.AlreadyExists, "already exists")
 
-	pemBytes, err := ioutil.ReadFile("testdata/pub.pem")
+	pemBytes, err := os.ReadFile("testdata/pub.pem")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +389,7 @@ func TestCloudKMS_GetPublicKey(t *testing.T) {
 	keyName := "projects/p/locations/l/keyRings/k/cryptoKeys/c/cryptoKeyVersions/1"
 	testError := fmt.Errorf("an error")
 
-	pemBytes, err := ioutil.ReadFile("testdata/pub.pem")
+	pemBytes, err := os.ReadFile("testdata/pub.pem")
 	if err != nil {
 		t.Fatal(err)
 	}

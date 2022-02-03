@@ -5,8 +5,8 @@ private keys and sign certificates.
 
 Support for multiple KMS are planned, but currently the only Google's Cloud KMS,
 and Amazon's AWS KMS are supported. A still experimental version for YubiKeys is
-also available if you compile
-[step-certificates](https://github.com/smallstep/certificates) yourself.
+also available if you compile [step-ca](https://github.com/smallstep/certificates) 
+yourself.
 
 ## Google's Cloud KMS
 
@@ -213,3 +213,25 @@ and configure the `kms` property with the `type` and your `pin` in it.
     ...
 }
 ```
+
+## SSHAgentKMS
+
+SSHAgentKMS is a KMS that wrapps a ssh-agent which has access to the keys to
+sign ssh certificates. This was primarly written to be able to use gpg-agent
+to provide the keys stored in a YubiKeys openpgp interface.
+
+```json
+{
+    "kms": {
+        "type": "sshagentkms"
+    },
+    "ssh": {
+        "hostKey": "sshagentkms:cardno:000123456789",
+        "userKey": "sshagentkms:cardno:000123456789",
+    },
+    ...
+}
+```
+
+This KMS requires that "root", "crt" and "key" are stored in plain files as for
+SoftKMS.

@@ -36,7 +36,7 @@ func (r *SSHRevokeRequest) Validate() (err error) {
 	if !r.Passive {
 		return errs.NotImplemented("non-passive revocation not implemented")
 	}
-	if len(r.OTT) == 0 {
+	if r.OTT == "" {
 		return errs.BadRequest("missing ott")
 	}
 	return
@@ -48,7 +48,7 @@ func (r *SSHRevokeRequest) Validate() (err error) {
 func (h *caHandler) SSHRevoke(w http.ResponseWriter, r *http.Request) {
 	var body SSHRevokeRequest
 	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+		WriteError(w, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 
@@ -75,7 +75,7 @@ func (h *caHandler) SSHRevoke(w http.ResponseWriter, r *http.Request) {
 	opts.OTT = body.OTT
 
 	if err := h.Authority.Revoke(ctx, opts); err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		WriteError(w, errs.ForbiddenErr(err, "error revoking ssh certificate"))
 		return
 	}
 

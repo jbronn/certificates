@@ -8,7 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -181,13 +181,8 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 				t.Errorf("Client.GetClientTLSConfig() error = %v", err)
 				return nil
 			}
-			tr, err := getDefaultTransport(tlsConfig)
-			if err != nil {
-				t.Errorf("getDefaultTransport() error = %v", err)
-				return nil
-			}
 			return &http.Client{
-				Transport: tr,
+				Transport: getDefaultTransport(tlsConfig),
 			}
 		}, map[string]bool{srvTLS.URL: false, srvMTLS.URL: false}},
 		{"with no ClientCert", func(t *testing.T, client *Client, sr *api.SignResponse, pk crypto.PrivateKey) *http.Client {
@@ -199,14 +194,8 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 			tlsConfig := getDefaultTLSConfig(sr)
 			tlsConfig.RootCAs = x509.NewCertPool()
 			tlsConfig.RootCAs.AddCert(root)
-
-			tr, err := getDefaultTransport(tlsConfig)
-			if err != nil {
-				t.Errorf("getDefaultTransport() error = %v", err)
-				return nil
-			}
 			return &http.Client{
-				Transport: tr,
+				Transport: getDefaultTransport(tlsConfig),
 			}
 		}, map[string]bool{srvTLS.URL + "/no-cert": false, srvMTLS.URL + "/no-cert": true}},
 		{"fail with default", func(t *testing.T, client *Client, sr *api.SignResponse, pk crypto.PrivateKey) *http.Client {
@@ -232,7 +221,7 @@ func TestClient_GetServerTLSConfig_http(t *testing.T) {
 						return
 					}
 					defer resp.Body.Close()
-					b, err := ioutil.ReadAll(resp.Body)
+					b, err := io.ReadAll(resp.Body)
 					if err != nil {
 						t.Fatalf("ioutil.RealAdd() error = %v", err)
 					}
@@ -288,10 +277,7 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Client.GetClientTLSConfig() error = %v", err)
 	}
-	tr2, err := getDefaultTransport(tlsConfig)
-	if err != nil {
-		t.Fatalf("getDefaultTransport() error = %v", err)
-	}
+	tr2 := getDefaultTransport(tlsConfig)
 	// No client cert
 	root, err := RootCertificate(sr)
 	if err != nil {
@@ -300,10 +286,7 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 	tlsConfig = getDefaultTLSConfig(sr)
 	tlsConfig.RootCAs = x509.NewCertPool()
 	tlsConfig.RootCAs.AddCert(root)
-	tr3, err := getDefaultTransport(tlsConfig)
-	if err != nil {
-		t.Fatalf("getDefaultTransport() error = %v", err)
-	}
+	tr3 := getDefaultTransport(tlsConfig)
 
 	// Disable keep alives to force TLS handshake
 	tr1.DisableKeepAlives = true
@@ -352,7 +335,7 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 					}
 
 					defer resp.Body.Close()
-					b, err := ioutil.ReadAll(resp.Body)
+					b, err := io.ReadAll(resp.Body)
 					if err != nil {
 						t.Errorf("ioutil.RealAdd() error = %v", err)
 						return
@@ -391,9 +374,9 @@ func TestClient_GetServerTLSConfig_renew(t *testing.T) {
 					}
 
 					defer resp.Body.Close()
-					b, err := ioutil.ReadAll(resp.Body)
+					b, err := io.ReadAll(resp.Body)
 					if err != nil {
-						t.Errorf("ioutil.RealAdd() error = %v", err)
+						t.Errorf("io.ReadAll() error = %v", err)
 						return
 					}
 					if !bytes.Equal(b, []byte("ok")) {

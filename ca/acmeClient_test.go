@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -31,18 +31,17 @@ func TestNewACMEClient(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce:   srv.URL + "/foo",
 		NewAccount: srv.URL + "/bar",
 		NewOrder:   srv.URL + "/baz",
-		NewAuthz:   srv.URL + "/zap",
 		RevokeCert: srv.URL + "/zip",
 		KeyChange:  srv.URL + "/blorp",
 	}
 	acc := acme.Account{
-		Contact: []string{"max", "mariano"},
-		Status:  "valid",
-		Orders:  "orders-url",
+		Contact:   []string{"max", "mariano"},
+		Status:    "valid",
+		OrdersURL: "orders-url",
 	}
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-option-error": func(t *testing.T) test {
@@ -58,7 +57,7 @@ func TestNewACMEClient(t *testing.T) {
 		"fail/get-directory": func(t *testing.T) test {
 			return test{
 				ops: []ClientOption{WithTransport(http.DefaultTransport)},
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -76,7 +75,7 @@ func TestNewACMEClient(t *testing.T) {
 				ops: []ClientOption{WithTransport(http.DefaultTransport)},
 				r1:  dir,
 				rc1: 200,
-				r2:  acme.AccountDoesNotExistErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorAccountDoesNotExistType, "account does not exist"),
 				rc2: 400,
 				err: errors.New("Account does not exist"),
 			}
@@ -110,6 +109,7 @@ func TestNewACMEClient(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
 				switch {
 				case i == 0:
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -142,11 +142,10 @@ func TestNewACMEClient(t *testing.T) {
 
 func TestACMEClient_GetDirectory(t *testing.T) {
 	c := &ACMEClient{
-		dir: &acme.Directory{
+		dir: &acmeAPI.Directory{
 			NewNonce:   "/foo",
 			NewAccount: "/bar",
 			NewOrder:   "/baz",
-			NewAuthz:   "/zap",
 			RevokeCert: "/zip",
 			KeyChange:  "/blorp",
 		},
@@ -166,7 +165,7 @@ func TestACMEClient_GetNonce(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -185,7 +184,7 @@ func TestACMEClient_GetNonce(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/GET-nonce": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -205,6 +204,7 @@ func TestACMEClient_GetNonce(t *testing.T) {
 			tc := run(t)
 
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				api.JSONStatus(w, tc.r1, tc.rc1)
 			})
@@ -237,7 +237,7 @@ func TestACMEClient_post(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -248,9 +248,9 @@ func TestACMEClient_post(t *testing.T) {
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 	assert.FatalError(t, err)
 	acc := acme.Account{
-		Contact: []string{"max", "mariano"},
-		Status:  "valid",
-		Orders:  "orders-url",
+		Contact:   []string{"max", "mariano"},
+		Status:    "valid",
+		OrdersURL: "orders-url",
 	}
 	ac := &ACMEClient{
 		client: &http.Client{
@@ -266,7 +266,7 @@ func TestACMEClient_post(t *testing.T) {
 		"fail/account-not-configured": func(t *testing.T) test {
 			return test{
 				client: &ACMEClient{},
-				r1:     acme.MalformedErr(nil).ToACME(),
+				r1:     acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1:    400,
 				err:    errors.New("acme client not configured with account"),
 			}
@@ -274,7 +274,7 @@ func TestACMEClient_post(t *testing.T) {
 		"fail/GET-nonce": func(t *testing.T) test {
 			return test{
 				client: ac,
-				r1:     acme.MalformedErr(nil).ToACME(),
+				r1:     acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1:    400,
 				err:    errors.New("The request message was malformed"),
 			}
@@ -311,6 +311,8 @@ func TestACMEClient_post(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -319,7 +321,7 @@ func TestACMEClient_post(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -365,7 +367,7 @@ func TestACMEClient_NewOrder(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 		NewOrder: srv.URL + "/bar",
 	}
@@ -376,20 +378,21 @@ func TestACMEClient_NewOrder(t *testing.T) {
 	assert.FatalError(t, err)
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 	assert.FatalError(t, err)
+	now := time.Now().UTC().Round(time.Second)
 	nor := acmeAPI.NewOrderRequest{
 		Identifiers: []acme.Identifier{
 			{Type: "dns", Value: "example.com"},
 			{Type: "dns", Value: "acme.example.com"},
 		},
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(time.Minute),
+		NotBefore: now,
+		NotAfter:  now.Add(time.Minute),
 	}
 	norb, err := json.Marshal(nor)
 	assert.FatalError(t, err)
 	ord := acme.Order{
-		Status:   "valid",
-		Expires:  "soon",
-		Finalize: "finalize-url",
+		Status:      "valid",
+		ExpiresAt:   now, // "soon"
+		FinalizeURL: "finalize-url",
 	}
 	ac := &ACMEClient{
 		client: &http.Client{
@@ -404,7 +407,7 @@ func TestACMEClient_NewOrder(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -413,7 +416,7 @@ func TestACMEClient_NewOrder(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				ops: []withHeaderOption{withKid(ac)},
 				err: errors.New("The request message was malformed"),
@@ -448,6 +451,8 @@ func TestACMEClient_NewOrder(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -456,7 +461,7 @@ func TestACMEClient_NewOrder(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -498,7 +503,7 @@ func TestACMEClient_GetOrder(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -509,9 +514,9 @@ func TestACMEClient_GetOrder(t *testing.T) {
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 	assert.FatalError(t, err)
 	ord := acme.Order{
-		Status:   "valid",
-		Expires:  "soon",
-		Finalize: "finalize-url",
+		Status:      "valid",
+		ExpiresAt:   time.Now().UTC().Round(time.Second), // "soon"
+		FinalizeURL: "finalize-url",
 	}
 	ac := &ACMEClient{
 		client: &http.Client{
@@ -526,7 +531,7 @@ func TestACMEClient_GetOrder(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -535,7 +540,7 @@ func TestACMEClient_GetOrder(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -568,6 +573,8 @@ func TestACMEClient_GetOrder(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -576,7 +583,7 @@ func TestACMEClient_GetOrder(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -618,7 +625,7 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -628,9 +635,9 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 	assert.FatalError(t, err)
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 	assert.FatalError(t, err)
-	az := acme.Authz{
+	az := acme.Authorization{
 		Status:     "valid",
-		Expires:    "soon",
+		ExpiresAt:  time.Now().UTC().Round(time.Second),
 		Identifier: acme.Identifier{Type: "dns", Value: "example.com"},
 	}
 	ac := &ACMEClient{
@@ -646,7 +653,7 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -655,7 +662,7 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -688,6 +695,8 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -696,7 +705,7 @@ func TestACMEClient_GetAuthz(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -738,7 +747,7 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -766,7 +775,7 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -775,7 +784,7 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -808,6 +817,8 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -816,7 +827,7 @@ func TestACMEClient_GetChallenge(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -859,7 +870,7 @@ func TestACMEClient_ValidateChallenge(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -887,7 +898,7 @@ func TestACMEClient_ValidateChallenge(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -896,7 +907,7 @@ func TestACMEClient_ValidateChallenge(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -929,6 +940,8 @@ func TestACMEClient_ValidateChallenge(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -937,7 +950,7 @@ func TestACMEClient_ValidateChallenge(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -976,7 +989,7 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -987,10 +1000,10 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 	jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
 	assert.FatalError(t, err)
 	ord := acme.Order{
-		Status:      "valid",
-		Expires:     "soon",
-		Finalize:    "finalize-url",
-		Certificate: "cert-url",
+		Status:         "valid",
+		ExpiresAt:      time.Now(), // "soon"
+		FinalizeURL:    "finalize-url",
+		CertificateURL: "cert-url",
 	}
 	_csr, err := pemutil.Read("../authority/testdata/certs/foo.csr")
 	assert.FatalError(t, err)
@@ -1012,7 +1025,7 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -1021,7 +1034,7 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -1054,6 +1067,8 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -1062,7 +1077,7 @@ func TestACMEClient_FinalizeOrder(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -1101,7 +1116,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -1121,9 +1136,9 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 		Key:    jwk,
 		kid:    "foobar",
 		acc: &acme.Account{
-			Contact: []string{"max", "mariano"},
-			Status:  "valid",
-			Orders:  srv.URL + "/orders-url",
+			Contact:   []string{"max", "mariano"},
+			Status:    "valid",
+			OrdersURL: srv.URL + "/orders-url",
 		},
 	}
 
@@ -1137,7 +1152,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 		"fail/client-post": func(t *testing.T) test {
 			return test{
 				client: ac,
-				r1:     acme.MalformedErr(nil).ToACME(),
+				r1:     acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1:    400,
 				err:    errors.New("The request message was malformed"),
 			}
@@ -1147,7 +1162,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 				client: ac,
 				r1:     []byte{},
 				rc1:    200,
-				r2:     acme.MalformedErr(nil).ToACME(),
+				r2:     acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2:    400,
 				err:    errors.New("The request message was malformed"),
 			}
@@ -1181,6 +1196,8 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -1189,7 +1206,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)
@@ -1198,7 +1215,7 @@ func TestACMEClient_GetAccountOrders(t *testing.T) {
 				assert.Equals(t, hdr.Nonce, expectedNonce)
 				jwsURL, ok := hdr.ExtraHeaders["url"].(string)
 				assert.Fatal(t, ok)
-				assert.Equals(t, jwsURL, ac.acc.Orders)
+				assert.Equals(t, jwsURL, ac.acc.OrdersURL)
 				assert.Equals(t, hdr.KeyID, ac.kid)
 
 				payload, err := jws.Verify(ac.Key.Public())
@@ -1232,7 +1249,7 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 	srv := httptest.NewServer(nil)
 	defer srv.Close()
 
-	dir := acme.Directory{
+	dir := acmeAPI.Directory{
 		NewNonce: srv.URL + "/foo",
 	}
 	// Retrieve transport from options.
@@ -1248,6 +1265,7 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 		Type:  "Certificate",
 		Bytes: leaf.Raw,
 	})
+	// nolint:gocritic
 	certBytes := append(leafb, leafb...)
 	certBytes = append(certBytes, leafb...)
 	ac := &ACMEClient{
@@ -1259,16 +1277,16 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 		Key:    jwk,
 		kid:    "foobar",
 		acc: &acme.Account{
-			Contact: []string{"max", "mariano"},
-			Status:  "valid",
-			Orders:  srv.URL + "/orders-url",
+			Contact:   []string{"max", "mariano"},
+			Status:    "valid",
+			OrdersURL: srv.URL + "/orders-url",
 		},
 	}
 
 	tests := map[string]func(t *testing.T) test{
 		"fail/client-post": func(t *testing.T) test {
 			return test{
-				r1:  acme.MalformedErr(nil).ToACME(),
+				r1:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc1: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -1277,7 +1295,7 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 			return test{
 				r1:  []byte{},
 				rc1: 200,
-				r2:  acme.MalformedErr(nil).ToACME(),
+				r2:  acme.NewError(acme.ErrorMalformedType, "malformed request"),
 				rc2: 400,
 				err: errors.New("The request message was malformed"),
 			}
@@ -1309,6 +1327,8 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 
 			i := 0
 			srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equals(t, "step-http-client/1.0", req.Header.Get("User-Agent")) // check default User-Agent header
+
 				w.Header().Set("Replay-Nonce", expectedNonce)
 				if i == 0 {
 					api.JSONStatus(w, tc.r1, tc.rc1)
@@ -1317,7 +1337,7 @@ func TestACMEClient_GetCertificate(t *testing.T) {
 				}
 
 				// validate jws request protected headers and body
-				body, err := ioutil.ReadAll(req.Body)
+				body, err := io.ReadAll(req.Body)
 				assert.FatalError(t, err)
 				jws, err := jose.ParseJWS(string(body))
 				assert.FatalError(t, err)

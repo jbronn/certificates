@@ -3,11 +3,12 @@ package ca
 import (
 	"context"
 	"crypto/tls"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/errs"
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/randutil"
 )
@@ -72,6 +74,30 @@ func startCAServer(configFile string) (*CA, string, error) {
 		ca.srv.Serve(listener)
 	}()
 	return ca, caURL, nil
+}
+
+func mTLSMiddleware(next http.Handler, nonAuthenticatedPaths ...string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			api.JSON(w, api.VersionResponse{
+				Version:                     "test",
+				RequireClientAuthentication: true,
+			})
+			return
+		}
+
+		for _, s := range nonAuthenticatedPaths {
+			if strings.HasPrefix(r.URL.Path, s) || strings.HasPrefix(r.URL.Path, "/1.0"+s) {
+				next.ServeHTTP(w, r)
+			}
+		}
+		isMTLS := r.TLS != nil && len(r.TLS.PeerCertificates) > 0
+		if !isMTLS {
+			api.WriteError(w, errs.Unauthorized("missing peer certificate"))
+		} else {
+			next.ServeHTTP(w, r)
+		}
+	})
 }
 
 func generateBootstrapToken(ca, subject, sha string) string {
@@ -156,7 +182,7 @@ func TestBootstrap(t *testing.T) {
 					}
 					gotTR := got.client.GetTransport().(*http.Transport)
 					wantTR := tt.want.client.GetTransport().(*http.Transport)
-					if !reflect.DeepEqual(gotTR.TLSClientConfig.RootCAs, wantTR.TLSClientConfig.RootCAs) {
+					if !equalPools(gotTR.TLSClientConfig.RootCAs, wantTR.TLSClientConfig.RootCAs) {
 						t.Errorf("Bootstrap() certPool = %v, want %v", gotTR.TLSClientConfig.RootCAs, wantTR.TLSClientConfig.RootCAs)
 					}
 				}
@@ -171,6 +197,15 @@ func TestBootstrapServerWithoutMTLS(t *testing.T) {
 	token := func() string {
 		return generateBootstrapToken(srv.URL, "subject", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
 	}
+
+	mtlsServer := startCABootstrapServer()
+	next := mtlsServer.Config.Handler
+	mtlsServer.Config.Handler = mTLSMiddleware(next, "/root/", "/sign")
+	defer mtlsServer.Close()
+	mtlsToken := func() string {
+		return generateBootstrapToken(mtlsServer.URL, "subject", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
+	}
+
 	type args struct {
 		ctx   context.Context
 		token string
@@ -182,6 +217,7 @@ func TestBootstrapServerWithoutMTLS(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", args{context.Background(), token(), &http.Server{}}, false},
+		{"ok mtls", args{context.Background(), mtlsToken(), &http.Server{}}, false},
 		{"fail", args{context.Background(), "bad-token", &http.Server{}}, true},
 		{"fail with TLSConfig", args{context.Background(), token(), &http.Server{TLSConfig: &tls.Config{}}}, true},
 	}
@@ -217,6 +253,15 @@ func TestBootstrapServerWithMTLS(t *testing.T) {
 	token := func() string {
 		return generateBootstrapToken(srv.URL, "subject", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
 	}
+
+	mtlsServer := startCABootstrapServer()
+	next := mtlsServer.Config.Handler
+	mtlsServer.Config.Handler = mTLSMiddleware(next, "/root/", "/sign")
+	defer mtlsServer.Close()
+	mtlsToken := func() string {
+		return generateBootstrapToken(mtlsServer.URL, "subject", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
+	}
+
 	type args struct {
 		ctx   context.Context
 		token string
@@ -228,6 +273,7 @@ func TestBootstrapServerWithMTLS(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", args{context.Background(), token(), &http.Server{}}, false},
+		{"ok mtls", args{context.Background(), mtlsToken(), &http.Server{}}, false},
 		{"fail", args{context.Background(), "bad-token", &http.Server{}}, true},
 		{"fail with TLSConfig", args{context.Background(), token(), &http.Server{TLSConfig: &tls.Config{}}}, true},
 	}
@@ -263,6 +309,15 @@ func TestBootstrapClient(t *testing.T) {
 	token := func() string {
 		return generateBootstrapToken(srv.URL, "subject", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
 	}
+
+	mtlsServer := startCABootstrapServer()
+	next := mtlsServer.Config.Handler
+	mtlsServer.Config.Handler = mTLSMiddleware(next, "/root/", "/sign")
+	defer mtlsServer.Close()
+	mtlsToken := func() string {
+		return generateBootstrapToken(mtlsServer.URL, "subject", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
+	}
+
 	type args struct {
 		ctx   context.Context
 		token string
@@ -273,6 +328,7 @@ func TestBootstrapClient(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", args{context.Background(), token()}, false},
+		{"ok mtls", args{context.Background(), mtlsToken()}, false},
 		{"fail", args{context.Background(), "bad-token"}, true},
 	}
 	for _, tt := range tests {
@@ -382,7 +438,7 @@ func TestBootstrapClientServerRotation(t *testing.T) {
 			return errors.Wrapf(err, "client.Get(%s) failed", srvURL)
 		}
 		defer resp.Body.Close()
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return errors.Wrap(err, "client.Get() error reading response")
 		}
@@ -499,7 +555,7 @@ func TestBootstrapClientServerFederation(t *testing.T) {
 			return errors.Wrapf(err, "client.Get(%s) failed", srvURL)
 		}
 		defer resp.Body.Close()
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return errors.Wrap(err, "client.Get() error reading response")
 		}
@@ -541,6 +597,15 @@ func TestBootstrapListener(t *testing.T) {
 	token := func() string {
 		return generateBootstrapToken(srv.URL, "127.0.0.1", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
 	}
+
+	mtlsServer := startCABootstrapServer()
+	next := mtlsServer.Config.Handler
+	mtlsServer.Config.Handler = mTLSMiddleware(next, "/root/", "/sign")
+	defer mtlsServer.Close()
+	mtlsToken := func() string {
+		return generateBootstrapToken(mtlsServer.URL, "127.0.0.1", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
+	}
+
 	type args struct {
 		token string
 	}
@@ -550,6 +615,7 @@ func TestBootstrapListener(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", args{token()}, false},
+		{"ok mtls", args{mtlsToken()}, false},
 		{"fail", args{"bad-token"}, true},
 	}
 	for _, tt := range tests {
@@ -589,9 +655,9 @@ func TestBootstrapListener(t *testing.T) {
 				return
 			}
 			defer resp.Body.Close()
-			b, err := ioutil.ReadAll(resp.Body)
+			b, err := io.ReadAll(resp.Body)
 			if err != nil {
-				t.Errorf("ioutil.ReadAll() error = %v", err)
+				t.Errorf("io.ReadAll() error = %v", err)
 				return
 			}
 			if string(b) != "ok" {

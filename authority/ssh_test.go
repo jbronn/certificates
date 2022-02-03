@@ -57,7 +57,7 @@ func (m sshTestCertModifier) Modify(cert *ssh.Certificate, opts provisioner.Sign
 	if m == "" {
 		return nil
 	}
-	return fmt.Errorf(string(m))
+	return errors.New(string(m))
 }
 
 type sshTestCertValidator string
@@ -66,7 +66,7 @@ func (v sshTestCertValidator) Valid(crt *ssh.Certificate, opts provisioner.SignS
 	if v == "" {
 		return nil
 	}
-	return fmt.Errorf(string(v))
+	return errors.New(string(v))
 }
 
 type sshTestOptionsValidator string
@@ -75,7 +75,7 @@ func (v sshTestOptionsValidator) Valid(opts provisioner.SignSSHOptions) error {
 	if v == "" {
 		return nil
 	}
-	return fmt.Errorf(string(v))
+	return errors.New(string(v))
 }
 
 type sshTestOptionsModifier string
@@ -84,7 +84,53 @@ func (m sshTestOptionsModifier) Modify(cert *ssh.Certificate, opts provisioner.S
 	if m == "" {
 		return nil
 	}
-	return fmt.Errorf(string(m))
+	return errors.New(string(m))
+}
+
+func TestAuthority_initHostOnly(t *testing.T) {
+	auth := testAuthority(t, func(a *Authority) error {
+		a.config.SSH.UserKey = ""
+		return nil
+	})
+
+	// Check keys
+	keys, err := auth.GetSSHRoots(context.Background())
+	assert.NoError(t, err)
+	assert.Len(t, 1, keys.HostKeys)
+	assert.Len(t, 0, keys.UserKeys)
+
+	// Check templates, user templates should work fine.
+	_, err = auth.GetSSHConfig(context.Background(), "user", nil)
+	assert.NoError(t, err)
+
+	_, err = auth.GetSSHConfig(context.Background(), "host", map[string]string{
+		"Certificate": "ssh_host_ecdsa_key-cert.pub",
+		"Key":         "ssh_host_ecdsa_key",
+	})
+	assert.Error(t, err)
+}
+
+func TestAuthority_initUserOnly(t *testing.T) {
+	auth := testAuthority(t, func(a *Authority) error {
+		a.config.SSH.HostKey = ""
+		return nil
+	})
+
+	// Check keys
+	keys, err := auth.GetSSHRoots(context.Background())
+	assert.NoError(t, err)
+	assert.Len(t, 0, keys.HostKeys)
+	assert.Len(t, 1, keys.UserKeys)
+
+	// Check templates, host templates should work fine.
+	_, err = auth.GetSSHConfig(context.Background(), "host", map[string]string{
+		"Certificate": "ssh_host_ecdsa_key-cert.pub",
+		"Key":         "ssh_host_ecdsa_key",
+	})
+	assert.NoError(t, err)
+
+	_, err = auth.GetSSHConfig(context.Background(), "user", nil)
+	assert.Error(t, err)
 }
 
 func TestAuthority_SignSSH(t *testing.T) {
@@ -126,6 +172,14 @@ func TestAuthority_SignSSH(t *testing.T) {
 		SSH: &provisioner.SSHOptions{Template: `{{ fail "an error"}}`},
 	}, sshutil.CreateTemplateData(sshutil.UserCert, "key-id", []string{"user"}))
 	assert.FatalError(t, err)
+	userJSONSyntaxErrorTemplateFile, err := provisioner.TemplateSSHOptions(&provisioner.Options{
+		SSH: &provisioner.SSHOptions{TemplateFile: "./testdata/templates/badjsonsyntax.tpl"},
+	}, sshutil.CreateTemplateData(sshutil.UserCert, "key-id", []string{"user"}))
+	assert.FatalError(t, err)
+	userJSONValueErrorTemplateFile, err := provisioner.TemplateSSHOptions(&provisioner.Options{
+		SSH: &provisioner.SSHOptions{TemplateFile: "./testdata/templates/badjsonvalue.tpl"},
+	}, sshutil.CreateTemplateData(sshutil.UserCert, "key-id", []string{"user"}))
+	assert.FatalError(t, err)
 
 	now := time.Now()
 
@@ -153,6 +207,8 @@ func TestAuthority_SignSSH(t *testing.T) {
 	}{
 		{"ok-user", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{userTemplate, userOptions}}, want{CertType: ssh.UserCert}, false},
 		{"ok-host", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{hostTemplate, hostOptions}}, want{CertType: ssh.HostCert}, false},
+		{"ok-user-only", fields{signer, nil}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{userTemplate, userOptions}}, want{CertType: ssh.UserCert}, false},
+		{"ok-host-only", fields{nil, signer}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{hostTemplate, hostOptions}}, want{CertType: ssh.HostCert}, false},
 		{"ok-opts-type-user", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{CertType: "user"}, []provisioner.SignOption{userTemplate}}, want{CertType: ssh.UserCert}, false},
 		{"ok-opts-type-host", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{CertType: "host"}, []provisioner.SignOption{hostTemplate}}, want{CertType: ssh.HostCert}, false},
 		{"ok-opts-principals", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{CertType: "user", Principals: []string{"user"}}, []provisioner.SignOption{userTemplateWithUser}}, want{CertType: ssh.UserCert, Principals: []string{"user"}}, false},
@@ -174,6 +230,8 @@ func TestAuthority_SignSSH(t *testing.T) {
 		{"fail-no-host-key", fields{signer, nil}, args{pub, provisioner.SignSSHOptions{CertType: "host"}, []provisioner.SignOption{hostTemplate}}, want{}, true},
 		{"fail-bad-type", fields{signer, nil}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{userTemplate, sshTestModifier{CertType: 100}}}, want{}, true},
 		{"fail-custom-template", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{userFailTemplate, userOptions}}, want{}, true},
+		{"fail-custom-template-syntax-error-file", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{userJSONSyntaxErrorTemplateFile, userOptions}}, want{}, true},
+		{"fail-custom-template-syntax-value-file", fields{signer, signer}, args{pub, provisioner.SignSSHOptions{}, []provisioner.SignOption{userJSONValueErrorTemplateFile, userOptions}}, want{}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -450,7 +508,33 @@ func TestAuthority_GetSSHConfig(t *testing.T) {
 		{Name: "config.tpl", Type: templates.File, Comment: "#", Path: "ssh/config", Content: []byte("Match exec \"step ssh check-host %h\"\n\tUserKnownHostsFile /home/user/.step/ssh/known_hosts\n\tProxyCommand step ssh proxycommand %r %h %p\n")},
 	}
 	hostOutputWithUserData := []templates.Output{
-		{Name: "sshd_config.tpl", Type: templates.File, Comment: "#", Path: "/etc/ssh/sshd_config", Content: []byte("TrustedUserCAKeys /etc/ssh/ca.pub\nHostCertificate /etc/ssh/ssh_host_ecdsa_key-cert.pub\nHostKey /etc/ssh/ssh_host_ecdsa_key")},
+		{Name: "sshd_config.tpl", Type: templates.File, Comment: "#", Path: "/etc/ssh/sshd_config", Content: []byte("Match all\n\tTrustedUserCAKeys /etc/ssh/ca.pub\n\tHostCertificate /etc/ssh/ssh_host_ecdsa_key-cert.pub\n\tHostKey /etc/ssh/ssh_host_ecdsa_key")},
+	}
+
+	tmplConfigUserIncludes := &templates.Templates{
+		SSH: &templates.SSHTemplates{
+			User: []templates.Template{
+				{Name: "step_includes.tpl", Type: templates.PrependLine, TemplatePath: "./testdata/templates/step_includes.tpl", Path: "${STEPPATH}/ssh/includes", Comment: "#"},
+			},
+		},
+		Data: map[string]interface{}{
+			"Step": &templates.Step{
+				SSH: templates.StepSSH{
+					UserKey: user,
+					HostKey: host,
+				},
+			},
+		},
+	}
+
+	userOutputEmptyData := []templates.Output{
+		{Name: "step_includes.tpl", Type: templates.File, Comment: "#", Path: "ssh/includes", Content: []byte("Include \"<no value>/ssh/config\"\n")},
+	}
+	userOutputWithoutTemplateVersion := []templates.Output{
+		{Name: "step_includes.tpl", Type: templates.File, Comment: "#", Path: "ssh/includes", Content: []byte("Include \"/home/user/.step/ssh/config\"\n")},
+	}
+	userOutputWithTemplateVersion := []templates.Output{
+		{Name: "step_includes.tpl", Type: templates.PrependLine, Comment: "#", Path: "${STEPPATH}/ssh/includes", Content: []byte("Include \"/home/user/.step/ssh/config\"\n")},
 	}
 
 	tmplConfigErr := &templates.Templates{
@@ -494,6 +578,9 @@ func TestAuthority_GetSSHConfig(t *testing.T) {
 		{"host", fields{tmplConfig, nil, hostSigner}, args{"host", nil}, hostOutput, false},
 		{"userWithData", fields{tmplConfigWithUserData, userSigner, hostSigner}, args{"user", map[string]string{"StepPath": "/home/user/.step"}}, userOutputWithUserData, false},
 		{"hostWithData", fields{tmplConfigWithUserData, userSigner, hostSigner}, args{"host", map[string]string{"Certificate": "ssh_host_ecdsa_key-cert.pub", "Key": "ssh_host_ecdsa_key"}}, hostOutputWithUserData, false},
+		{"userIncludesEmptyData", fields{tmplConfigUserIncludes, userSigner, hostSigner}, args{"user", nil}, userOutputEmptyData, false},
+		{"userIncludesWithoutTemplateVersion", fields{tmplConfigUserIncludes, userSigner, hostSigner}, args{"user", map[string]string{"StepPath": "/home/user/.step"}}, userOutputWithoutTemplateVersion, false},
+		{"userIncludesWithTemplateVersion", fields{tmplConfigUserIncludes, userSigner, hostSigner}, args{"user", map[string]string{"StepPath": "/home/user/.step", "StepSSHTemplateVersion": "v2"}}, userOutputWithTemplateVersion, false},
 		{"disabled", fields{tmplConfig, nil, nil}, args{"host", nil}, nil, true},
 		{"badType", fields{tmplConfig, userSigner, hostSigner}, args{"bad", nil}, nil, true},
 		{"userError", fields{tmplConfigErr, userSigner, hostSigner}, args{"user", nil}, nil, true},
@@ -585,69 +672,6 @@ func TestSSHConfig_Validate(t *testing.T) {
 
 			if err := tt.sshConfig.Validate(); (err != nil) != tt.wantErr {
 				t.Errorf("SSHConfig.Validate() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestSSHPublicKey_Validate(t *testing.T) {
-	key, err := jose.GenerateJWK("EC", "P-256", "", "sig", "", 0)
-	assert.FatalError(t, err)
-
-	type fields struct {
-		Type      string
-		Federated bool
-		Key       jose.JSONWebKey
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		wantErr bool
-	}{
-		{"user", fields{"user", true, key.Public()}, false},
-		{"host", fields{"host", false, key.Public()}, false},
-		{"empty", fields{"", true, key.Public()}, true},
-		{"badType", fields{"bad", false, key.Public()}, true},
-		{"badKey", fields{"user", false, *key}, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			k := &SSHPublicKey{
-				Type:      tt.fields.Type,
-				Federated: tt.fields.Federated,
-				Key:       tt.fields.Key,
-			}
-			if err := k.Validate(); (err != nil) != tt.wantErr {
-				t.Errorf("SSHPublicKey.Validate() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestSSHPublicKey_PublicKey(t *testing.T) {
-	key, err := jose.GenerateJWK("EC", "P-256", "", "sig", "", 0)
-	assert.FatalError(t, err)
-	pub, err := ssh.NewPublicKey(key.Public().Key)
-	assert.FatalError(t, err)
-
-	type fields struct {
-		publicKey ssh.PublicKey
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		want   ssh.PublicKey
-	}{
-		{"ok", fields{pub}, pub},
-		{"nil", fields{nil}, nil},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			k := &SSHPublicKey{
-				publicKey: tt.fields.publicKey,
-			}
-			if got := k.PublicKey(); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("SSHPublicKey.PublicKey() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -813,6 +837,11 @@ func TestAuthority_RekeySSH(t *testing.T) {
 	now := time.Now().UTC()
 
 	a := testAuthority(t)
+	a.db = &db.MockAuthDB{
+		MIsSSHRevoked: func(sn string) (bool, error) {
+			return false, nil
+		},
+	}
 
 	type test struct {
 		auth       *Authority
@@ -826,6 +855,56 @@ func TestAuthority_RekeySSH(t *testing.T) {
 		code       int
 	}
 	tests := map[string]func(t *testing.T) *test{
+		"fail/is-revoked": func(t *testing.T) *test {
+			auth := testAuthority(t)
+			auth.db = &db.MockAuthDB{
+				MIsSSHRevoked: func(sn string) (bool, error) {
+					return true, nil
+				},
+			}
+			return &test{
+				auth:       auth,
+				userSigner: signer,
+				hostSigner: signer,
+				cert: &ssh.Certificate{
+					Serial:          1234567890,
+					ValidAfter:      uint64(now.Unix()),
+					ValidBefore:     uint64(now.Add(time.Hour).Unix()),
+					CertType:        ssh.UserCert,
+					ValidPrincipals: []string{"foo", "bar"},
+					KeyId:           "foo",
+				},
+				key:      pub,
+				signOpts: []provisioner.SignOption{},
+				err:      errors.New("authority.authorizeSSHCertificate: certificate has been revoked"),
+				code:     http.StatusUnauthorized,
+			}
+		},
+		"fail/is-revoked-error": func(t *testing.T) *test {
+			auth := testAuthority(t)
+			auth.db = &db.MockAuthDB{
+				MIsSSHRevoked: func(sn string) (bool, error) {
+					return false, errors.New("an error")
+				},
+			}
+			return &test{
+				auth:       auth,
+				userSigner: signer,
+				hostSigner: signer,
+				cert: &ssh.Certificate{
+					Serial:          1234567890,
+					ValidAfter:      uint64(now.Unix()),
+					ValidBefore:     uint64(now.Add(time.Hour).Unix()),
+					CertType:        ssh.UserCert,
+					ValidPrincipals: []string{"foo", "bar"},
+					KeyId:           "foo",
+				},
+				key:      pub,
+				signOpts: []provisioner.SignOption{},
+				err:      errors.New("authority.authorizeSSHCertificate: an error"),
+				code:     http.StatusInternalServerError,
+			}
+		},
 		"fail/opts-type": func(t *testing.T) *test {
 			return &test{
 				userSigner: signer,
@@ -843,7 +922,7 @@ func TestAuthority_RekeySSH(t *testing.T) {
 				cert:       &ssh.Certificate{},
 				key:        pub,
 				signOpts:   []provisioner.SignOption{},
-				err:        errors.New("rekeySSH; cannot rekey certificate without validity period"),
+				err:        errors.New("cannot rekey a certificate without validity period"),
 				code:       http.StatusBadRequest,
 			}
 		},
@@ -854,7 +933,7 @@ func TestAuthority_RekeySSH(t *testing.T) {
 				cert:       &ssh.Certificate{ValidAfter: uint64(now.Unix())},
 				key:        pub,
 				signOpts:   []provisioner.SignOption{},
-				err:        errors.New("rekeySSH; cannot rekey certificate without validity period"),
+				err:        errors.New("cannot rekey a certificate without validity period"),
 				code:       http.StatusBadRequest,
 			}
 		},
@@ -887,13 +966,16 @@ func TestAuthority_RekeySSH(t *testing.T) {
 				cert:       &ssh.Certificate{ValidAfter: uint64(now.Unix()), ValidBefore: uint64(now.Add(10 * time.Minute).Unix()), CertType: 0},
 				key:        pub,
 				signOpts:   []provisioner.SignOption{},
-				err:        errors.New("rekeySSH; unexpected ssh certificate type: 0"),
+				err:        errors.New("unexpected certificate type '0'"),
 				code:       http.StatusBadRequest,
 			}
 		},
 		"fail/db-store": func(t *testing.T) *test {
 			return &test{
 				auth: testAuthority(t, WithDatabase(&db.MockAuthDB{
+					MIsSSHRevoked: func(sn string) (bool, error) {
+						return false, nil
+					},
 					MStoreSSHCertificate: func(cert *ssh.Certificate) error {
 						return errors.New("force")
 					},

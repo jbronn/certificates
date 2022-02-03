@@ -18,23 +18,28 @@ import (
 
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/commands"
-	"github.com/smallstep/cli/command"
-	"github.com/smallstep/cli/command/version"
-	"github.com/smallstep/cli/config"
-	"github.com/smallstep/cli/usage"
 	"github.com/urfave/cli"
+	"go.step.sm/cli-utils/command"
+	"go.step.sm/cli-utils/command/version"
+	"go.step.sm/cli-utils/step"
+	"go.step.sm/cli-utils/ui"
+	"go.step.sm/cli-utils/usage"
 
 	// Enabled kms interfaces.
 	_ "github.com/smallstep/certificates/kms/awskms"
+	_ "github.com/smallstep/certificates/kms/azurekms"
 	_ "github.com/smallstep/certificates/kms/cloudkms"
 	_ "github.com/smallstep/certificates/kms/softkms"
+	_ "github.com/smallstep/certificates/kms/sshagentkms"
 
 	// Experimental kms interfaces.
+	_ "github.com/smallstep/certificates/kms/pkcs11"
 	_ "github.com/smallstep/certificates/kms/yubikey"
 
 	// Enabled cas interfaces.
 	_ "github.com/smallstep/certificates/cas/cloudcas"
 	_ "github.com/smallstep/certificates/cas/softcas"
+	_ "github.com/smallstep/certificates/cas/stepcas"
 )
 
 // commit and buildTime are filled in during build by the Makefile
@@ -44,9 +49,14 @@ var (
 )
 
 func init() {
-	config.Set("Smallstep CA", Version, BuildTime)
+	step.Set("Smallstep CA", Version, BuildTime)
 	authority.GlobalVersion.Version = Version
 	rand.Seed(time.Now().UnixNano())
+}
+
+func exit(code int) {
+	ui.Reset()
+	os.Exit(code)
 }
 
 // appHelpTemplate contains the modified template for the main app
@@ -63,6 +73,7 @@ var appHelpTemplate = `## NAME
 | **{{join .Names ", "}}** | {{.Usage}} |{{end}}
 {{end}}{{if .VisibleFlags}}{{end}}
 ## OPTIONS
+
 {{range $index, $option := .VisibleFlags}}{{if $index}}
 {{end}}{{$option}}
 {{end}}{{end}}{{if .Copyright}}{{if len .Authors}}
@@ -86,6 +97,9 @@ Please send us a sentence or two, good or bad: **feedback@smallstep.com** or htt
 `
 
 func main() {
+	// Initialize windows terminal
+	ui.Init()
+
 	// Override global framework components
 	cli.VersionPrinter = func(c *cli.Context) {
 		version.Command(c)
@@ -101,9 +115,11 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "step-ca"
 	app.HelpName = "step-ca"
-	app.Version = config.Version()
+	app.Version = step.Version()
 	app.Usage = "an online certificate authority for secure automated certificate management"
-	app.UsageText = `**step-ca** <config> [**--password-file**=<file>] [**--resolver**=<addr>] [**--help**] [**--version**]`
+	app.UsageText = `**step-ca** <config> [**--password-file**=<file>]
+[**--ssh-host-password-file**=<file>] [**--ssh-user-password-file**=<file>]
+[**--issuer-password-file**=<file>] [**--resolver**=<addr>] [**--help**] [**--version**]`
 	app.Description = `**step-ca** runs the Step Online Certificate Authority
 (Step CA) using the given configuration.
 See the README.md for more detailed configuration documentation.
@@ -158,8 +174,10 @@ $ step-ca $STEPPATH/config/ca.json --password-file ./password.txt
 		} else {
 			fmt.Fprintln(os.Stderr, err)
 		}
-		os.Exit(1)
+		exit(1)
 	}
+
+	exit(0)
 }
 
 func flagValue(f cli.Flag) reflect.Value {
@@ -174,8 +192,8 @@ var placeholderString = regexp.MustCompile(`<.*?>`)
 
 func stringifyFlag(f cli.Flag) string {
 	fv := flagValue(f)
-	usage := fv.FieldByName("Usage").String()
-	placeholder := placeholderString.FindString(usage)
+	usg := fv.FieldByName("Usage").String()
+	placeholder := placeholderString.FindString(usg)
 	if placeholder == "" {
 		switch f.(type) {
 		case cli.BoolFlag, cli.BoolTFlag:
@@ -183,5 +201,5 @@ func stringifyFlag(f cli.Flag) string {
 			placeholder = "<value>"
 		}
 	}
-	return cli.FlagNamePrefixer(fv.FieldByName("Name").String(), placeholder) + "\t" + usage
+	return cli.FlagNamePrefixer(fv.FieldByName("Name").String(), placeholder) + "\t" + usg
 }

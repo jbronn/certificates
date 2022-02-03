@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
 )
@@ -26,7 +26,7 @@ func (s *SignRequest) Validate() error {
 		return errs.BadRequest("missing csr")
 	}
 	if err := s.CsrPEM.CertificateRequest.CheckSignature(); err != nil {
-		return errs.Wrap(http.StatusBadRequest, err, "invalid csr")
+		return errs.BadRequestErr(err, "invalid csr")
 	}
 	if s.OTT == "" {
 		return errs.BadRequest("missing ott")
@@ -37,11 +37,11 @@ func (s *SignRequest) Validate() error {
 
 // SignResponse is the response object of the certificate signature request.
 type SignResponse struct {
-	ServerPEM    Certificate           `json:"crt"`
-	CaPEM        Certificate           `json:"ca"`
-	CertChainPEM []Certificate         `json:"certChain"`
-	TLSOptions   *authority.TLSOptions `json:"tlsOptions,omitempty"`
-	TLS          *tls.ConnectionState  `json:"-"`
+	ServerPEM    Certificate          `json:"crt"`
+	CaPEM        Certificate          `json:"ca"`
+	CertChainPEM []Certificate        `json:"certChain"`
+	TLSOptions   *config.TLSOptions   `json:"tlsOptions,omitempty"`
+	TLS          *tls.ConnectionState `json:"-"`
 }
 
 // Sign is an HTTP handler that reads a certificate request and an
@@ -50,7 +50,7 @@ type SignResponse struct {
 func (h *caHandler) Sign(w http.ResponseWriter, r *http.Request) {
 	var body SignRequest
 	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+		WriteError(w, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 
@@ -74,7 +74,7 @@ func (h *caHandler) Sign(w http.ResponseWriter, r *http.Request) {
 
 	certChain, err := h.Authority.Sign(body.CsrPEM.CertificateRequest, opts, signOpts...)
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		WriteError(w, errs.ForbiddenErr(err, "error signing certificate"))
 		return
 	}
 	certChainPEM := certChainToPEM(certChain)

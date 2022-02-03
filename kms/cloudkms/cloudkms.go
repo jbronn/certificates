@@ -3,6 +3,7 @@ package cloudkms
 import (
 	"context"
 	"crypto"
+	"crypto/x509"
 	"log"
 	"strings"
 	"time"
@@ -14,10 +15,14 @@ import (
 	gax "github.com/googleapis/gax-go/v2"
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/kms/apiv1"
+	"github.com/smallstep/certificates/kms/uri"
 	"go.step.sm/crypto/pemutil"
 	"google.golang.org/api/option"
 	kmspb "google.golang.org/genproto/googleapis/cloud/kms/v1"
 )
+
+// Scheme is the scheme used in uris.
+const Scheme = "cloudkms"
 
 const pendingGenerationRetries = 10
 
@@ -42,8 +47,8 @@ var signatureAlgorithmMapping = map[apiv1.SignatureAlgorithm]interface{}{
 		4096: kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA256,
 	},
 	apiv1.SHA512WithRSA: map[int]kmspb.CryptoKeyVersion_CryptoKeyVersionAlgorithm{
-		0:    kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA256,
-		4096: kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA256,
+		0:    kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA512,
+		4096: kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA512,
 	},
 	apiv1.SHA256WithRSAPSS: map[int]kmspb.CryptoKeyVersion_CryptoKeyVersionAlgorithm{
 		0:    kmspb.CryptoKeyVersion_RSA_SIGN_PSS_3072_SHA256,
@@ -59,6 +64,19 @@ var signatureAlgorithmMapping = map[apiv1.SignatureAlgorithm]interface{}{
 	apiv1.ECDSAWithSHA384: kmspb.CryptoKeyVersion_EC_SIGN_P384_SHA384,
 }
 
+var cryptoKeyVersionMapping = map[kmspb.CryptoKeyVersion_CryptoKeyVersionAlgorithm]x509.SignatureAlgorithm{
+	kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256:        x509.ECDSAWithSHA256,
+	kmspb.CryptoKeyVersion_EC_SIGN_P384_SHA384:        x509.ECDSAWithSHA384,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_2048_SHA256: x509.SHA256WithRSA,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_3072_SHA256: x509.SHA256WithRSA,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA256: x509.SHA256WithRSA,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA512: x509.SHA512WithRSA,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PSS_2048_SHA256:   x509.SHA256WithRSAPSS,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PSS_3072_SHA256:   x509.SHA256WithRSAPSS,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PSS_4096_SHA256:   x509.SHA256WithRSAPSS,
+	kmspb.CryptoKeyVersion_RSA_SIGN_PSS_4096_SHA512:   x509.SHA512WithRSAPSS,
+}
+
 // KeyManagementClient defines the methods on KeyManagementClient that this
 // package will use. This interface will be used for unit testing.
 type KeyManagementClient interface {
@@ -71,6 +89,10 @@ type KeyManagementClient interface {
 	CreateCryptoKeyVersion(ctx context.Context, req *kmspb.CreateCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error)
 }
 
+var newKeyManagementClient = func(ctx context.Context, opts ...option.ClientOption) (KeyManagementClient, error) {
+	return cloudkms.NewKeyManagementClient(ctx, opts...)
+}
+
 // CloudKMS implements a KMS using Google's Cloud apiv1.
 type CloudKMS struct {
 	client KeyManagementClient
@@ -79,11 +101,23 @@ type CloudKMS struct {
 // New creates a new CloudKMS configured with a new client.
 func New(ctx context.Context, opts apiv1.Options) (*CloudKMS, error) {
 	var cloudOpts []option.ClientOption
+
+	if opts.URI != "" {
+		u, err := uri.ParseWithScheme(Scheme, opts.URI)
+		if err != nil {
+			return nil, err
+		}
+		if f := u.Get("credentials-file"); f != "" {
+			cloudOpts = append(cloudOpts, option.WithCredentialsFile(f))
+		}
+	}
+
+	// Deprecated way to set configuration parameters.
 	if opts.CredentialsFile != "" {
 		cloudOpts = append(cloudOpts, option.WithCredentialsFile(opts.CredentialsFile))
 	}
 
-	client, err := cloudkms.NewKeyManagementClient(ctx, cloudOpts...)
+	client, err := newKeyManagementClient(ctx, cloudOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -120,8 +154,7 @@ func (k *CloudKMS) CreateSigner(req *apiv1.CreateSignerRequest) (crypto.Signer, 
 	if req.SigningKey == "" {
 		return nil, errors.New("signing key cannot be empty")
 	}
-
-	return NewSigner(k.client, req.SigningKey), nil
+	return NewSigner(k.client, req.SigningKey)
 }
 
 // CreateKey creates in Google's Cloud KMS a new asymmetric key for signing.

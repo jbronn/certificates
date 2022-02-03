@@ -6,10 +6,11 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
-	"io/ioutil"
 	"net"
+	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
@@ -81,6 +82,10 @@ func testAuthority(t *testing.T, opts ...Option) *Authority {
 	}
 	a, err := New(c, opts...)
 	assert.FatalError(t, err)
+	// Avoid errors when test tokens are created before the test authority. This
+	// happens in some tests where we re-create the same authority to test
+	// special cases without re-creating the token.
+	a.startTime = a.startTime.Add(-1 * time.Minute)
 	return a
 }
 
@@ -189,7 +194,7 @@ func TestAuthority_GetDatabase(t *testing.T) {
 }
 
 func TestNewEmbedded(t *testing.T) {
-	caPEM, err := ioutil.ReadFile("testdata/certs/root_ca.crt")
+	caPEM, err := os.ReadFile("testdata/certs/root_ca.crt")
 	assert.FatalError(t, err)
 
 	crt, err := pemutil.ReadCertificate("testdata/certs/intermediate_ca.crt")
@@ -262,7 +267,7 @@ func TestNewEmbedded(t *testing.T) {
 }
 
 func TestNewEmbedded_Sign(t *testing.T) {
-	caPEM, err := ioutil.ReadFile("testdata/certs/root_ca.crt")
+	caPEM, err := os.ReadFile("testdata/certs/root_ca.crt")
 	assert.FatalError(t, err)
 
 	crt, err := pemutil.ReadCertificate("testdata/certs/intermediate_ca.crt")
@@ -288,7 +293,7 @@ func TestNewEmbedded_Sign(t *testing.T) {
 }
 
 func TestNewEmbedded_GetTLSCertificate(t *testing.T) {
-	caPEM, err := ioutil.ReadFile("testdata/certs/root_ca.crt")
+	caPEM, err := os.ReadFile("testdata/certs/root_ca.crt")
 	assert.FatalError(t, err)
 
 	crt, err := pemutil.ReadCertificate("testdata/certs/intermediate_ca.crt")
@@ -305,4 +310,114 @@ func TestNewEmbedded_GetTLSCertificate(t *testing.T) {
 	assert.Equals(t, []string{"localhost"}, cert.Leaf.DNSNames)
 	assert.True(t, cert.Leaf.IPAddresses[0].Equal(net.ParseIP("127.0.0.1")))
 	assert.True(t, cert.Leaf.IPAddresses[1].Equal(net.ParseIP("::1")))
+}
+
+func TestAuthority_CloseForReload(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *Authority
+	}{
+		{"ok", testAuthority(t)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.auth.CloseForReload()
+		})
+	}
+}
+
+func testScepAuthority(t *testing.T, opts ...Option) *Authority {
+	p := provisioner.List{
+		&provisioner.SCEP{
+			Name: "scep1",
+			Type: "SCEP",
+		},
+	}
+	c := &Config{
+		Address:          "127.0.0.1:8443",
+		InsecureAddress:  "127.0.0.1:8080",
+		Root:             []string{"testdata/scep/root.crt"},
+		IntermediateCert: "testdata/scep/intermediate.crt",
+		IntermediateKey:  "testdata/scep/intermediate.key",
+		DNSNames:         []string{"example.com"},
+		Password:         "pass",
+		AuthorityConfig: &AuthConfig{
+			Provisioners: p,
+		},
+	}
+	a, err := New(c, opts...)
+	assert.FatalError(t, err)
+	return a
+}
+
+func TestAuthority_GetSCEPService(t *testing.T) {
+	_ = testScepAuthority(t)
+	p := provisioner.List{
+		&provisioner.SCEP{
+			Name: "scep1",
+			Type: "SCEP",
+		},
+	}
+	type fields struct {
+		config *Config
+	}
+	tests := []struct {
+		name        string
+		fields      fields
+		wantService bool
+		wantErr     bool
+	}{
+		{
+			name: "ok",
+			fields: fields{
+				config: &Config{
+					Address:          "127.0.0.1:8443",
+					InsecureAddress:  "127.0.0.1:8080",
+					Root:             []string{"testdata/scep/root.crt"},
+					IntermediateCert: "testdata/scep/intermediate.crt",
+					IntermediateKey:  "testdata/scep/intermediate.key",
+					DNSNames:         []string{"example.com"},
+					Password:         "pass",
+					AuthorityConfig: &AuthConfig{
+						Provisioners: p,
+					},
+				},
+			},
+			wantService: true,
+			wantErr:     false,
+		},
+		{
+			name: "wrong password",
+			fields: fields{
+				config: &Config{
+					Address:          "127.0.0.1:8443",
+					InsecureAddress:  "127.0.0.1:8080",
+					Root:             []string{"testdata/scep/root.crt"},
+					IntermediateCert: "testdata/scep/intermediate.crt",
+					IntermediateKey:  "testdata/scep/intermediate.key",
+					DNSNames:         []string{"example.com"},
+					Password:         "wrongpass",
+					AuthorityConfig: &AuthConfig{
+						Provisioners: p,
+					},
+				},
+			},
+			wantService: false,
+			wantErr:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := New(tt.fields.config)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Authority.New(), error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantService {
+				if got := a.GetSCEPService(); (got != nil) != tt.wantService {
+					t.Errorf("Authority.GetSCEPService() = %v, wantService %v", got, tt.wantService)
+				}
+			}
+		})
+	}
 }

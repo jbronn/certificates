@@ -1,5 +1,9 @@
 # Provisioners
 
+> Note: The canonical documentation for `step-ca` provisioners now lives at
+> https://smallstep.com/docs/step-ca/provisioners. Documentation
+> found on this page may be out of date.
+
 Provisioners are people or code that are registered with the CA and authorized
 to issue "provisioning tokens". Provisioning tokens are single-use tokens that
 can be used to authenticate with the CA and get a certificate.
@@ -29,9 +33,10 @@ Example `claims`:
         "disableRenewal": false,
         "minHostSSHCertDuration": "5m",
         "maxHostSSHCertDuration": "1680h",
+        "defaultHostSSHCertDuration": "720h",
         "minUserSSHCertDuration": "5m",
         "maxUserSSHCertDuration": "24h",
-        "maxTLSCertDuration": "16h",
+        "defaultUserSSHCertDuration": "16h",
         "enableSSHCA": true
     },
     ...
@@ -75,7 +80,7 @@ Example `claims`:
   use this value.
 
   * `enableSSHCA`: enable all provisioners to generate SSH Certificates.
-  The deault value is `false`. You can enable this option per provisioner
+  The default value is `false`. You can enable this option per provisioner
   by setting it to `true` in the provisioner claims.
 
 ## Provisioner Types
@@ -142,7 +147,6 @@ In the ca.json configuration file, a complete JWK provisioner example looks like
         "maxHostSSHCertDuration": "1680h",
         "minUserSSHCertDuration": "5m",
         "maxUserSSHCertDuration": "24h",
-        "maxTLSCertDuration": "16h",
         "enableSSHCA": true
     }
 }
@@ -187,7 +191,7 @@ In the ca.json configuration file, a complete JWK provisioner example looks like
 ### OIDC
 
 An OIDC provisioner allows a user to get a certificate after authenticating
-himself with an OAuth OpenID Connect identity provider. The ID token provided
+with an OAuth OpenID Connect identity provider. The ID token provided
 will be used on the CA authentication, and by default, the certificate will only
 have the user's email as a Subject Alternative Name (SAN) Extension.
 
@@ -330,7 +334,7 @@ Below is an example of an SSHPOP provisioner in the `ca.json`:
 ### ACME
 
 An ACME provisioner allows a client to request a certificate from the server
-using the [https://tools.ietf.org/html/rfc8555](ACME Protocol). The ACME
+using the [ACME Protocol](https://tools.ietf.org/html/rfc8555). The ACME
 provisioner can only request X509 certificates. All authentication of the CSR
 is managed by the ACME protocol.
 
@@ -342,6 +346,7 @@ Below is an example of an ACME provisioner in the `ca.json`:
     "type": "ACME",
     "name": "my-acme-provisioner",
     "forceCN": true,
+    "requireEAB": false,
     "claims": {
         "maxTLSCertDuration": "8h",
         "defaultTLSCertDuration": "2h",
@@ -356,6 +361,9 @@ Below is an example of an ACME provisioner in the `ca.json`:
 
 * `forceCN` (optional): force one of the SANs to become the Common Name, if a
   common name is not provided.
+
+* `requireEAB` (optional): require clients to provide External Account Binding 
+  credentials when creating an ACME Account.
 
 * `claims` (optional): overwrites the default claims set in the authority, see
   the [top](#provisioners) section for all the options.

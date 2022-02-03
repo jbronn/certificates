@@ -56,7 +56,7 @@ func (m *certificateDurationEnforcer) Enforce(cert *x509.Certificate) error {
 }
 
 func getDefaultIssuer(a *Authority) *x509.Certificate {
-	return a.x509CAService.(*softcas.SoftCAS).Issuer
+	return a.x509CAService.(*softcas.SoftCAS).CertificateChain[len(a.x509CAService.(*softcas.SoftCAS).CertificateChain)-1]
 }
 
 func getDefaultSigner(a *Authority) crypto.Signer {
@@ -205,6 +205,17 @@ type basicConstraints struct {
 	MaxPathLen int  `asn1:"optional,default:-1"`
 }
 
+type testEnforcer struct {
+	enforcer func(*x509.Certificate) error
+}
+
+func (e *testEnforcer) Enforce(cert *x509.Certificate) error {
+	if e.enforcer != nil {
+		return e.enforcer(cert)
+	}
+	return nil
+}
+
 func TestAuthority_Sign(t *testing.T) {
 	pub, priv, err := keyutil.GenerateDefaultKeyPair()
 	assert.FatalError(t, err)
@@ -238,14 +249,15 @@ func TestAuthority_Sign(t *testing.T) {
 	assert.FatalError(t, err)
 
 	type signTest struct {
-		auth      *Authority
-		csr       *x509.CertificateRequest
-		signOpts  provisioner.SignOptions
-		extraOpts []provisioner.SignOption
-		notBefore time.Time
-		notAfter  time.Time
-		err       error
-		code      int
+		auth            *Authority
+		csr             *x509.CertificateRequest
+		signOpts        provisioner.SignOptions
+		extraOpts       []provisioner.SignOption
+		notBefore       time.Time
+		notAfter        time.Time
+		extensionsCount int
+		err             error
+		code            int
 	}
 	tests := map[string]func(*testing.T) *signTest{
 		"fail invalid signature": func(t *testing.T) *signTest {
@@ -256,7 +268,7 @@ func TestAuthority_Sign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err:       errors.New("authority.Sign; invalid certificate request"),
+				err:       errors.New("invalid certificate request"),
 				code:      http.StatusBadRequest,
 			}
 		},
@@ -281,8 +293,8 @@ func TestAuthority_Sign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err:       errors.New("authority.Sign: default ASN1DN template cannot be nil"),
-				code:      http.StatusUnauthorized,
+				err:       errors.New("default ASN1DN template cannot be nil"),
+				code:      http.StatusForbidden,
 			}
 		},
 		"fail create cert": func(t *testing.T) *signTest {
@@ -309,8 +321,8 @@ func TestAuthority_Sign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  _signOpts,
-				err:       errors.New("authority.Sign: requested duration of 25h0m0s is more than the authorized maximum certificate duration of 24h1m0s"),
-				code:      http.StatusUnauthorized,
+				err:       errors.New("requested duration of 25h0m0s is more than the authorized maximum certificate duration of 24h1m0s"),
+				code:      http.StatusForbidden,
 			}
 		},
 		"fail validate sans when adding common name not in claims": func(t *testing.T) *signTest {
@@ -322,8 +334,8 @@ func TestAuthority_Sign(t *testing.T) {
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err:       errors.New("authority.Sign: certificate request does not contain the valid DNS names - got [test.smallstep.com smallstep test], want [test.smallstep.com]"),
-				code:      http.StatusUnauthorized,
+				err:       errors.New("certificate request does not contain the valid DNS names - got [test.smallstep.com smallstep test], want [test.smallstep.com]"),
+				code:      http.StatusForbidden,
 			}
 		},
 		"fail rsa key too short": func(t *testing.T) *signTest {
@@ -348,8 +360,8 @@ ZYtQ9Ot36qc=
 				csr:       csr,
 				extraOpts: extraOpts,
 				signOpts:  signOpts,
-				err:       errors.New("authority.Sign: rsa key in CSR must be at least 2048 bits (256 bytes)"),
-				code:      http.StatusUnauthorized,
+				err:       errors.New("certificate request RSA key must be at least 2048 bits (256 bytes)"),
+				code:      http.StatusForbidden,
 			}
 		},
 		"fail store cert in db": func(t *testing.T) *signTest {
@@ -396,6 +408,107 @@ ZYtQ9Ot36qc=
 				code:      http.StatusBadRequest,
 			}
 		},
+		"fail bad JSON syntax template file": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+			testAuthority := testAuthority(t)
+			p, ok := testAuthority.provisioners.Load("step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc")
+			if !ok {
+				t.Fatal("provisioner not found")
+			}
+			p.(*provisioner.JWK).Options = &provisioner.Options{
+				X509: &provisioner.X509Options{
+					TemplateFile: "./testdata/templates/badjsonsyntax.tpl",
+				},
+			}
+			testExtraOpts, err := testAuthority.Authorize(ctx, token)
+			assert.FatalError(t, err)
+			testAuthority.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
+					return nil
+				},
+			}
+			return &signTest{
+				auth:      testAuthority,
+				csr:       csr,
+				extraOpts: testExtraOpts,
+				signOpts:  signOpts,
+				err:       errors.New("error applying certificate template: invalid character"),
+				code:      http.StatusInternalServerError,
+			}
+		},
+		"fail bad JSON value template file": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+			testAuthority := testAuthority(t)
+			p, ok := testAuthority.provisioners.Load("step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc")
+			if !ok {
+				t.Fatal("provisioner not found")
+			}
+			p.(*provisioner.JWK).Options = &provisioner.Options{
+				X509: &provisioner.X509Options{
+					TemplateFile: "./testdata/templates/badjsonvalue.tpl",
+				},
+			}
+			testExtraOpts, err := testAuthority.Authorize(ctx, token)
+			assert.FatalError(t, err)
+			testAuthority.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
+					return nil
+				},
+			}
+			return &signTest{
+				auth:      testAuthority,
+				csr:       csr,
+				extraOpts: testExtraOpts,
+				signOpts:  signOpts,
+				err:       errors.New("error applying certificate template: cannot unmarshal"),
+				code:      http.StatusInternalServerError,
+			}
+		},
+		"fail with provisioner enforcer": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+			aa := testAuthority(t)
+			aa.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
+					return nil
+				},
+			}
+
+			return &signTest{
+				auth: aa,
+				csr:  csr,
+				extraOpts: append(extraOpts, &testEnforcer{
+					enforcer: func(crt *x509.Certificate) error { return fmt.Errorf("an error") },
+				}),
+				signOpts: signOpts,
+				err:      errors.New("error creating certificate"),
+				code:     http.StatusForbidden,
+			}
+		},
+		"fail with custom enforcer": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+			aa := testAuthority(t, WithX509Enforcers(&testEnforcer{
+				enforcer: func(cert *x509.Certificate) error {
+					return fmt.Errorf("an error")
+				},
+			}))
+			aa.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
+					return nil
+				},
+			}
+			return &signTest{
+				auth:      aa,
+				csr:       csr,
+				extraOpts: extraOpts,
+				signOpts:  signOpts,
+				err:       errors.New("error creating certificate"),
+				code:      http.StatusForbidden,
+			}
+		},
 		"ok": func(t *testing.T) *signTest {
 			csr := getCSR(t, priv)
 			_a := testAuthority(t)
@@ -406,12 +519,13 @@ ZYtQ9Ot36qc=
 				},
 			}
 			return &signTest{
-				auth:      a,
-				csr:       csr,
-				extraOpts: extraOpts,
-				signOpts:  signOpts,
-				notBefore: signOpts.NotBefore.Time().Truncate(time.Second),
-				notAfter:  signOpts.NotAfter.Time().Truncate(time.Second),
+				auth:            a,
+				csr:             csr,
+				extraOpts:       extraOpts,
+				signOpts:        signOpts,
+				notBefore:       signOpts.NotBefore.Time().Truncate(time.Second),
+				notAfter:        signOpts.NotAfter.Time().Truncate(time.Second),
+				extensionsCount: 6,
 			}
 		},
 		"ok with enforced modifier": func(t *testing.T) *signTest {
@@ -426,6 +540,7 @@ ZYtQ9Ot36qc=
 				{Id: stepOIDProvisioner, Value: []byte("foo")},
 				{Id: []int{1, 1, 1}, Value: []byte("bar")}}))
 			now := time.Now().UTC()
+			// nolint:gocritic
 			enforcedExtraOptions := append(extraOpts, &certificateDurationEnforcer{
 				NotBefore: now,
 				NotAfter:  now.Add(365 * 24 * time.Hour),
@@ -438,12 +553,13 @@ ZYtQ9Ot36qc=
 				},
 			}
 			return &signTest{
-				auth:      a,
-				csr:       csr,
-				extraOpts: enforcedExtraOptions,
-				signOpts:  signOpts,
-				notBefore: now.Truncate(time.Second),
-				notAfter:  now.Add(365 * 24 * time.Hour).Truncate(time.Second),
+				auth:            a,
+				csr:             csr,
+				extraOpts:       enforcedExtraOptions,
+				signOpts:        signOpts,
+				notBefore:       now.Truncate(time.Second),
+				notAfter:        now.Add(365 * 24 * time.Hour).Truncate(time.Second),
+				extensionsCount: 6,
 			}
 		},
 		"ok with custom template": func(t *testing.T) *signTest {
@@ -471,12 +587,13 @@ ZYtQ9Ot36qc=
 				},
 			}
 			return &signTest{
-				auth:      testAuthority,
-				csr:       csr,
-				extraOpts: testExtraOpts,
-				signOpts:  signOpts,
-				notBefore: signOpts.NotBefore.Time().Truncate(time.Second),
-				notAfter:  signOpts.NotAfter.Time().Truncate(time.Second),
+				auth:            testAuthority,
+				csr:             csr,
+				extraOpts:       testExtraOpts,
+				signOpts:        signOpts,
+				notBefore:       signOpts.NotBefore.Time().Truncate(time.Second),
+				notAfter:        signOpts.NotAfter.Time().Truncate(time.Second),
+				extensionsCount: 6,
 			}
 		},
 		"ok/csr with no template critical SAN extension": func(t *testing.T) *signTest {
@@ -499,12 +616,39 @@ ZYtQ9Ot36qc=
 				},
 			}
 			return &signTest{
-				auth:      _a,
-				csr:       csr,
-				extraOpts: enforcedExtraOptions,
-				signOpts:  provisioner.SignOptions{},
-				notBefore: now.Truncate(time.Second),
-				notAfter:  now.Add(365 * 24 * time.Hour).Truncate(time.Second),
+				auth:            _a,
+				csr:             csr,
+				extraOpts:       enforcedExtraOptions,
+				signOpts:        provisioner.SignOptions{},
+				notBefore:       now.Truncate(time.Second),
+				notAfter:        now.Add(365 * 24 * time.Hour).Truncate(time.Second),
+				extensionsCount: 5,
+			}
+		},
+		"ok with custom enforcer": func(t *testing.T) *signTest {
+			csr := getCSR(t, priv)
+			aa := testAuthority(t, WithX509Enforcers(&testEnforcer{
+				enforcer: func(cert *x509.Certificate) error {
+					cert.CRLDistributionPoints = []string{"http://ca.example.org/leaf.crl"}
+					return nil
+				},
+			}))
+			aa.config.AuthorityConfig.Template = a.config.AuthorityConfig.Template
+			aa.db = &db.MockAuthDB{
+				MStoreCertificate: func(crt *x509.Certificate) error {
+					assert.Equals(t, crt.Subject.CommonName, "smallstep test")
+					assert.Equals(t, crt.CRLDistributionPoints, []string{"http://ca.example.org/leaf.crl"})
+					return nil
+				},
+			}
+			return &signTest{
+				auth:            aa,
+				csr:             csr,
+				extraOpts:       extraOpts,
+				signOpts:        signOpts,
+				notBefore:       signOpts.NotBefore.Time().Truncate(time.Second),
+				notAfter:        signOpts.NotAfter.Time().Truncate(time.Second),
+				extensionsCount: 7,
 			}
 		},
 	}
@@ -537,15 +681,15 @@ ZYtQ9Ot36qc=
 					if tc.csr.Subject.CommonName == "" {
 						assert.Equals(t, leaf.Subject, pkix.Name{})
 					} else {
-						assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-							fmt.Sprintf("%v", &pkix.Name{
+						assert.Equals(t, leaf.Subject.String(),
+							pkix.Name{
 								Country:       []string{tmplt.Country},
 								Organization:  []string{tmplt.Organization},
 								Locality:      []string{tmplt.Locality},
 								StreetAddress: []string{tmplt.StreetAddress},
 								Province:      []string{tmplt.Province},
 								CommonName:    "smallstep test",
-							}))
+							}.String())
 						assert.Equals(t, leaf.DNSNames, []string{"test.smallstep.com"})
 					}
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
@@ -586,9 +730,6 @@ ZYtQ9Ot36qc=
 								// Empty CSR subject test does not use any provisioner extensions.
 								// So provisioner ID ext will be missing.
 								found = 1
-								assert.Len(t, 5, leaf.Extensions)
-							} else {
-								assert.Len(t, 6, leaf.Extensions)
 							}
 						}
 					}
@@ -596,6 +737,7 @@ ZYtQ9Ot36qc=
 					realIntermediate, err := x509.ParseCertificate(issuer.Raw)
 					assert.FatalError(t, err)
 					assert.Equals(t, intermediate, realIntermediate)
+					assert.Len(t, tc.extensionsCount, leaf.Extensions)
 				}
 			}
 		})
@@ -656,7 +798,7 @@ func TestAuthority_Renew(t *testing.T) {
 		"fail/unauthorized": func() (*renewTest, error) {
 			return &renewTest{
 				cert: certNoRenew,
-				err:  errors.New("authority.Rekey: authority.authorizeRenew: jwk.AuthorizeRenew; renew is disabled for jwk provisioner dev:IMi94WBNI6gP5cNHXlZYNUzvMjGdHyBRmFoo-lCEaqk"),
+				err:  errors.New("authority.Rekey: authority.authorizeRenew: jwk.AuthorizeRenew; renew is disabled for jwk provisioner 'dev'"),
 				code: http.StatusUnauthorized,
 			}, nil
 		},
@@ -671,7 +813,7 @@ func TestAuthority_Renew(t *testing.T) {
 			intCert, intSigner := generateIntermidiateCertificate(t, rootCert, rootSigner)
 
 			_a := testAuthority(t)
-			_a.x509CAService.(*softcas.SoftCAS).Issuer = intCert
+			_a.x509CAService.(*softcas.SoftCAS).CertificateChain = []*x509.Certificate{intCert}
 			_a.x509CAService.(*softcas.SoftCAS).Signer = intSigner
 			return &renewTest{
 				auth: _a,
@@ -717,15 +859,15 @@ func TestAuthority_Renew(t *testing.T) {
 					assert.True(t, leaf.NotAfter.Before(expiry.Add(time.Minute)))
 
 					tmplt := a.config.AuthorityConfig.Template
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							Country:       []string{tmplt.Country},
 							Organization:  []string{tmplt.Organization},
 							Locality:      []string{tmplt.Locality},
 							StreetAddress: []string{tmplt.StreetAddress},
 							Province:      []string{tmplt.Province},
 							CommonName:    tmplt.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -856,7 +998,7 @@ func TestAuthority_Rekey(t *testing.T) {
 		"fail/unauthorized": func() (*renewTest, error) {
 			return &renewTest{
 				cert: certNoRenew,
-				err:  errors.New("authority.Rekey: authority.authorizeRenew: jwk.AuthorizeRenew; renew is disabled for jwk provisioner dev:IMi94WBNI6gP5cNHXlZYNUzvMjGdHyBRmFoo-lCEaqk"),
+				err:  errors.New("authority.Rekey: authority.authorizeRenew: jwk.AuthorizeRenew; renew is disabled for jwk provisioner 'dev'"),
 				code: http.StatusUnauthorized,
 			}, nil
 		},
@@ -878,7 +1020,7 @@ func TestAuthority_Rekey(t *testing.T) {
 			intCert, intSigner := generateIntermidiateCertificate(t, rootCert, rootSigner)
 
 			_a := testAuthority(t)
-			_a.x509CAService.(*softcas.SoftCAS).Issuer = intCert
+			_a.x509CAService.(*softcas.SoftCAS).CertificateChain = []*x509.Certificate{intCert}
 			_a.x509CAService.(*softcas.SoftCAS).Signer = intSigner
 			return &renewTest{
 				auth: _a,
@@ -924,15 +1066,15 @@ func TestAuthority_Rekey(t *testing.T) {
 					assert.True(t, leaf.NotAfter.Before(expiry.Add(time.Minute)))
 
 					tmplt := a.config.AuthorityConfig.Template
-					assert.Equals(t, fmt.Sprintf("%v", leaf.Subject),
-						fmt.Sprintf("%v", &pkix.Name{
+					assert.Equals(t, leaf.Subject.String(),
+						pkix.Name{
 							Country:       []string{tmplt.Country},
 							Organization:  []string{tmplt.Organization},
 							Locality:      []string{tmplt.Locality},
 							StreetAddress: []string{tmplt.StreetAddress},
 							Province:      []string{tmplt.Province},
 							CommonName:    tmplt.CommonName,
-						}))
+						}.String())
 					assert.Equals(t, leaf.Issuer, intermediate.Subject)
 
 					assert.Equals(t, leaf.SignatureAlgorithm, x509.ECDSAWithSHA256)
@@ -1186,7 +1328,7 @@ func TestAuthority_Revoke(t *testing.T) {
 					Reason:     reason,
 					OTT:        raw,
 				},
-				err:  errors.New("authority.Revoke; certificate with serial number sn has already been revoked"),
+				err:  errors.New("certificate with serial number 'sn' is already revoked"),
 				code: http.StatusBadRequest,
 				checkErrDetails: func(err *errs.Error) {
 					assert.Equals(t, err.Details["token"], raw)
@@ -1239,6 +1381,47 @@ func TestAuthority_Revoke(t *testing.T) {
 					ReasonCode: reasonCode,
 					Reason:     reason,
 					MTLS:       true,
+				},
+			}
+		},
+		"ok/mTLS-no-provisioner": func() test {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{}))
+
+			crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
+			assert.FatalError(t, err)
+			// Filter out provisioner extension.
+			for i, ext := range crt.Extensions {
+				if ext.Id.Equal(asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64, 1}) {
+					crt.Extensions = append(crt.Extensions[:i], crt.Extensions[i+1:]...)
+					break
+				}
+			}
+
+			return test{
+				auth: _a,
+				opts: &RevokeOptions{
+					Crt:        crt,
+					Serial:     "102012593071130646873265215610956555026",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					MTLS:       true,
+				},
+			}
+		},
+		"ok/ACME": func() test {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{}))
+
+			crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
+			assert.FatalError(t, err)
+
+			return test{
+				auth: _a,
+				opts: &RevokeOptions{
+					Crt:        crt,
+					Serial:     "102012593071130646873265215610956555026",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					ACME:       true,
 				},
 			}
 		},

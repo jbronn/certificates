@@ -8,10 +8,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 
 	"github.com/pkg/errors"
-	pb "google.golang.org/genproto/googleapis/cloud/security/privateca/v1beta1"
-	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
+	kmsapi "github.com/smallstep/certificates/kms/apiv1"
+	pb "google.golang.org/genproto/googleapis/cloud/security/privateca/v1"
 )
 
 var (
@@ -65,11 +66,10 @@ func createCertificateConfig(tpl *x509.Certificate) (*pb.Certificate_Config, err
 	config := &pb.CertificateConfig{
 		SubjectConfig: &pb.CertificateConfig_SubjectConfig{
 			Subject:        createSubject(tpl),
-			CommonName:     tpl.Subject.CommonName,
 			SubjectAltName: createSubjectAlternativeNames(tpl),
 		},
-		ReusableConfig: createReusableConfig(tpl),
-		PublicKey:      pk,
+		X509Config: createX509Parameters(tpl),
+		PublicKey:  pk,
 	}
 	return &pb.Certificate_Config{
 		Config: config,
@@ -84,7 +84,7 @@ func createPublicKey(key crypto.PublicKey) (*pb.PublicKey, error) {
 			return nil, errors.Wrap(err, "error marshaling public key")
 		}
 		return &pb.PublicKey{
-			Type: pb.PublicKey_PEM_EC_KEY,
+			Format: pb.PublicKey_PEM,
 			Key: pem.EncodeToMemory(&pem.Block{
 				Type:  "PUBLIC KEY",
 				Bytes: asn1Bytes,
@@ -92,7 +92,7 @@ func createPublicKey(key crypto.PublicKey) (*pb.PublicKey, error) {
 		}, nil
 	case *rsa.PublicKey:
 		return &pb.PublicKey{
-			Type: pb.PublicKey_PEM_RSA_KEY,
+			Format: pb.PublicKey_PEM,
 			Key: pem.EncodeToMemory(&pem.Block{
 				Type:  "RSA PUBLIC KEY",
 				Bytes: x509.MarshalPKCS1PublicKey(key),
@@ -105,7 +105,9 @@ func createPublicKey(key crypto.PublicKey) (*pb.PublicKey, error) {
 
 func createSubject(cert *x509.Certificate) *pb.Subject {
 	sub := cert.Subject
-	ret := new(pb.Subject)
+	ret := &pb.Subject{
+		CommonName: sub.CommonName,
+	}
 	if len(sub.Country) > 0 {
 		ret.CountryCode = sub.Country[0]
 	}
@@ -194,7 +196,7 @@ func createSubjectAlternativeNames(cert *x509.Certificate) *pb.SubjectAltNames {
 	return ret
 }
 
-func createReusableConfig(cert *x509.Certificate) *pb.ReusableConfigWrapper {
+func createX509Parameters(cert *x509.Certificate) *pb.X509Parameters {
 	var unknownEKUs []*pb.ObjectId
 	var ekuOptions = &pb.KeyUsage_ExtendedKeyUsageOptions{}
 	for _, eku := range cert.ExtKeyUsage {
@@ -239,22 +241,19 @@ func createReusableConfig(cert *x509.Certificate) *pb.ReusableConfigWrapper {
 		policyIDs = append(policyIDs, createObjectID(oid))
 	}
 
-	var caOptions *pb.ReusableConfigValues_CaOptions
+	var caOptions *pb.X509Parameters_CaOptions
 	if cert.BasicConstraintsValid {
-		var maxPathLength *wrapperspb.Int32Value
+		caOptions = new(pb.X509Parameters_CaOptions)
+		var maxPathLength int32
 		switch {
 		case cert.MaxPathLenZero:
-			maxPathLength = wrapperspb.Int32(0)
+			maxPathLength = 0
+			caOptions.MaxIssuerPathLength = &maxPathLength
 		case cert.MaxPathLen > 0:
-			maxPathLength = wrapperspb.Int32(int32(cert.MaxPathLen))
-		default:
-			maxPathLength = nil
+			maxPathLength = int32(cert.MaxPathLen)
+			caOptions.MaxIssuerPathLength = &maxPathLength
 		}
-
-		caOptions = &pb.ReusableConfigValues_CaOptions{
-			IsCa:                wrapperspb.Bool(cert.IsCA),
-			MaxIssuerPathLength: maxPathLength,
-		}
+		caOptions.IsCa = &cert.IsCA
 	}
 
 	var extraExtensions []*pb.X509Extension
@@ -268,7 +267,7 @@ func createReusableConfig(cert *x509.Certificate) *pb.ReusableConfigWrapper {
 		}
 	}
 
-	values := &pb.ReusableConfigValues{
+	return &pb.X509Parameters{
 		KeyUsage: &pb.KeyUsage{
 			BaseKeyUsage: &pb.KeyUsage_KeyUsageOptions{
 				DigitalSignature:  cert.KeyUsage&x509.KeyUsageDigitalSignature > 0,
@@ -288,12 +287,6 @@ func createReusableConfig(cert *x509.Certificate) *pb.ReusableConfigWrapper {
 		PolicyIds:            policyIDs,
 		AiaOcspServers:       cert.OCSPServer,
 		AdditionalExtensions: extraExtensions,
-	}
-
-	return &pb.ReusableConfigWrapper{
-		ConfigValues: &pb.ReusableConfigWrapper_ReusableConfigValues{
-			ReusableConfigValues: values,
-		},
 	}
 }
 
@@ -325,4 +318,69 @@ func findExtraExtension(cert *x509.Certificate, oid asn1.ObjectIdentifier) (pkix
 		}
 	}
 	return pkix.Extension{}, false
+}
+
+func createKeyVersionSpec(alg kmsapi.SignatureAlgorithm, bits int) (*pb.CertificateAuthority_KeyVersionSpec, error) {
+	switch alg {
+	case kmsapi.UnspecifiedSignAlgorithm, kmsapi.ECDSAWithSHA256:
+		return &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_EC_P256_SHA256,
+			},
+		}, nil
+	case kmsapi.ECDSAWithSHA384:
+		return &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_EC_P384_SHA384,
+			},
+		}, nil
+	case kmsapi.SHA256WithRSA:
+		algo, err := getRSAPKCS1Algorithm(bits)
+		if err != nil {
+			return nil, err
+		}
+		return &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: algo,
+			},
+		}, nil
+	case kmsapi.SHA256WithRSAPSS:
+		algo, err := getRSAPSSAlgorithm(bits)
+		if err != nil {
+			return nil, err
+		}
+		return &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: algo,
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown or unsupported signature algorithm '%s'", alg)
+	}
+}
+
+func getRSAPKCS1Algorithm(bits int) (pb.CertificateAuthority_SignHashAlgorithm, error) {
+	switch bits {
+	case 0, 3072:
+		return pb.CertificateAuthority_RSA_PKCS1_3072_SHA256, nil
+	case 2048:
+		return pb.CertificateAuthority_RSA_PKCS1_2048_SHA256, nil
+	case 4096:
+		return pb.CertificateAuthority_RSA_PKCS1_4096_SHA256, nil
+	default:
+		return 0, fmt.Errorf("unsupported RSA PKCS #1 key size '%d'", bits)
+	}
+}
+
+func getRSAPSSAlgorithm(bits int) (pb.CertificateAuthority_SignHashAlgorithm, error) {
+	switch bits {
+	case 0, 3072:
+		return pb.CertificateAuthority_RSA_PSS_3072_SHA256, nil
+	case 2048:
+		return pb.CertificateAuthority_RSA_PSS_2048_SHA256, nil
+	case 4096:
+		return pb.CertificateAuthority_RSA_PSS_4096_SHA256, nil
+	default:
+		return 0, fmt.Errorf("unsupported RSA-PSS key size '%d'", bits)
+	}
 }

@@ -8,7 +8,7 @@ linters-settings:
           - (github.com/golangci/golangci-lint/pkg/logutils.Log).Errorf
           - (github.com/golangci/golangci-lint/pkg/logutils.Log).Warnf
           - (github.com/golangci/golangci-lint/pkg/logutils.Log).Fatalf
-  golint:
+  revive:
     min-confidence: 0
   gocyclo:
     min-complexity: 10
@@ -36,22 +36,30 @@ linters-settings:
       - performance
       - style
       - experimental
+      - diagnostic
     disabled-checks:
-      - wrapperFunc
-      - dupImport # https://github.com/go-critic/go-critic/issues/845
+      - commentFormatting
+      - commentedOutCode
+      - evalOrder
+      - hugeParam
+      - octalLiteral
+      - rangeValCopy
+      - tooManyResultsChecker
+      - unnamedResult
 
 linters:
   disable-all: true
   enable:
-    - gofmt
-    - golint
-    - govet
-    - misspell
-    - ineffassign
     - deadcode
+    - gocritic
+    - gofmt
+    - gosimple
+    - govet
+    - ineffassign
+    - misspell
+    - revive
     - staticcheck
     - unused
-    - gosimple
 
 run:
   skip-dirs:
@@ -65,9 +73,3 @@ issues:
     - error strings should not be capitalized or end with punctuation or a newline
     - Wrapf call needs 1 arg but has 2 args
     - cs.NegotiatedProtocolIsMutual is deprecated
-# golangci.com configuration
-# https://github.com/golangci/golangci/wiki/Configuration
-service:
-  golangci-lint-version: 1.19.x # use the fixed version to not introduce new linters unexpectedly
-  prepare:
-    - echo "here I can run custom commands, but no preparation needed for this repo"

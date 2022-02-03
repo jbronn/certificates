@@ -77,12 +77,12 @@ func Test_defaultPublicKeyValidator_Valid(t *testing.T) {
 		{
 			"fail/unrecognized-key-type",
 			&x509.CertificateRequest{PublicKey: "foo"},
-			errors.New("unrecognized public key of type 'string' in CSR"),
+			errors.New("certificate request key of type 'string' is not supported"),
 		},
 		{
 			"fail/rsa/too-short",
 			shortRSA,
-			errors.New("rsa key in CSR must be at least 2048 bits (256 bytes)"),
+			errors.New("certificate request RSA key must be at least 2048 bits (256 bytes)"),
 		},
 		{
 			"ok/rsa",
@@ -174,14 +174,15 @@ func Test_emailAddressesValidator_Valid(t *testing.T) {
 		{"ok1", []string{"max@smallstep.com"}, args{&x509.CertificateRequest{EmailAddresses: []string{"max@smallstep.com"}}}, false},
 		{"ok2", []string{"max@step.com", "mike@step.com"}, args{&x509.CertificateRequest{EmailAddresses: []string{"max@step.com", "mike@step.com"}}}, false},
 		{"ok3", []string{"max@step.com", "mike@step.com"}, args{&x509.CertificateRequest{EmailAddresses: []string{"mike@step.com", "max@step.com"}}}, false},
+		{"ok3", []string{"max@step.com", "mike@step.com"}, args{&x509.CertificateRequest{}}, false},
 		{"fail1", []string{"max@step.com"}, args{&x509.CertificateRequest{EmailAddresses: []string{"mike@step.com"}}}, true},
 		{"fail2", []string{"mike@step.com"}, args{&x509.CertificateRequest{EmailAddresses: []string{"max@step.com", "mike@step.com"}}}, true},
-		{"fail3", []string{"mike@step.com", "max@step.com"}, args{&x509.CertificateRequest{DNSNames: []string{"mike@step.com", "mex@step.com"}}}, true},
+		{"fail3", []string{"mike@step.com", "max@step.com"}, args{&x509.CertificateRequest{EmailAddresses: []string{"mike@step.com", "mex@step.com"}}}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := tt.v.Valid(tt.args.req); (err != nil) != tt.wantErr {
-				t.Errorf("dnsNamesValidator.Valid() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("emailAddressesValidator.Valid() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -201,6 +202,7 @@ func Test_dnsNamesValidator_Valid(t *testing.T) {
 		{"ok1", []string{"foo.bar.zar"}, args{&x509.CertificateRequest{DNSNames: []string{"foo.bar.zar"}}}, false},
 		{"ok2", []string{"foo.bar.zar", "bar.zar"}, args{&x509.CertificateRequest{DNSNames: []string{"foo.bar.zar", "bar.zar"}}}, false},
 		{"ok3", []string{"foo.bar.zar", "bar.zar"}, args{&x509.CertificateRequest{DNSNames: []string{"bar.zar", "foo.bar.zar"}}}, false},
+		{"ok4", []string{"foo.bar.zar", "bar.zar"}, args{&x509.CertificateRequest{}}, false},
 		{"fail1", []string{"foo.bar.zar"}, args{&x509.CertificateRequest{DNSNames: []string{"bar.zar"}}}, true},
 		{"fail2", []string{"foo.bar.zar"}, args{&x509.CertificateRequest{DNSNames: []string{"bar.zar", "foo.bar.zar"}}}, true},
 		{"fail3", []string{"foo.bar.zar", "bar.zar"}, args{&x509.CertificateRequest{DNSNames: []string{"foo.bar.zar", "zar.bar"}}}, true},
@@ -232,6 +234,7 @@ func Test_ipAddressesValidator_Valid(t *testing.T) {
 		{"ok1", []net.IP{ip1}, args{&x509.CertificateRequest{IPAddresses: []net.IP{ip1}}}, false},
 		{"ok2", []net.IP{ip1, ip2}, args{&x509.CertificateRequest{IPAddresses: []net.IP{ip1, ip2}}}, false},
 		{"ok3", []net.IP{ip1, ip2}, args{&x509.CertificateRequest{IPAddresses: []net.IP{ip2, ip1}}}, false},
+		{"ok4", []net.IP{ip1, ip2}, args{&x509.CertificateRequest{}}, false},
 		{"fail1", []net.IP{ip1}, args{&x509.CertificateRequest{IPAddresses: []net.IP{ip2}}}, true},
 		{"fail2", []net.IP{ip1}, args{&x509.CertificateRequest{IPAddresses: []net.IP{ip2, ip1}}}, true},
 		{"fail3", []net.IP{ip1, ip2}, args{&x509.CertificateRequest{IPAddresses: []net.IP{ip1, ip3}}}, true},
@@ -268,6 +271,7 @@ func Test_urisValidator_Valid(t *testing.T) {
 		{"ok1", []*url.URL{u1}, args{&x509.CertificateRequest{URIs: []*url.URL{u1}}}, false},
 		{"ok2", []*url.URL{u1, u2}, args{&x509.CertificateRequest{URIs: []*url.URL{u2, u1}}}, false},
 		{"ok3", []*url.URL{u2, u1, u3}, args{&x509.CertificateRequest{URIs: []*url.URL{u3, u2, u1}}}, false},
+		{"ok3", []*url.URL{u2, u1, u3}, args{&x509.CertificateRequest{}}, false},
 		{"fail1", []*url.URL{u1}, args{&x509.CertificateRequest{URIs: []*url.URL{u2}}}, true},
 		{"fail2", []*url.URL{u1}, args{&x509.CertificateRequest{URIs: []*url.URL{u2, u1}}}, true},
 		{"fail3", []*url.URL{u1, u2}, args{&x509.CertificateRequest{URIs: []*url.URL{u1, fu}}}, true},
@@ -299,14 +303,14 @@ func Test_defaultSANsValidator_Valid(t *testing.T) {
 			return test{
 				csr:          &x509.CertificateRequest{EmailAddresses: []string{"max@fx.com", "mariano@fx.com"}},
 				expectedSANs: []string{"dcow@fx.com"},
-				err:          errors.New("certificate request does not contain the valid Email Addresses"),
+				err:          errors.New("certificate request does not contain the valid email addresses"),
 			}
 		},
 		"fail/ipAddressesValidator": func() test {
 			return test{
 				csr:          &x509.CertificateRequest{IPAddresses: []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("127.0.0.1")}},
 				expectedSANs: []string{"127.0.0.1"},
-				err:          errors.New("IP Addresses claim failed"),
+				err:          errors.New("certificate request does not contain the valid IP addresses"),
 			}
 		},
 		"fail/urisValidator": func() test {
@@ -317,7 +321,7 @@ func Test_defaultSANsValidator_Valid(t *testing.T) {
 			return test{
 				csr:          &x509.CertificateRequest{URIs: []*url.URL{u1, u2}},
 				expectedSANs: []string{"urn:uuid:ddfe62ba-7e99-4bc1-83b3-8f57fe3e9959"},
-				err:          errors.New("URIs claim failed"),
+				err:          errors.New("certificate request does not contain the valid URIs"),
 			}
 		},
 		"ok": func() test {
@@ -508,7 +512,7 @@ func Test_forceCN_Option(t *testing.T) {
 					Subject:  pkix.Name{},
 					DNSNames: []string{},
 				},
-				err: errors.New("Cannot force CN, DNSNames is empty"),
+				err: errors.New("cannot force common name, DNS names is empty"),
 			}
 		},
 	}

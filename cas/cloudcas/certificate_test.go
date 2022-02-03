@@ -14,8 +14,8 @@ import (
 	"reflect"
 	"testing"
 
-	pb "google.golang.org/genproto/googleapis/cloud/security/privateca/v1beta1"
-	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
+	kmsapi "github.com/smallstep/certificates/kms/apiv1"
+	pb "google.golang.org/genproto/googleapis/cloud/security/privateca/v1"
 )
 
 var (
@@ -66,30 +66,27 @@ func Test_createCertificateConfig(t *testing.T) {
 		{"ok", args{cert}, &pb.Certificate_Config{
 			Config: &pb.CertificateConfig{
 				SubjectConfig: &pb.CertificateConfig_SubjectConfig{
-					Subject:    &pb.Subject{},
-					CommonName: "test.smallstep.com",
+					Subject: &pb.Subject{
+						CommonName: "test.smallstep.com",
+					},
 					SubjectAltName: &pb.SubjectAltNames{
 						DnsNames: []string{"test.smallstep.com"},
 					},
 				},
-				ReusableConfig: &pb.ReusableConfigWrapper{
-					ConfigValues: &pb.ReusableConfigWrapper_ReusableConfigValues{
-						ReusableConfigValues: &pb.ReusableConfigValues{
-							KeyUsage: &pb.KeyUsage{
-								BaseKeyUsage: &pb.KeyUsage_KeyUsageOptions{
-									DigitalSignature: true,
-								},
-								ExtendedKeyUsage: &pb.KeyUsage_ExtendedKeyUsageOptions{
-									ClientAuth: true,
-									ServerAuth: true,
-								},
-							},
+				X509Config: &pb.X509Parameters{
+					KeyUsage: &pb.KeyUsage{
+						BaseKeyUsage: &pb.KeyUsage_KeyUsageOptions{
+							DigitalSignature: true,
+						},
+						ExtendedKeyUsage: &pb.KeyUsage_ExtendedKeyUsageOptions{
+							ClientAuth: true,
+							ServerAuth: true,
 						},
 					},
 				},
 				PublicKey: &pb.PublicKey{
-					Type: pb.PublicKey_PEM_EC_KEY,
-					Key:  []byte(testLeafPublicKey),
+					Key:    []byte(testLeafPublicKey),
+					Format: pb.PublicKey_PEM,
 				},
 			},
 		}, false},
@@ -103,7 +100,7 @@ func Test_createCertificateConfig(t *testing.T) {
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("createCertificateConfig() = %v, want %v", got.Config.ReusableConfig, tt.want.Config.ReusableConfig)
+				t.Errorf("createCertificateConfig() = %v, want %v", got.Config, tt.want.Config)
 			}
 		})
 	}
@@ -126,12 +123,12 @@ func Test_createPublicKey(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok ec", args{ecCert.PublicKey}, &pb.PublicKey{
-			Type: pb.PublicKey_PEM_EC_KEY,
-			Key:  []byte(testLeafPublicKey),
+			Format: pb.PublicKey_PEM,
+			Key:    []byte(testLeafPublicKey),
 		}, false},
 		{"ok rsa", args{rsaCert.PublicKey}, &pb.PublicKey{
-			Type: pb.PublicKey_PEM_RSA_KEY,
-			Key:  []byte(testRSAPublicKey),
+			Format: pb.PublicKey_PEM,
+			Key:    []byte(testRSAPublicKey),
 		}, false},
 		{"fail ed25519", args{edpub}, nil, true},
 		{"fail ec marshal", args{&ecdsa.PublicKey{
@@ -184,6 +181,7 @@ func Test_createSubject(t *testing.T) {
 			Province:           "California",
 			StreetAddress:      "1 A St.",
 			PostalCode:         "12345",
+			CommonName:         "test.smallstep.com",
 		}},
 	}
 	for _, tt := range tests {
@@ -288,35 +286,32 @@ func Test_createSubjectAlternativeNames(t *testing.T) {
 	}
 }
 
-func Test_createReusableConfig(t *testing.T) {
-	withKU := func(ku *pb.KeyUsage) *pb.ReusableConfigWrapper {
+func Test_createX509Parameters(t *testing.T) {
+	withKU := func(ku *pb.KeyUsage) *pb.X509Parameters {
 		if ku.BaseKeyUsage == nil {
 			ku.BaseKeyUsage = &pb.KeyUsage_KeyUsageOptions{}
 		}
 		if ku.ExtendedKeyUsage == nil {
 			ku.ExtendedKeyUsage = &pb.KeyUsage_ExtendedKeyUsageOptions{}
 		}
-		return &pb.ReusableConfigWrapper{
-			ConfigValues: &pb.ReusableConfigWrapper_ReusableConfigValues{
-				ReusableConfigValues: &pb.ReusableConfigValues{
-					KeyUsage: ku,
-				},
-			},
+		return &pb.X509Parameters{
+			KeyUsage: ku,
 		}
 	}
-	withRCV := func(rcv *pb.ReusableConfigValues) *pb.ReusableConfigWrapper {
+	withRCV := func(rcv *pb.X509Parameters) *pb.X509Parameters {
 		if rcv.KeyUsage == nil {
 			rcv.KeyUsage = &pb.KeyUsage{
 				BaseKeyUsage:     &pb.KeyUsage_KeyUsageOptions{},
 				ExtendedKeyUsage: &pb.KeyUsage_ExtendedKeyUsageOptions{},
 			}
 		}
-		return &pb.ReusableConfigWrapper{
-			ConfigValues: &pb.ReusableConfigWrapper_ReusableConfigValues{
-				ReusableConfigValues: rcv,
-			},
-		}
+		return rcv
 	}
+
+	vTrue := true
+	vFalse := false
+	vZero := int32(0)
+	vOne := int32(1)
 
 	type args struct {
 		cert *x509.Certificate
@@ -324,26 +319,22 @@ func Test_createReusableConfig(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want *pb.ReusableConfigWrapper
+		want *pb.X509Parameters
 	}{
 		{"keyUsageDigitalSignature", args{&x509.Certificate{
 			KeyUsage: x509.KeyUsageDigitalSignature,
-		}}, &pb.ReusableConfigWrapper{
-			ConfigValues: &pb.ReusableConfigWrapper_ReusableConfigValues{
-				ReusableConfigValues: &pb.ReusableConfigValues{
-					KeyUsage: &pb.KeyUsage{
-						BaseKeyUsage: &pb.KeyUsage_KeyUsageOptions{
-							DigitalSignature: true,
-						},
-						ExtendedKeyUsage:         &pb.KeyUsage_ExtendedKeyUsageOptions{},
-						UnknownExtendedKeyUsages: nil,
-					},
-					CaOptions:            nil,
-					PolicyIds:            nil,
-					AiaOcspServers:       nil,
-					AdditionalExtensions: nil,
+		}}, &pb.X509Parameters{
+			KeyUsage: &pb.KeyUsage{
+				BaseKeyUsage: &pb.KeyUsage_KeyUsageOptions{
+					DigitalSignature: true,
 				},
+				ExtendedKeyUsage:         &pb.KeyUsage_ExtendedKeyUsageOptions{},
+				UnknownExtendedKeyUsages: nil,
 			},
+			CaOptions:            nil,
+			PolicyIds:            nil,
+			AiaOcspServers:       nil,
+			AdditionalExtensions: nil,
 		}},
 		// KeyUsage
 		{"KeyUsageDigitalSignature", args{&x509.Certificate{KeyUsage: x509.KeyUsageDigitalSignature}}, withKU(&pb.KeyUsage{
@@ -454,48 +445,48 @@ func Test_createReusableConfig(t *testing.T) {
 			},
 		})},
 		// BasicCre
-		{"BasicConstraintsCAMax0", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: 0, MaxPathLenZero: true}}, withRCV(&pb.ReusableConfigValues{
-			CaOptions: &pb.ReusableConfigValues_CaOptions{
-				IsCa:                wrapperspb.Bool(true),
-				MaxIssuerPathLength: wrapperspb.Int32(0),
+		{"BasicConstraintsCAMax0", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: 0, MaxPathLenZero: true}}, withRCV(&pb.X509Parameters{
+			CaOptions: &pb.X509Parameters_CaOptions{
+				IsCa:                &vTrue,
+				MaxIssuerPathLength: &vZero,
 			},
 		})},
-		{"BasicConstraintsCAMax1", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: 1, MaxPathLenZero: false}}, withRCV(&pb.ReusableConfigValues{
-			CaOptions: &pb.ReusableConfigValues_CaOptions{
-				IsCa:                wrapperspb.Bool(true),
-				MaxIssuerPathLength: wrapperspb.Int32(1),
+		{"BasicConstraintsCAMax1", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: 1, MaxPathLenZero: false}}, withRCV(&pb.X509Parameters{
+			CaOptions: &pb.X509Parameters_CaOptions{
+				IsCa:                &vTrue,
+				MaxIssuerPathLength: &vOne,
 			},
 		})},
-		{"BasicConstraintsCANoMax", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: -1, MaxPathLenZero: false}}, withRCV(&pb.ReusableConfigValues{
-			CaOptions: &pb.ReusableConfigValues_CaOptions{
-				IsCa:                wrapperspb.Bool(true),
+		{"BasicConstraintsCANoMax", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: -1, MaxPathLenZero: false}}, withRCV(&pb.X509Parameters{
+			CaOptions: &pb.X509Parameters_CaOptions{
+				IsCa:                &vTrue,
 				MaxIssuerPathLength: nil,
 			},
 		})},
-		{"BasicConstraintsCANoMax0", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: 0, MaxPathLenZero: false}}, withRCV(&pb.ReusableConfigValues{
-			CaOptions: &pb.ReusableConfigValues_CaOptions{
-				IsCa:                wrapperspb.Bool(true),
+		{"BasicConstraintsCANoMax0", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: true, MaxPathLen: 0, MaxPathLenZero: false}}, withRCV(&pb.X509Parameters{
+			CaOptions: &pb.X509Parameters_CaOptions{
+				IsCa:                &vTrue,
 				MaxIssuerPathLength: nil,
 			},
 		})},
-		{"BasicConstraintsNoCA", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: false, MaxPathLen: 0, MaxPathLenZero: false}}, withRCV(&pb.ReusableConfigValues{
-			CaOptions: &pb.ReusableConfigValues_CaOptions{
-				IsCa:                wrapperspb.Bool(false),
+		{"BasicConstraintsNoCA", args{&x509.Certificate{BasicConstraintsValid: true, IsCA: false, MaxPathLen: 0, MaxPathLenZero: false}}, withRCV(&pb.X509Parameters{
+			CaOptions: &pb.X509Parameters_CaOptions{
+				IsCa:                &vFalse,
 				MaxIssuerPathLength: nil,
 			},
 		})},
-		{"BasicConstraintsNoValid", args{&x509.Certificate{BasicConstraintsValid: false, IsCA: false, MaxPathLen: 0, MaxPathLenZero: false}}, withRCV(&pb.ReusableConfigValues{
+		{"BasicConstraintsNoValid", args{&x509.Certificate{BasicConstraintsValid: false, IsCA: false, MaxPathLen: 0, MaxPathLenZero: false}}, withRCV(&pb.X509Parameters{
 			CaOptions: nil,
 		})},
 		// PolicyIdentifiers
-		{"PolicyIdentifiers", args{&x509.Certificate{PolicyIdentifiers: []asn1.ObjectIdentifier{{1, 2, 3, 4}, {4, 3, 2, 1}}}}, withRCV(&pb.ReusableConfigValues{
+		{"PolicyIdentifiers", args{&x509.Certificate{PolicyIdentifiers: []asn1.ObjectIdentifier{{1, 2, 3, 4}, {4, 3, 2, 1}}}}, withRCV(&pb.X509Parameters{
 			PolicyIds: []*pb.ObjectId{
 				{ObjectIdPath: []int32{1, 2, 3, 4}},
 				{ObjectIdPath: []int32{4, 3, 2, 1}},
 			},
 		})},
 		// OCSPServer
-		{"OCPServers", args{&x509.Certificate{OCSPServer: []string{"https://oscp.doe.com", "https://doe.com/ocsp"}}}, withRCV(&pb.ReusableConfigValues{
+		{"OCPServers", args{&x509.Certificate{OCSPServer: []string{"https://oscp.doe.com", "https://doe.com/ocsp"}}}, withRCV(&pb.X509Parameters{
 			AiaOcspServers: []string{"https://oscp.doe.com", "https://doe.com/ocsp"},
 		})},
 		// Extensions
@@ -504,7 +495,7 @@ func Test_createReusableConfig(t *testing.T) {
 			{Id: []int{2, 5, 29, 17}, Critical: true, Value: []byte("SANs")}, //
 			{Id: []int{4, 3, 2, 1}, Critical: false, Value: []byte("zoobar")},
 			{Id: []int{2, 5, 29, 31}, Critical: false, Value: []byte("CRL Distribution points")},
-		}}}, withRCV(&pb.ReusableConfigValues{
+		}}}, withRCV(&pb.X509Parameters{
 			AdditionalExtensions: []*pb.X509Extension{
 				{ObjectId: &pb.ObjectId{ObjectIdPath: []int32{1, 2, 3, 4}}, Critical: true, Value: []byte("foobar")},
 				{ObjectId: &pb.ObjectId{ObjectIdPath: []int32{4, 3, 2, 1}}, Critical: false, Value: []byte("zoobar")},
@@ -513,8 +504,8 @@ func Test_createReusableConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := createReusableConfig(tt.args.cert); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("createReusableConfig() = %v, want %v", got, tt.want)
+			if got := createX509Parameters(tt.args.cert); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("createX509Parameters() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -544,6 +535,79 @@ func Test_isExtraExtension(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isExtraExtension(tt.args.oid); got != tt.want {
 				t.Errorf("isExtraExtension() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_createKeyVersionSpec(t *testing.T) {
+	type args struct {
+		alg  kmsapi.SignatureAlgorithm
+		bits int
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    *pb.CertificateAuthority_KeyVersionSpec
+		wantErr bool
+	}{
+		{"ok P256", args{0, 0}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_EC_P256_SHA256,
+			}}, false},
+		{"ok P256", args{kmsapi.ECDSAWithSHA256, 0}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_EC_P256_SHA256,
+			}}, false},
+		{"ok P384", args{kmsapi.ECDSAWithSHA384, 0}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_EC_P384_SHA384,
+			}}, false},
+		{"ok RSA default", args{kmsapi.SHA256WithRSA, 0}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PKCS1_3072_SHA256,
+			}}, false},
+		{"ok RSA 2048", args{kmsapi.SHA256WithRSA, 2048}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PKCS1_2048_SHA256,
+			}}, false},
+		{"ok RSA 3072", args{kmsapi.SHA256WithRSA, 3072}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PKCS1_3072_SHA256,
+			}}, false},
+		{"ok RSA 4096", args{kmsapi.SHA256WithRSA, 4096}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PKCS1_4096_SHA256,
+			}}, false},
+		{"ok RSA-PSS default", args{kmsapi.SHA256WithRSAPSS, 0}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PSS_3072_SHA256,
+			}}, false},
+		{"ok RSA-PSS 2048", args{kmsapi.SHA256WithRSAPSS, 2048}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PSS_2048_SHA256,
+			}}, false},
+		{"ok RSA-PSS 3072", args{kmsapi.SHA256WithRSAPSS, 3072}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PSS_3072_SHA256,
+			}}, false},
+		{"ok RSA-PSS 4096", args{kmsapi.SHA256WithRSAPSS, 4096}, &pb.CertificateAuthority_KeyVersionSpec{
+			KeyVersion: &pb.CertificateAuthority_KeyVersionSpec_Algorithm{
+				Algorithm: pb.CertificateAuthority_RSA_PSS_4096_SHA256,
+			}}, false},
+		{"fail Ed25519", args{kmsapi.PureEd25519, 0}, nil, true},
+		{"fail RSA size", args{kmsapi.SHA256WithRSA, 1024}, nil, true},
+		{"fail RSA-PSS size", args{kmsapi.SHA256WithRSAPSS, 1024}, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := createKeyVersionSpec(tt.args.alg, tt.args.bits)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("createKeyVersionSpec() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("createKeyVersionSpec() = %v, want %v", got, tt.want)
 			}
 		})
 	}
