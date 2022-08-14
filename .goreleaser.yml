@@ -19,6 +19,7 @@ builds:
       - linux_386
       - linux_amd64
       - linux_arm64
+      - linux_arm_5
       - linux_arm_6
       - linux_arm_7
       - windows_amd64
@@ -39,6 +40,7 @@ builds:
       - linux_386
       - linux_amd64
       - linux_arm64
+      - linux_arm_5
       - linux_arm_6
       - linux_arm_7
       - windows_amd64
@@ -59,6 +61,7 @@ builds:
       - linux_386
       - linux_amd64
       - linux_arm64
+      - linux_arm_5
       - linux_arm_6
       - linux_arm_7
       - windows_amd64
@@ -227,42 +230,3 @@ scoop:
   # Your app's license
   # Default is empty.
   license: "Apache-2.0"
-
-  #dockers:
-  #  - dockerfile: docker/Dockerfile
-  #    goos: linux
-  #    goarch: amd64
-  #    use_buildx: true
-  #    image_templates:
-  #    - "smallstep/step-cli:latest"
-  #    - "smallstep/step-cli:{{ .Tag }}"
-  #    build_flag_templates:
-  #    - "--platform=linux/amd64"
-  #  - dockerfile: docker/Dockerfile
-  #    goos: linux
-  #    goarch: 386
-  #    use_buildx: true
-  #    image_templates:
-  #    - "smallstep/step-cli:latest"
-  #    - "smallstep/step-cli:{{ .Tag }}"
-  #    build_flag_templates:
-  #    - "--platform=linux/386"
-  #  - dockerfile: docker/Dockerfile
-  #    goos: linux
-  #    goarch: arm
-  #    goarm: 7
-  #    use_buildx: true
-  #    image_templates:
-  #    - "smallstep/step-cli:latest"
-  #    - "smallstep/step-cli:{{ .Tag }}"
-  #    build_flag_templates:
-  #    - "--platform=linux/arm/v7"
-  #  - dockerfile: docker/Dockerfile
-  #    goos: linux
-  #    goarch: arm64
-  #    use_buildx: true
-  #    image_templates:
-  #    - "smallstep/step-cli:latest"
-  #    - "smallstep/step-cli:{{ .Tag }}"
-  #    build_flag_templates:
-  #    - "--platform=linux/arm64/v8"

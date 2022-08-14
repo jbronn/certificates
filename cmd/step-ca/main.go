@@ -40,6 +40,7 @@ import (
 	_ "github.com/smallstep/certificates/cas/cloudcas"
 	_ "github.com/smallstep/certificates/cas/softcas"
 	_ "github.com/smallstep/certificates/cas/stepcas"
+	_ "github.com/smallstep/certificates/cas/vaultcas"
 )
 
 // commit and buildTime are filled in during build by the Makefile
@@ -117,7 +118,7 @@ func main() {
 	app.HelpName = "step-ca"
 	app.Version = step.Version()
 	app.Usage = "an online certificate authority for secure automated certificate management"
-	app.UsageText = `**step-ca** <config> [**--password-file**=<file>]
+	app.UsageText = `**step-ca** [config] [**--context**=<name>] [**--password-file**=<file>]
 [**--ssh-host-password-file**=<file>] [**--ssh-user-password-file**=<file>]
 [**--issuer-password-file**=<file>] [**--resolver**=<addr>] [**--help**] [**--version**]`
 	app.Description = `**step-ca** runs the Step Online Certificate Authority
@@ -133,6 +134,7 @@ This command will run indefinitely on success and return \>0 if any error occurs
 These examples assume that you have already initialized your PKI by running
 'step ca init'. If you have not completed this step please see the 'Getting Started'
 section of the README.
+
 Run the Step CA and prompt for password:
 '''
 $ step-ca $STEPPATH/config/ca.json
@@ -141,10 +143,29 @@ Run the Step CA and read the password from a file - this is useful for
 automating deployment:
 '''
 $ step-ca $STEPPATH/config/ca.json --password-file ./password.txt
-'''`
+'''
+Run the Step CA for the context selected with step and a custom password file:
+'''
+$ step context select ssh
+$ step-ca --password-file ./password.txt
+'''
+Run the Step CA for the context named _mybiz_ and prompt for password:
+'''
+$ step-ca --context=mybiz
+'''
+Run the Step CA for the context named _mybiz_ and an alternate ca.json file:
+'''
+$ step-ca --context=mybiz other-ca.json
+'''
+Run the Step CA for the context named _mybiz_ and read the password from a file - this is useful for
+automating deployment:
+'''
+$ step-ca --context=mybiz --password-file ./password.txt
+'''
+`
 	app.Flags = append(app.Flags, commands.AppCommand.Flags...)
 	app.Flags = append(app.Flags, cli.HelpFlag)
-	app.Copyright = "(c) 2018-2020 Smallstep Labs, Inc."
+	app.Copyright = fmt.Sprintf("(c) 2018-%d Smallstep Labs, Inc.", time.Now().Year())
 
 	// All non-successful output should be written to stderr
 	app.Writer = os.Stdout

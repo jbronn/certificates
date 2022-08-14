@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"go.step.sm/linkedca"
+
+	"github.com/smallstep/certificates/authority/policy"
 	"github.com/smallstep/certificates/authority/provisioner"
 	cas "github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
 	kms "github.com/smallstep/certificates/kms/apiv1"
 	"github.com/smallstep/certificates/templates"
-	"go.step.sm/linkedca"
 )
 
 const (
@@ -26,23 +29,27 @@ var (
 	DefaultBackdate = time.Minute
 	// DefaultDisableRenewal disables renewals per provisioner.
 	DefaultDisableRenewal = false
+	// DefaultAllowRenewalAfterExpiry allows renewals even if the certificate is
+	// expired.
+	DefaultAllowRenewalAfterExpiry = false
 	// DefaultEnableSSHCA enable SSH CA features per provisioner or globally
 	// for all provisioners.
 	DefaultEnableSSHCA = false
 	// GlobalProvisionerClaims default claims for the Authority. Can be overridden
 	// by provisioner specific claims.
 	GlobalProvisionerClaims = provisioner.Claims{
-		MinTLSDur:         &provisioner.Duration{Duration: 5 * time.Minute}, // TLS certs
-		MaxTLSDur:         &provisioner.Duration{Duration: 24 * time.Hour},
-		DefaultTLSDur:     &provisioner.Duration{Duration: 24 * time.Hour},
-		DisableRenewal:    &DefaultDisableRenewal,
-		MinUserSSHDur:     &provisioner.Duration{Duration: 5 * time.Minute}, // User SSH certs
-		MaxUserSSHDur:     &provisioner.Duration{Duration: 24 * time.Hour},
-		DefaultUserSSHDur: &provisioner.Duration{Duration: 16 * time.Hour},
-		MinHostSSHDur:     &provisioner.Duration{Duration: 5 * time.Minute}, // Host SSH certs
-		MaxHostSSHDur:     &provisioner.Duration{Duration: 30 * 24 * time.Hour},
-		DefaultHostSSHDur: &provisioner.Duration{Duration: 30 * 24 * time.Hour},
-		EnableSSHCA:       &DefaultEnableSSHCA,
+		MinTLSDur:               &provisioner.Duration{Duration: 5 * time.Minute}, // TLS certs
+		MaxTLSDur:               &provisioner.Duration{Duration: 24 * time.Hour},
+		DefaultTLSDur:           &provisioner.Duration{Duration: 24 * time.Hour},
+		MinUserSSHDur:           &provisioner.Duration{Duration: 5 * time.Minute}, // User SSH certs
+		MaxUserSSHDur:           &provisioner.Duration{Duration: 24 * time.Hour},
+		DefaultUserSSHDur:       &provisioner.Duration{Duration: 16 * time.Hour},
+		MinHostSSHDur:           &provisioner.Duration{Duration: 5 * time.Minute}, // Host SSH certs
+		MaxHostSSHDur:           &provisioner.Duration{Duration: 30 * 24 * time.Hour},
+		DefaultHostSSHDur:       &provisioner.Duration{Duration: 30 * 24 * time.Hour},
+		EnableSSHCA:             &DefaultEnableSSHCA,
+		DisableRenewal:          &DefaultDisableRenewal,
+		AllowRenewalAfterExpiry: &DefaultAllowRenewalAfterExpiry,
 	}
 )
 
@@ -64,6 +71,7 @@ type Config struct {
 	TLS              *TLSOptions          `json:"tls,omitempty"`
 	Password         string               `json:"password,omitempty"`
 	Templates        *templates.Templates `json:"templates,omitempty"`
+	CommonName       string               `json:"commonName,omitempty"`
 }
 
 // ASN1DN contains ASN1.DN attributes that are used in Subject and Issuer
@@ -90,6 +98,7 @@ type AuthConfig struct {
 	Admins               []*linkedca.Admin     `json:"-"`
 	Template             *ASN1DN               `json:"template,omitempty"`
 	Claims               *provisioner.Claims   `json:"claims,omitempty"`
+	Policy               *policy.Options       `json:"policy,omitempty"`
 	DisableIssuedAtCheck bool                  `json:"disableIssuedAtCheck,omitempty"`
 	Backdate             *provisioner.Duration `json:"backdate,omitempty"`
 	EnableAdmin          bool                  `json:"enableAdmin,omitempty"`
@@ -168,6 +177,9 @@ func (c *Config) Init() {
 	}
 	if c.AuthorityConfig == nil {
 		c.AuthorityConfig = &AuthConfig{}
+	}
+	if c.CommonName == "" {
+		c.CommonName = "Step Online CA"
 	}
 	c.AuthorityConfig.init()
 }
@@ -269,29 +281,53 @@ func (c *Config) GetAudiences() provisioner.Audiences {
 	}
 
 	for _, name := range c.DNSNames {
+		hostname := toHostname(name)
 		audiences.Sign = append(audiences.Sign,
-			fmt.Sprintf("https://%s/1.0/sign", name),
-			fmt.Sprintf("https://%s/sign", name),
-			fmt.Sprintf("https://%s/1.0/ssh/sign", name),
-			fmt.Sprintf("https://%s/ssh/sign", name))
+			fmt.Sprintf("https://%s/1.0/sign", hostname),
+			fmt.Sprintf("https://%s/sign", hostname),
+			fmt.Sprintf("https://%s/1.0/ssh/sign", hostname),
+			fmt.Sprintf("https://%s/ssh/sign", hostname))
+		audiences.Renew = append(audiences.Renew,
+			fmt.Sprintf("https://%s/1.0/renew", hostname),
+			fmt.Sprintf("https://%s/renew", hostname))
 		audiences.Revoke = append(audiences.Revoke,
-			fmt.Sprintf("https://%s/1.0/revoke", name),
-			fmt.Sprintf("https://%s/revoke", name))
+			fmt.Sprintf("https://%s/1.0/revoke", hostname),
+			fmt.Sprintf("https://%s/revoke", hostname))
 		audiences.SSHSign = append(audiences.SSHSign,
-			fmt.Sprintf("https://%s/1.0/ssh/sign", name),
-			fmt.Sprintf("https://%s/ssh/sign", name),
-			fmt.Sprintf("https://%s/1.0/sign", name),
-			fmt.Sprintf("https://%s/sign", name))
+			fmt.Sprintf("https://%s/1.0/ssh/sign", hostname),
+			fmt.Sprintf("https://%s/ssh/sign", hostname),
+			fmt.Sprintf("https://%s/1.0/sign", hostname),
+			fmt.Sprintf("https://%s/sign", hostname))
 		audiences.SSHRevoke = append(audiences.SSHRevoke,
-			fmt.Sprintf("https://%s/1.0/ssh/revoke", name),
-			fmt.Sprintf("https://%s/ssh/revoke", name))
+			fmt.Sprintf("https://%s/1.0/ssh/revoke", hostname),
+			fmt.Sprintf("https://%s/ssh/revoke", hostname))
 		audiences.SSHRenew = append(audiences.SSHRenew,
-			fmt.Sprintf("https://%s/1.0/ssh/renew", name),
-			fmt.Sprintf("https://%s/ssh/renew", name))
+			fmt.Sprintf("https://%s/1.0/ssh/renew", hostname),
+			fmt.Sprintf("https://%s/ssh/renew", hostname))
 		audiences.SSHRekey = append(audiences.SSHRekey,
-			fmt.Sprintf("https://%s/1.0/ssh/rekey", name),
-			fmt.Sprintf("https://%s/ssh/rekey", name))
+			fmt.Sprintf("https://%s/1.0/ssh/rekey", hostname),
+			fmt.Sprintf("https://%s/ssh/rekey", hostname))
 	}
 
 	return audiences
+}
+
+// Audience returns the list of audiences for a given path.
+func (c *Config) Audience(path string) []string {
+	audiences := make([]string, len(c.DNSNames)+1)
+	for i, name := range c.DNSNames {
+		hostname := toHostname(name)
+		audiences[i] = "https://" + hostname + path
+	}
+	// For backward compatibility
+	audiences[len(c.DNSNames)] = path
+	return audiences
+}
+
+func toHostname(name string) string {
+	// ensure an IPv6 address is represented with square brackets when used as hostname
+	if ip := net.ParseIP(name); ip != nil && ip.To4() == nil {
+		name = "[" + name + "]"
+	}
+	return name
 }

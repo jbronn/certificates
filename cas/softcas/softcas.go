@@ -3,6 +3,7 @@ package softcas
 import (
 	"context"
 	"crypto"
+	"crypto/rsa"
 	"crypto/x509"
 	"time"
 
@@ -24,9 +25,10 @@ var now = time.Now
 // SoftCAS implements a Certificate Authority Service using Golang or KMS
 // crypto. This is the default CAS used in step-ca.
 type SoftCAS struct {
-	CertificateChain []*x509.Certificate
-	Signer           crypto.Signer
-	KeyManager       kms.KeyManager
+	CertificateChain  []*x509.Certificate
+	Signer            crypto.Signer
+	CertificateSigner func() ([]*x509.Certificate, crypto.Signer, error)
+	KeyManager        kms.KeyManager
 }
 
 // New creates a new CertificateAuthorityService implementation using Golang or KMS
@@ -34,16 +36,17 @@ type SoftCAS struct {
 func New(ctx context.Context, opts apiv1.Options) (*SoftCAS, error) {
 	if !opts.IsCreator {
 		switch {
-		case len(opts.CertificateChain) == 0:
+		case len(opts.CertificateChain) == 0 && opts.CertificateSigner == nil:
 			return nil, errors.New("softCAS 'CertificateChain' cannot be nil")
-		case opts.Signer == nil:
+		case opts.Signer == nil && opts.CertificateSigner == nil:
 			return nil, errors.New("softCAS 'signer' cannot be nil")
 		}
 	}
 	return &SoftCAS{
-		CertificateChain: opts.CertificateChain,
-		Signer:           opts.Signer,
-		KeyManager:       opts.KeyManager,
+		CertificateChain:  opts.CertificateChain,
+		Signer:            opts.Signer,
+		CertificateSigner: opts.CertificateSigner,
+		KeyManager:        opts.KeyManager,
 	}, nil
 }
 
@@ -57,6 +60,7 @@ func (c *SoftCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*apiv1
 	}
 
 	t := now()
+
 	// Provisioners can also set specific values.
 	if req.Template.NotBefore.IsZero() {
 		req.Template.NotBefore = t.Add(-1 * req.Backdate)
@@ -64,16 +68,21 @@ func (c *SoftCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*apiv1
 	if req.Template.NotAfter.IsZero() {
 		req.Template.NotAfter = t.Add(req.Lifetime)
 	}
-	req.Template.Issuer = c.CertificateChain[0].Subject
 
-	cert, err := createCertificate(req.Template, c.CertificateChain[0], req.Template.PublicKey, c.Signer)
+	chain, signer, err := c.getCertSigner()
+	if err != nil {
+		return nil, err
+	}
+	req.Template.Issuer = chain[0].Subject
+
+	cert, err := createCertificate(req.Template, chain[0], req.Template.PublicKey, signer)
 	if err != nil {
 		return nil, err
 	}
 
 	return &apiv1.CreateCertificateResponse{
 		Certificate:      cert,
-		CertificateChain: c.CertificateChain,
+		CertificateChain: chain,
 	}, nil
 }
 
@@ -89,16 +98,21 @@ func (c *SoftCAS) RenewCertificate(req *apiv1.RenewCertificateRequest) (*apiv1.R
 	t := now()
 	req.Template.NotBefore = t.Add(-1 * req.Backdate)
 	req.Template.NotAfter = t.Add(req.Lifetime)
-	req.Template.Issuer = c.CertificateChain[0].Subject
 
-	cert, err := createCertificate(req.Template, c.CertificateChain[0], req.Template.PublicKey, c.Signer)
+	chain, signer, err := c.getCertSigner()
+	if err != nil {
+		return nil, err
+	}
+	req.Template.Issuer = chain[0].Subject
+
+	cert, err := createCertificate(req.Template, chain[0], req.Template.PublicKey, signer)
 	if err != nil {
 		return nil, err
 	}
 
 	return &apiv1.RenewCertificateResponse{
 		Certificate:      cert,
-		CertificateChain: c.CertificateChain,
+		CertificateChain: chain,
 	}, nil
 }
 
@@ -106,9 +120,13 @@ func (c *SoftCAS) RenewCertificate(req *apiv1.RenewCertificateRequest) (*apiv1.R
 // operation is a no-op as the actual revoke will happen when we store the entry
 // in the db.
 func (c *SoftCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*apiv1.RevokeCertificateResponse, error) {
+	chain, _, err := c.getCertSigner()
+	if err != nil {
+		return nil, err
+	}
 	return &apiv1.RevokeCertificateResponse{
 		Certificate:      req.Certificate,
-		CertificateChain: c.CertificateChain,
+		CertificateChain: chain,
 	}, nil
 }
 
@@ -179,7 +197,7 @@ func (c *SoftCAS) CreateCertificateAuthority(req *apiv1.CreateCertificateAuthori
 	}, nil
 }
 
-// initializeKeyManager initiazes the default key manager if was not given.
+// initializeKeyManager initializes the default key manager if was not given.
 func (c *SoftCAS) initializeKeyManager() (err error) {
 	if c.KeyManager == nil {
 		c.KeyManager, err = kms.New(context.Background(), kmsapi.Options{
@@ -187,6 +205,15 @@ func (c *SoftCAS) initializeKeyManager() (err error) {
 		})
 	}
 	return
+}
+
+// getCertSigner returns the certificate chain and signer to use.
+func (c *SoftCAS) getCertSigner() ([]*x509.Certificate, crypto.Signer, error) {
+	if c.CertificateSigner != nil {
+		return c.CertificateSigner()
+	}
+	return c.CertificateChain, c.Signer, nil
+
 }
 
 // createKey uses the configured kms to create a key.
@@ -218,6 +245,8 @@ func createCertificate(template, parent *x509.Certificate, pub crypto.PublicKey,
 	if template.SignatureAlgorithm == 0 {
 		if sa, ok := signer.(apiv1.SignatureAlgorithmGetter); ok {
 			template.SignatureAlgorithm = sa.SignatureAlgorithm()
+		} else if _, ok := parent.PublicKey.(*rsa.PublicKey); ok {
+			template.SignatureAlgorithm = parent.SignatureAlgorithm
 		}
 	}
 	return x509util.CreateCertificate(template, parent, pub, signer)

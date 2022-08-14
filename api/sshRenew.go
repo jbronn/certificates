@@ -6,6 +6,9 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/smallstep/certificates/api/read"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
 )
@@ -34,33 +37,37 @@ type SSHRenewResponse struct {
 // SSHRenew is an HTTP handler that reads an RenewSSHRequest with a one-time-token
 // (ott) from the body and creates a new SSH certificate with the information in
 // the request.
-func (h *caHandler) SSHRenew(w http.ResponseWriter, r *http.Request) {
+func SSHRenew(w http.ResponseWriter, r *http.Request) {
 	var body SSHRenewRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.BadRequestErr(err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 
 	logOtt(w, body.OTT)
 	if err := body.Validate(); err != nil {
-		WriteError(w, err)
+		render.Error(w, err)
 		return
 	}
 
 	ctx := provisioner.NewContextWithMethod(r.Context(), provisioner.SSHRenewMethod)
-	_, err := h.Authority.Authorize(ctx, body.OTT)
+	ctx = provisioner.NewContextWithToken(ctx, body.OTT)
+
+	a := mustAuthority(ctx)
+	_, err := a.Authorize(ctx, body.OTT)
 	if err != nil {
-		WriteError(w, errs.UnauthorizedErr(err))
+		render.Error(w, errs.UnauthorizedErr(err))
 		return
 	}
 	oldCert, _, err := provisioner.ExtractSSHPOPCert(body.OTT)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, errs.InternalServerErr(err))
+		return
 	}
 
-	newCert, err := h.Authority.RenewSSH(ctx, oldCert)
+	newCert, err := a.RenewSSH(ctx, oldCert)
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err, "error renewing ssh certificate"))
+		render.Error(w, errs.ForbiddenErr(err, "error renewing ssh certificate"))
 		return
 	}
 
@@ -68,20 +75,20 @@ func (h *caHandler) SSHRenew(w http.ResponseWriter, r *http.Request) {
 	notBefore := time.Unix(int64(oldCert.ValidAfter), 0)
 	notAfter := time.Unix(int64(oldCert.ValidBefore), 0)
 
-	identity, err := h.renewIdentityCertificate(r, notBefore, notAfter)
+	identity, err := renewIdentityCertificate(r, notBefore, notAfter)
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err, "error renewing identity certificate"))
+		render.Error(w, errs.ForbiddenErr(err, "error renewing identity certificate"))
 		return
 	}
 
-	JSONStatus(w, &SSHSignResponse{
+	render.JSONStatus(w, &SSHSignResponse{
 		Certificate:         SSHCertificate{newCert},
 		IdentityCertificate: identity,
 	}, http.StatusCreated)
 }
 
 // renewIdentityCertificate request the client TLS certificate if present. If notBefore and notAfter are passed the
-func (h *caHandler) renewIdentityCertificate(r *http.Request, notBefore, notAfter time.Time) ([]Certificate, error) {
+func renewIdentityCertificate(r *http.Request, notBefore, notAfter time.Time) ([]Certificate, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return nil, nil
 	}
@@ -101,7 +108,7 @@ func (h *caHandler) renewIdentityCertificate(r *http.Request, notBefore, notAfte
 		cert.NotAfter = notAfter
 	}
 
-	certChain, err := h.Authority.Renew(cert)
+	certChain, err := mustAuthority(r.Context()).Renew(cert)
 	if err != nil {
 		return nil, err
 	}

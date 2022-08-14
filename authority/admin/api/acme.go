@@ -1,23 +1,15 @@
 package api
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net/http"
 
-	"github.com/go-chi/chi"
-	"github.com/smallstep/certificates/acme"
-	"github.com/smallstep/certificates/api"
-	"github.com/smallstep/certificates/authority/admin"
-	"github.com/smallstep/certificates/authority/provisioner"
 	"go.step.sm/linkedca"
 	"google.golang.org/protobuf/types/known/timestamppb"
-)
 
-const (
-	// provisionerContextKey provisioner key
-	provisionerContextKey = ContextKey("provisioner")
+	"github.com/smallstep/certificates/acme"
+	"github.com/smallstep/certificates/api/render"
+	"github.com/smallstep/certificates/authority/admin"
 )
 
 // CreateExternalAccountKeyRequest is the type for POST /admin/acme/eab requests
@@ -41,206 +33,121 @@ type GetExternalAccountKeysResponse struct {
 
 // requireEABEnabled is a middleware that ensures ACME EAB is enabled
 // before serving requests that act on ACME EAB credentials.
-func (h *Handler) requireEABEnabled(next nextHTTP) nextHTTP {
+func requireEABEnabled(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		provName := chi.URLParam(r, "provisionerName")
-		eabEnabled, prov, err := h.provisionerHasEABEnabled(ctx, provName)
-		if err != nil {
-			api.WriteError(w, err)
+		prov := linkedca.MustProvisionerFromContext(ctx)
+
+		acmeProvisioner := prov.GetDetails().GetACME()
+		if acmeProvisioner == nil {
+			render.Error(w, admin.NewErrorISE("error getting ACME details for provisioner '%s'", prov.GetName()))
 			return
 		}
-		if !eabEnabled {
-			api.WriteError(w, admin.NewError(admin.ErrorBadRequestType, "ACME EAB not enabled for provisioner %s", prov.GetName()))
+
+		if !acmeProvisioner.RequireEab {
+			render.Error(w, admin.NewError(admin.ErrorBadRequestType, "ACME EAB not enabled for provisioner '%s'", prov.GetName()))
 			return
 		}
-		ctx = context.WithValue(ctx, provisionerContextKey, prov)
-		next(w, r.WithContext(ctx))
+
+		next(w, r)
 	}
 }
 
-// provisionerHasEABEnabled determines if the "requireEAB" setting for an ACME
-// provisioner is set to true and thus has EAB enabled.
-func (h *Handler) provisionerHasEABEnabled(ctx context.Context, provisionerName string) (bool, *linkedca.Provisioner, error) {
-	var (
-		p   provisioner.Interface
-		err error
-	)
-	if p, err = h.auth.LoadProvisionerByName(provisionerName); err != nil {
-		return false, nil, admin.WrapErrorISE(err, "error loading provisioner %s", provisionerName)
-	}
-
-	prov, err := h.db.GetProvisioner(ctx, p.GetID())
-	if err != nil {
-		return false, nil, admin.WrapErrorISE(err, "error getting provisioner with ID: %s", p.GetID())
-	}
-
-	details := prov.GetDetails()
-	if details == nil {
-		return false, nil, admin.NewErrorISE("error getting details for provisioner with ID: %s", p.GetID())
-	}
-
-	acmeProvisioner := details.GetACME()
-	if acmeProvisioner == nil {
-		return false, nil, admin.NewErrorISE("error getting ACME details for provisioner with ID: %s", p.GetID())
-	}
-
-	return acmeProvisioner.GetRequireEab(), prov, nil
+// ACMEAdminResponder is responsible for writing ACME admin responses
+type ACMEAdminResponder interface {
+	GetExternalAccountKeys(w http.ResponseWriter, r *http.Request)
+	CreateExternalAccountKey(w http.ResponseWriter, r *http.Request)
+	DeleteExternalAccountKey(w http.ResponseWriter, r *http.Request)
 }
 
-// provisionerFromContext searches the context for a provisioner. Returns the
-// provisioner or an error.
-func provisionerFromContext(ctx context.Context) (*linkedca.Provisioner, error) {
-	val := ctx.Value(provisionerContextKey)
-	if val == nil {
-		return nil, admin.NewErrorISE("provisioner expected in request context")
-	}
-	pval, ok := val.(*linkedca.Provisioner)
-	if !ok || pval == nil {
-		return nil, admin.NewErrorISE("provisioner in context is not a linkedca.Provisioner")
-	}
-	return pval, nil
+// acmeAdminResponder implements ACMEAdminResponder.
+type acmeAdminResponder struct{}
+
+// NewACMEAdminResponder returns a new ACMEAdminResponder
+func NewACMEAdminResponder() ACMEAdminResponder {
+	return &acmeAdminResponder{}
 }
 
-// CreateExternalAccountKey creates a new External Account Binding key
-func (h *Handler) CreateExternalAccountKey(w http.ResponseWriter, r *http.Request) {
-	var body CreateExternalAccountKeyRequest
-	if err := api.ReadJSON(r.Body, &body); err != nil {
-		api.WriteError(w, admin.WrapError(admin.ErrorBadRequestType, err, "error reading request body"))
-		return
-	}
-
-	if err := body.Validate(); err != nil {
-		api.WriteError(w, admin.WrapError(admin.ErrorBadRequestType, err, "error validating request body"))
-		return
-	}
-
-	ctx := r.Context()
-	prov, err := provisionerFromContext(ctx)
-	if err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error getting provisioner from context"))
-		return
-	}
-
-	// check if a key with the reference does not exist (only when a reference was in the request)
-	reference := body.Reference
-	if reference != "" {
-		k, err := h.acmeDB.GetExternalAccountKeyByReference(ctx, prov.GetId(), reference)
-		// retrieving an EAB key from DB results in an error if it doesn't exist, which is what we're looking for,
-		// but other errors can also happen. Return early if that happens; continuing if it was acme.ErrNotFound.
-		if shouldWriteError := err != nil && !errors.Is(err, acme.ErrNotFound); shouldWriteError {
-			api.WriteError(w, admin.WrapErrorISE(err, "could not lookup external account key by reference"))
-			return
-		}
-		// if a key was found, return HTTP 409 conflict
-		if k != nil {
-			err := admin.NewError(admin.ErrorBadRequestType, "an ACME EAB key for provisioner '%s' with reference '%s' already exists", prov.GetName(), reference)
-			err.Status = 409
-			api.WriteError(w, err)
-			return
-		}
-		// continue execution if no key was found for the reference
-	}
-
-	eak, err := h.acmeDB.CreateExternalAccountKey(ctx, prov.GetId(), reference)
-	if err != nil {
-		msg := fmt.Sprintf("error creating ACME EAB key for provisioner '%s'", prov.GetName())
-		if reference != "" {
-			msg += fmt.Sprintf(" and reference '%s'", reference)
-		}
-		api.WriteError(w, admin.WrapErrorISE(err, msg))
-		return
-	}
-
-	response := &linkedca.EABKey{
-		Id:          eak.ID,
-		HmacKey:     eak.KeyBytes,
-		Provisioner: prov.GetName(),
-		Reference:   eak.Reference,
-	}
-
-	api.ProtoJSONStatus(w, response, http.StatusCreated)
+// GetExternalAccountKeys writes the response for the EAB keys GET endpoint
+func (h *acmeAdminResponder) GetExternalAccountKeys(w http.ResponseWriter, r *http.Request) {
+	render.Error(w, admin.NewError(admin.ErrorNotImplementedType, "this functionality is currently only available in Certificate Manager: https://u.step.sm/cm"))
 }
 
-// DeleteExternalAccountKey deletes an ACME External Account Key.
-func (h *Handler) DeleteExternalAccountKey(w http.ResponseWriter, r *http.Request) {
-
-	keyID := chi.URLParam(r, "id")
-
-	ctx := r.Context()
-	prov, err := provisionerFromContext(ctx)
-	if err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error getting provisioner from context"))
-		return
-	}
-
-	if err := h.acmeDB.DeleteExternalAccountKey(ctx, prov.GetId(), keyID); err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error deleting ACME EAB Key '%s'", keyID))
-		return
-	}
-
-	api.JSON(w, &DeleteResponse{Status: "ok"})
+// CreateExternalAccountKey writes the response for the EAB key POST endpoint
+func (h *acmeAdminResponder) CreateExternalAccountKey(w http.ResponseWriter, r *http.Request) {
+	render.Error(w, admin.NewError(admin.ErrorNotImplementedType, "this functionality is currently only available in Certificate Manager: https://u.step.sm/cm"))
 }
 
-// GetExternalAccountKeys returns ACME EAB Keys. If a reference is specified,
-// only the ExternalAccountKey with that reference is returned. Otherwise all
-// ExternalAccountKeys in the system for a specific provisioner are returned.
-func (h *Handler) GetExternalAccountKeys(w http.ResponseWriter, r *http.Request) {
+// DeleteExternalAccountKey writes the response for the EAB key DELETE endpoint
+func (h *acmeAdminResponder) DeleteExternalAccountKey(w http.ResponseWriter, r *http.Request) {
+	render.Error(w, admin.NewError(admin.ErrorNotImplementedType, "this functionality is currently only available in Certificate Manager: https://u.step.sm/cm"))
+}
 
-	var (
-		key        *acme.ExternalAccountKey
-		keys       []*acme.ExternalAccountKey
-		err        error
-		cursor     string
-		nextCursor string
-		limit      int
-	)
+func eakToLinked(k *acme.ExternalAccountKey) *linkedca.EABKey {
 
-	ctx := r.Context()
-	prov, err := provisionerFromContext(ctx)
-	if err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error getting provisioner from context"))
-		return
+	if k == nil {
+		return nil
 	}
 
-	if cursor, limit, err = api.ParseCursor(r); err != nil {
-		api.WriteError(w, admin.WrapError(admin.ErrorBadRequestType, err,
-			"error parsing cursor and limit from query params"))
-		return
+	eak := &linkedca.EABKey{
+		Id:          k.ID,
+		HmacKey:     k.HmacKey,
+		Provisioner: k.ProvisionerID,
+		Reference:   k.Reference,
+		Account:     k.AccountID,
+		CreatedAt:   timestamppb.New(k.CreatedAt),
+		BoundAt:     timestamppb.New(k.BoundAt),
 	}
 
-	reference := chi.URLParam(r, "reference")
-	if reference != "" {
-		if key, err = h.acmeDB.GetExternalAccountKeyByReference(ctx, prov.GetId(), reference); err != nil {
-			api.WriteError(w, admin.WrapErrorISE(err, "error retrieving external account key with reference '%s'", reference))
-			return
+	if k.Policy != nil {
+		eak.Policy = &linkedca.Policy{
+			X509: &linkedca.X509Policy{
+				Allow: &linkedca.X509Names{},
+				Deny:  &linkedca.X509Names{},
+			},
 		}
-		if key != nil {
-			keys = []*acme.ExternalAccountKey{key}
-		}
-	} else {
-		if keys, nextCursor, err = h.acmeDB.GetExternalAccountKeys(ctx, prov.GetId(), cursor, limit); err != nil {
-			api.WriteError(w, admin.WrapErrorISE(err, "error retrieving external account keys"))
-			return
+		eak.Policy.X509.Allow.Dns = k.Policy.X509.Allowed.DNSNames
+		eak.Policy.X509.Allow.Ips = k.Policy.X509.Allowed.IPRanges
+		eak.Policy.X509.Deny.Dns = k.Policy.X509.Denied.DNSNames
+		eak.Policy.X509.Deny.Ips = k.Policy.X509.Denied.IPRanges
+		eak.Policy.X509.AllowWildcardNames = k.Policy.X509.AllowWildcardNames
+	}
+
+	return eak
+}
+
+func linkedEAKToCertificates(k *linkedca.EABKey) *acme.ExternalAccountKey {
+	if k == nil {
+		return nil
+	}
+
+	eak := &acme.ExternalAccountKey{
+		ID:            k.Id,
+		ProvisionerID: k.Provisioner,
+		Reference:     k.Reference,
+		AccountID:     k.Account,
+		HmacKey:       k.HmacKey,
+		CreatedAt:     k.CreatedAt.AsTime(),
+		BoundAt:       k.BoundAt.AsTime(),
+	}
+
+	if policy := k.GetPolicy(); policy != nil {
+		eak.Policy = &acme.Policy{}
+		if x509 := policy.GetX509(); x509 != nil {
+			eak.Policy.X509 = acme.X509Policy{}
+			if allow := x509.GetAllow(); allow != nil {
+				eak.Policy.X509.Allowed = acme.PolicyNames{}
+				eak.Policy.X509.Allowed.DNSNames = allow.Dns
+				eak.Policy.X509.Allowed.IPRanges = allow.Ips
+			}
+			if deny := x509.GetDeny(); deny != nil {
+				eak.Policy.X509.Denied = acme.PolicyNames{}
+				eak.Policy.X509.Denied.DNSNames = deny.Dns
+				eak.Policy.X509.Denied.IPRanges = deny.Ips
+			}
+			eak.Policy.X509.AllowWildcardNames = x509.AllowWildcardNames
 		}
 	}
 
-	provisionerName := prov.GetName()
-	eaks := make([]*linkedca.EABKey, len(keys))
-	for i, k := range keys {
-		eaks[i] = &linkedca.EABKey{
-			Id:          k.ID,
-			HmacKey:     []byte{},
-			Provisioner: provisionerName,
-			Reference:   k.Reference,
-			Account:     k.AccountID,
-			CreatedAt:   timestamppb.New(k.CreatedAt),
-			BoundAt:     timestamppb.New(k.BoundAt),
-		}
-	}
-
-	api.JSON(w, &GetExternalAccountKeysResponse{
-		EAKs:       eaks,
-		NextCursor: nextCursor,
-	})
+	return eak
 }

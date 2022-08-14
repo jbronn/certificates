@@ -5,10 +5,14 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi"
+
+	"go.step.sm/linkedca"
+
 	"github.com/smallstep/certificates/api"
+	"github.com/smallstep/certificates/api/read"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/authority/admin"
 	"github.com/smallstep/certificates/authority/provisioner"
-	"go.step.sm/linkedca"
 )
 
 type adminAuthority interface {
@@ -25,6 +29,10 @@ type adminAuthority interface {
 	LoadProvisionerByID(id string) (provisioner.Interface, error)
 	UpdateProvisioner(ctx context.Context, nu *linkedca.Provisioner) error
 	RemoveProvisioner(ctx context.Context, id string) error
+	GetAuthorityPolicy(ctx context.Context) (*linkedca.Policy, error)
+	CreateAuthorityPolicy(ctx context.Context, admin *linkedca.Admin, policy *linkedca.Policy) (*linkedca.Policy, error)
+	UpdateAuthorityPolicy(ctx context.Context, admin *linkedca.Admin, policy *linkedca.Policy) (*linkedca.Policy, error)
+	RemoveAuthorityPolicy(ctx context.Context) error
 }
 
 // CreateAdminRequest represents the body for a CreateAdmin request.
@@ -77,54 +85,55 @@ type DeleteResponse struct {
 }
 
 // GetAdmin returns the requested admin, or an error.
-func (h *Handler) GetAdmin(w http.ResponseWriter, r *http.Request) {
+func GetAdmin(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	adm, ok := h.auth.LoadAdminByID(id)
+	adm, ok := mustAuthority(r.Context()).LoadAdminByID(id)
 	if !ok {
-		api.WriteError(w, admin.NewError(admin.ErrorNotFoundType,
+		render.Error(w, admin.NewError(admin.ErrorNotFoundType,
 			"admin %s not found", id))
 		return
 	}
-	api.ProtoJSON(w, adm)
+	render.ProtoJSON(w, adm)
 }
 
 // GetAdmins returns a segment of admins associated with the authority.
-func (h *Handler) GetAdmins(w http.ResponseWriter, r *http.Request) {
+func GetAdmins(w http.ResponseWriter, r *http.Request) {
 	cursor, limit, err := api.ParseCursor(r)
 	if err != nil {
-		api.WriteError(w, admin.WrapError(admin.ErrorBadRequestType, err,
+		render.Error(w, admin.WrapError(admin.ErrorBadRequestType, err,
 			"error parsing cursor and limit from query params"))
 		return
 	}
 
-	admins, nextCursor, err := h.auth.GetAdmins(cursor, limit)
+	admins, nextCursor, err := mustAuthority(r.Context()).GetAdmins(cursor, limit)
 	if err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error retrieving paginated admins"))
+		render.Error(w, admin.WrapErrorISE(err, "error retrieving paginated admins"))
 		return
 	}
-	api.JSON(w, &GetAdminsResponse{
+	render.JSON(w, &GetAdminsResponse{
 		Admins:     admins,
 		NextCursor: nextCursor,
 	})
 }
 
 // CreateAdmin creates a new admin.
-func (h *Handler) CreateAdmin(w http.ResponseWriter, r *http.Request) {
+func CreateAdmin(w http.ResponseWriter, r *http.Request) {
 	var body CreateAdminRequest
-	if err := api.ReadJSON(r.Body, &body); err != nil {
-		api.WriteError(w, admin.WrapError(admin.ErrorBadRequestType, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, admin.WrapError(admin.ErrorBadRequestType, err, "error reading request body"))
 		return
 	}
 
 	if err := body.Validate(); err != nil {
-		api.WriteError(w, err)
+		render.Error(w, err)
 		return
 	}
 
-	p, err := h.auth.LoadProvisionerByName(body.Provisioner)
+	auth := mustAuthority(r.Context())
+	p, err := auth.LoadProvisionerByName(body.Provisioner)
 	if err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error loading provisioner %s", body.Provisioner))
+		render.Error(w, admin.WrapErrorISE(err, "error loading provisioner %s", body.Provisioner))
 		return
 	}
 	adm := &linkedca.Admin{
@@ -133,46 +142,46 @@ func (h *Handler) CreateAdmin(w http.ResponseWriter, r *http.Request) {
 		Type:          body.Type,
 	}
 	// Store to authority collection.
-	if err := h.auth.StoreAdmin(r.Context(), adm, p); err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error storing admin"))
+	if err := auth.StoreAdmin(r.Context(), adm, p); err != nil {
+		render.Error(w, admin.WrapErrorISE(err, "error storing admin"))
 		return
 	}
 
-	api.ProtoJSONStatus(w, adm, http.StatusCreated)
+	render.ProtoJSONStatus(w, adm, http.StatusCreated)
 }
 
 // DeleteAdmin deletes admin.
-func (h *Handler) DeleteAdmin(w http.ResponseWriter, r *http.Request) {
+func DeleteAdmin(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	if err := h.auth.RemoveAdmin(r.Context(), id); err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error deleting admin %s", id))
+	if err := mustAuthority(r.Context()).RemoveAdmin(r.Context(), id); err != nil {
+		render.Error(w, admin.WrapErrorISE(err, "error deleting admin %s", id))
 		return
 	}
 
-	api.JSON(w, &DeleteResponse{Status: "ok"})
+	render.JSON(w, &DeleteResponse{Status: "ok"})
 }
 
 // UpdateAdmin updates an existing admin.
-func (h *Handler) UpdateAdmin(w http.ResponseWriter, r *http.Request) {
+func UpdateAdmin(w http.ResponseWriter, r *http.Request) {
 	var body UpdateAdminRequest
-	if err := api.ReadJSON(r.Body, &body); err != nil {
-		api.WriteError(w, admin.WrapError(admin.ErrorBadRequestType, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, admin.WrapError(admin.ErrorBadRequestType, err, "error reading request body"))
 		return
 	}
 
 	if err := body.Validate(); err != nil {
-		api.WriteError(w, err)
+		render.Error(w, err)
 		return
 	}
 
 	id := chi.URLParam(r, "id")
-
-	adm, err := h.auth.UpdateAdmin(r.Context(), id, &linkedca.Admin{Type: body.Type})
+	auth := mustAuthority(r.Context())
+	adm, err := auth.UpdateAdmin(r.Context(), id, &linkedca.Admin{Type: body.Type})
 	if err != nil {
-		api.WriteError(w, admin.WrapErrorISE(err, "error updating admin %s", id))
+		render.Error(w, admin.WrapErrorISE(err, "error updating admin %s", id))
 		return
 	}
 
-	api.ProtoJSON(w, adm)
+	render.ProtoJSON(w, adm)
 }

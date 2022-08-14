@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -14,11 +15,14 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/api"
-	"github.com/smallstep/certificates/authority"
-	"github.com/smallstep/certificates/errs"
+
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/randutil"
+
+	"github.com/smallstep/certificates/api"
+	"github.com/smallstep/certificates/api/render"
+	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/errs"
 )
 
 func newLocalListener() net.Listener {
@@ -50,7 +54,11 @@ func startCABootstrapServer() *httptest.Server {
 	if err != nil {
 		panic(err)
 	}
+	baseContext := buildContext(ca.auth, nil, nil, nil)
 	srv.Config.Handler = ca.srv.Handler
+	srv.Config.BaseContext = func(net.Listener) context.Context {
+		return baseContext
+	}
 	srv.TLS = ca.srv.TLSConfig
 	srv.StartTLS()
 	// Force the use of GetCertificate on IPs
@@ -79,7 +87,7 @@ func startCAServer(configFile string) (*CA, string, error) {
 func mTLSMiddleware(next http.Handler, nonAuthenticatedPaths ...string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/version" {
-			api.JSON(w, api.VersionResponse{
+			render.JSON(w, api.VersionResponse{
 				Version:                     "test",
 				RequireClientAuthentication: true,
 			})
@@ -89,11 +97,12 @@ func mTLSMiddleware(next http.Handler, nonAuthenticatedPaths ...string) http.Han
 		for _, s := range nonAuthenticatedPaths {
 			if strings.HasPrefix(r.URL.Path, s) || strings.HasPrefix(r.URL.Path, "/1.0"+s) {
 				next.ServeHTTP(w, r)
+				return
 			}
 		}
 		isMTLS := r.TLS != nil && len(r.TLS.PeerCertificates) > 0
 		if !isMTLS {
-			api.WriteError(w, errs.Unauthorized("missing peer certificate"))
+			render.Error(w, errs.Unauthorized("missing peer certificate"))
 		} else {
 			next.ServeHTTP(w, r)
 		}
@@ -366,6 +375,9 @@ func TestBootstrapClient(t *testing.T) {
 }
 
 func TestBootstrapClientServerRotation(t *testing.T) {
+	if os.Getenv("CI") == "true" {
+		t.Skipf("skip until we fix https://github.com/smallstep/certificates/issues/873")
+	}
 	reset := setMinCertDuration(1 * time.Second)
 	defer reset()
 
@@ -408,6 +420,7 @@ func TestBootstrapClientServerRotation(t *testing.T) {
 		server.ServeTLS(listener, "", "")
 	}()
 	defer server.Close()
+	time.Sleep(1 * time.Second)
 
 	// Create bootstrap client
 	token = generateBootstrapToken(caURL, "client", "ef742f95dc0d8aa82d3cca4017af6dac3fce84290344159891952d18c53eefe7")
@@ -419,7 +432,6 @@ func TestBootstrapClientServerRotation(t *testing.T) {
 
 	// doTest does a request that requires mTLS
 	doTest := func(client *http.Client) error {
-		time.Sleep(1 * time.Second)
 		// test with ca
 		resp, err := client.Post(caURL+"/renew", "application/json", http.NoBody)
 		if err != nil {

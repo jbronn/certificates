@@ -4,22 +4,106 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## [Unreleased - 0.18.1] - DATE
+### TEMPLATE -- do not alter or remove
+---
+## [x.y.z] - aaaa-bb-cc
 ### Added
-- Support for ACME revocation.
-- Replace hash function with an RSA SSH CA to "rsa-sha2-256".
 ### Changed
 ### Deprecated
 ### Removed
 ### Fixed
 ### Security
+---
+
+## [Unreleased]
+### Changed
+- Certificates signed by an issuer using an RSA key will be signed using the same algorithm as the issuer certificate was signed with. The signature will no longer default to PKCS #1. For example, if the issuer certificate was signed using RSA-PSS with SHA-256, a new certificate will also be signed using RSA-PSS with SHA-256.
+
+## [0.20.0] - 2022-05-26
+### Added
+- Added Kubernetes auth method for Vault RAs.
+- Added support for reporting provisioners to linkedca.
+- Added support for certificate policies on authority level.
+- Added a Dockerfile with a step-ca build with HSM support.
+- A few new WithXX methods for instantiating authorities
+### Changed
+- Context usage in HTTP APIs.
+- Changed authentication for Vault RAs.
+- Error message returned to client when authenticating with expired certificate.
+- Strip padding from ACME CSRs.
+### Deprecated
+- HTTP API handler types.
+### Fixed
+- Fixed SSH revocation.
+- CA client dial context for js/wasm target.
+- Incomplete `extraNames` support in templates.
+- SCEP GET request support.
+- Large SCEP request handling.
+
+## [0.19.0] - 2022-04-19
+### Added
+- Added support for certificate renewals after expiry using the claim `allowRenewalAfterExpiry`.
+- Added support for `extraNames` in X.509 templates.
+- Added `armv5` builds.
+- Added RA support using a Vault instance as the CA.
+- Added `WithX509SignerFunc` authority option.
+- Added a new `/roots.pem` endpoint to download the CA roots in PEM format.
+- Added support for Azure `Managed Identity` tokens.
+- Added support for automatic configuration of linked RAs.
+- Added support for the `--context` flag. It's now possible to start the 
+  CA with `step-ca --context=abc` to use the configuration from context `abc`.
+  When a context has been configured and no configuration file is provided
+  on startup, the configuration for the current context is used.
+- Added startup info logging and option to skip it (`--quiet`).
+- Added support for renaming the CA (Common Name).
+### Changed
+- Made SCEP CA URL paths dynamic.
+- Support two latest versions of Go (1.17, 1.18).
+- Upgrade go.step.sm/crypto to v0.16.1.
+- Upgrade go.step.sm/linkedca to v0.15.0.
+### Deprecated
+- Go 1.16 support.
+### Removed
+### Fixed
+- Fixed admin credentials on RAs.
+- Fixed ACME HTTP-01 challenges for IPv6 identifiers.
+- Various improvements under the hood.
+### Security
+
+## [0.18.2] - 2022-03-01
+### Added
+- Added `subscriptionIDs` and `objectIDs` filters to the Azure provisioner.
+- [NoSQL](https://github.com/smallstep/nosql/pull/21) package allows filtering
+  out database drivers using Go tags. For example, using the Go flag
+  `--tags=nobadger,nobbolt,nomysql` will only compile `step-ca` with the pgx
+  driver for PostgreSQL.
+### Changed
+- IPv6 addresses are normalized as IP addresses instead of hostnames.
+- More descriptive JWK decryption error message.
+- Make the X5C leaf certificate available to the templates using `{{ .AuthorizationCrt }}`.
+### Fixed
+- During provisioner add - validate provisioner configuration before storing to DB.
+
+## [0.18.1] - 2022-02-03
+### Added
+- Support for ACME revocation.
+- Replace hash function with an RSA SSH CA to "rsa-sha2-256".
+- Support Nebula provisioners.
+- Example Ansible configurations.
+- Support PKCS#11 as a decrypter, as used by SCEP.
+### Changed
+- Automatically create database directory on `step ca init`.
+- Slightly improve errors reported when a template has invalid content.
+- Error reporting in logs and to clients.
+### Fixed
+- SCEP renewal using HTTPS on macOS.
 
 ## [0.18.0] - 2021-11-17
 ### Added
 - Support for multiple certificate authority contexts.
 - Support for generating extractable keys and certificates on a pkcs#11 module.
 ### Changed
-- Support two latest versions of golang (1.16, 1.17)
+- Support two latest versions of Go (1.16, 1.17)
 ### Deprecated
 - go 1.15 support
 

@@ -3,13 +3,10 @@ package admin
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
-	"os"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/certificates/logging"
+	"github.com/smallstep/certificates/api/render"
 )
 
 // ProblemType is the type of the Admin problem.
@@ -27,10 +24,12 @@ const (
 	ErrorBadRequestType
 	// ErrorNotImplementedType not implemented.
 	ErrorNotImplementedType
-	// ErrorUnauthorizedType internal server error.
+	// ErrorUnauthorizedType unauthorized.
 	ErrorUnauthorizedType
 	// ErrorServerInternalType internal server error.
 	ErrorServerInternalType
+	// ErrorConflictType conflict.
+	ErrorConflictType
 )
 
 // String returns the string representation of the admin problem type,
@@ -51,6 +50,8 @@ func (ap ProblemType) String() string {
 		return "unauthorized"
 	case ErrorServerInternalType:
 		return "internalServerError"
+	case ErrorConflictType:
+		return "conflict"
 	default:
 		return fmt.Sprintf("unsupported error type '%d'", int(ap))
 	}
@@ -67,7 +68,7 @@ var (
 	errorServerInternalMetadata = errorMetadata{
 		typ:     ErrorServerInternalType.String(),
 		details: "the server experienced an internal error",
-		status:  500,
+		status:  http.StatusInternalServerError,
 	}
 	errorMap = map[ProblemType]errorMetadata{
 		ErrorNotFoundType: {
@@ -101,6 +102,11 @@ var (
 			status:  http.StatusUnauthorized,
 		},
 		ErrorServerInternalType: errorServerInternalMetadata,
+		ErrorConflictType: {
+			typ:     ErrorConflictType.String(),
+			details: "conflict",
+			status:  http.StatusConflict,
+		},
 	}
 )
 
@@ -197,27 +203,9 @@ func (e *Error) ToLog() (interface{}, error) {
 	return string(b), nil
 }
 
-// WriteError writes to w a JSON representation of the given error.
-func WriteError(w http.ResponseWriter, err *Error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(err.StatusCode())
+// Render implements render.RenderableError for Error.
+func (e *Error) Render(w http.ResponseWriter) {
+	e.Message = e.Err.Error()
 
-	err.Message = err.Err.Error()
-	// Write errors in the response writer
-	if rl, ok := w.(logging.ResponseLogger); ok {
-		rl.WithFields(map[string]interface{}{
-			"error": err.Err,
-		})
-		if os.Getenv("STEPDEBUG") == "1" {
-			if e, ok := err.Err.(errs.StackTracer); ok {
-				rl.WithFields(map[string]interface{}{
-					"stack-trace": fmt.Sprintf("%+v", e),
-				})
-			}
-		}
-	}
-
-	if err := json.NewEncoder(w).Encode(err); err != nil {
-		log.Println(err)
-	}
+	render.JSONStatus(w, e, e.StatusCode())
 }

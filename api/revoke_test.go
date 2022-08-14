@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/pkg/errors"
+
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
@@ -107,7 +108,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusOK,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
@@ -151,7 +152,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				statusCode: http.StatusOK,
 				tls:        cs,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, ri *authority.RevokeOptions) error {
@@ -186,7 +187,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusInternalServerError,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
@@ -208,7 +209,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 				input:      string(input),
 				statusCode: http.StatusForbidden,
 				auth: &mockAuthority{
-					authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 						return nil, nil
 					},
 					revoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
@@ -222,13 +223,13 @@ func Test_caHandler_Revoke(t *testing.T) {
 	for name, _tc := range tests {
 		tc := _tc(t)
 		t.Run(name, func(t *testing.T) {
-			h := New(tc.auth).(*caHandler)
+			mockMustAuthority(t, tc.auth)
 			req := httptest.NewRequest("POST", "http://example.com/revoke", strings.NewReader(tc.input))
 			if tc.tls != nil {
 				req.TLS = tc.tls
 			}
 			w := httptest.NewRecorder()
-			h.Revoke(logging.NewResponseLogger(w), req)
+			Revoke(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			assert.Equals(t, tc.statusCode, res.StatusCode)
