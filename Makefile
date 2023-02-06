@@ -1,13 +1,5 @@
 PKG?=github.com/smallstep/certificates/cmd/step-ca
 BINNAME?=step-ca
-CLOUDKMS_BINNAME?=step-cloudkms-init
-CLOUDKMS_PKG?=github.com/smallstep/certificates/cmd/step-cloudkms-init
-AWSKMS_BINNAME?=step-awskms-init
-AWSKMS_PKG?=github.com/smallstep/certificates/cmd/step-awskms-init
-YUBIKEY_BINNAME?=step-yubikey-init
-YUBIKEY_PKG?=github.com/smallstep/certificates/cmd/step-yubikey-init
-PKCS11_BINNAME?=step-pkcs11-init
-PKCS11_PKG?=github.com/smallstep/certificates/cmd/step-pkcs11-init
 
 # Set V to 1 for verbose output from the Makefile
 Q=$(if $V,,@)
@@ -28,8 +20,9 @@ ci: testcgo build
 #########################################
 
 bootstra%:
-	# Using a released version of golangci-lint to take into account custom replacements in their go.mod
-	$Q curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell go env GOPATH)/bin v1.42.0
+	$Q curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin latest
+	$Q go install golang.org/x/vuln/cmd/govulncheck@latest
+	$Q go install gotest.tools/gotestsum@latest
 
 .PHONY: bootstra%
 
@@ -78,8 +71,6 @@ $(info    DEB_VERSION is $(DEB_VERSION))
 $(info    PUSHTYPE is $(PUSHTYPE))
 endif
 
-include make/docker.mk
-
 #########################################
 # Build
 #########################################
@@ -91,28 +82,12 @@ GOFLAGS := CGO_ENABLED=0
 download:
 	$Q go mod download
 
-build: $(PREFIX)bin/$(BINNAME) $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(PREFIX)bin/$(AWSKMS_BINNAME) $(PREFIX)bin/$(YUBIKEY_BINNAME) $(PREFIX)bin/$(PKCS11_BINNAME)
+build: $(PREFIX)bin/$(BINNAME)
 	@echo "Build Complete!"
 
 $(PREFIX)bin/$(BINNAME): download $(call rwildcard,*.go)
 	$Q mkdir -p $(@D)
 	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(BINNAME) $(LDFLAGS) $(PKG)
-
-$(PREFIX)bin/$(CLOUDKMS_BINNAME): download $(call rwildcard,*.go)
-	$Q mkdir -p $(@D)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(LDFLAGS) $(CLOUDKMS_PKG)
-
-$(PREFIX)bin/$(AWSKMS_BINNAME): download $(call rwildcard,*.go)
-	$Q mkdir -p $(@D)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(AWSKMS_BINNAME) $(LDFLAGS) $(AWSKMS_PKG)
-
-$(PREFIX)bin/$(YUBIKEY_BINNAME): download $(call rwildcard,*.go)
-	$Q mkdir -p $(@D)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(YUBIKEY_BINNAME) $(LDFLAGS) $(YUBIKEY_PKG)
-
-$(PREFIX)bin/$(PKCS11_BINNAME): download $(call rwildcard,*.go)
-	$Q mkdir -p $(@D)
-	$Q $(GOOS_OVERRIDE) $(GOFLAGS) go build -v -o $(PREFIX)bin/$(PKCS11_BINNAME) $(LDFLAGS) $(PKCS11_PKG)
 
 # Target to force a build of step-ca without running tests
 simple: build
@@ -132,17 +107,17 @@ generate:
 # Test
 #########################################
 test:
-	$Q $(GOFLAGS) go test -short -coverprofile=coverage.out ./...
+	$Q $(GOFLAGS) gotestsum -- -coverprofile=coverage.out -short -covermode=atomic ./...
 
 testcgo:
-	$Q go test -short -coverprofile=coverage.out ./...
+	$Q gotestsum -- -coverprofile=coverage.out -short -covermode=atomic ./...
 
 .PHONY: test testcgo
 
 integrate: integration
 
 integration: bin/$(BINNAME)
-	$Q $(GOFLAGS) go test -tags=integration ./integration/...
+	$Q $(GOFLAGS) gotestsum -- -tags=integration ./integration/...
 
 .PHONY: integrate integration
 
@@ -151,15 +126,14 @@ integration: bin/$(BINNAME)
 #########################################
 
 fmt:
-	$Q gofmt -l -s -w $(SRC)
+	$Q goimports -l -w $(SRC)
 
+lint: SHELL:=/bin/bash
 lint:
-	$Q golangci-lint run --timeout=30m
+	$Q LOG_LEVEL=error golangci-lint run --config <(curl -s https://raw.githubusercontent.com/smallstep/workflows/master/.golangci.yml) --timeout=30m
+	$Q govulncheck ./...
 
-lintcgo:
-	$Q LOG_LEVEL=error golangci-lint run --timeout=30m
-
-.PHONY: fmt lint lintcgo
+.PHONY: fmt lint
 
 #########################################
 # Install
@@ -167,15 +141,11 @@ lintcgo:
 
 INSTALL_PREFIX?=/usr/
 
-install: $(PREFIX)bin/$(BINNAME) $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(PREFIX)bin/$(AWSKMS_BINNAME)
+install: $(PREFIX)bin/$(BINNAME)
 	$Q install -D $(PREFIX)bin/$(BINNAME) $(DESTDIR)$(INSTALL_PREFIX)bin/$(BINNAME)
-	$Q install -D $(PREFIX)bin/$(CLOUDKMS_BINNAME) $(DESTDIR)$(INSTALL_PREFIX)bin/$(CLOUDKMS_BINNAME)
-	$Q install -D $(PREFIX)bin/$(AWSKMS_BINNAME) $(DESTDIR)$(INSTALL_PREFIX)bin/$(AWSKMS_BINNAME)
 
 uninstall:
 	$Q rm -f $(DESTDIR)$(INSTALL_PREFIX)/bin/$(BINNAME)
-	$Q rm -f $(DESTDIR)$(INSTALL_PREFIX)/bin/$(CLOUDKMS_BINNAME)
-	$Q rm -f $(DESTDIR)$(INSTALL_PREFIX)/bin/$(AWSKMS_BINNAME)
 
 .PHONY: install uninstall
 
@@ -186,18 +156,6 @@ uninstall:
 clean:
 ifneq ($(BINNAME),"")
 	$Q rm -f bin/$(BINNAME)
-endif
-ifneq ($(CLOUDKMS_BINNAME),"")
-	$Q rm -f bin/$(CLOUDKMS_BINNAME)
-endif
-ifneq ($(AWSKMS_BINNAME),"")
-	$Q rm -f bin/$(AWSKMS_BINNAME)
-endif
-ifneq ($(YUBIKEY_BINNAME),"")
-	$Q rm -f bin/$(YUBIKEY_BINNAME)
-endif
-ifneq ($(PKCS11_BINNAME),"")
-	$Q rm -f bin/$(PKCS11_BINNAME)
 endif
 
 .PHONY: clean
@@ -231,11 +189,3 @@ debian: changelog
 distclean: clean
 
 .PHONY: changelog debian distclean
-
-#################################################
-# Targets for creating step artifacts
-#################################################
-
-docker-artifacts: docker-$(PUSHTYPE)
-
-.PHONY: docker-artifacts

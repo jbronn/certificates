@@ -16,6 +16,7 @@ import (
 	"go.step.sm/crypto/jose"
 	"go.step.sm/crypto/sshutil"
 	"go.step.sm/crypto/x509util"
+	"go.step.sm/linkedca"
 
 	"github.com/smallstep/certificates/errs"
 )
@@ -356,6 +357,8 @@ func (o *OIDC) AuthorizeSign(ctx context.Context, token string) ([]SignOption, e
 		defaultPublicKeyValidator{},
 		newValidityValidator(o.ctl.Claimer.MinTLSCertDuration(), o.ctl.Claimer.MaxTLSCertDuration()),
 		newX509NamePolicyValidator(o.ctl.getPolicy().getX509()),
+		// webhooks
+		o.ctl.newWebhookController(data, linkedca.Webhook_X509),
 	}, nil
 }
 
@@ -376,31 +379,41 @@ func (o *OIDC) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption
 	if err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "oidc.AuthorizeSSHSign")
 	}
-	// Enforce an email claim
+
+	if claims.Subject == "" {
+		return nil, errs.Unauthorized("oidc.AuthorizeSSHSign: failed to validate oidc token payload: subject not found")
+	}
+
+	var data sshutil.TemplateData
 	if claims.Email == "" {
-		return nil, errs.Unauthorized("oidc.AuthorizeSSHSign: failed to validate oidc token payload: email not found")
-	}
+		// If email is empty, use the Subject claim instead to create minimal
+		// data for the template to use.
+		data = sshutil.CreateTemplateData(sshutil.UserCert, claims.Subject, nil)
+		if v, err := unsafeParseSigned(token); err == nil {
+			data.SetToken(v)
+		}
+	} else {
+		// Get the identity using either the default identityFunc or one injected
+		// externally. Note that the PreferredUsername might be empty.
+		// TBD: Would preferred_username present a safety issue here?
+		iden, err := o.ctl.GetIdentity(ctx, claims.Email)
+		if err != nil {
+			return nil, errs.Wrap(http.StatusInternalServerError, err, "oidc.AuthorizeSSHSign")
+		}
 
-	// Get the identity using either the default identityFunc or one injected
-	// externally. Note that the PreferredUsername might be empty.
-	// TBD: Would preferred_username present a safety issue here?
-	iden, err := o.ctl.GetIdentity(ctx, claims.Email)
-	if err != nil {
-		return nil, errs.Wrap(http.StatusInternalServerError, err, "oidc.AuthorizeSSHSign")
-	}
-
-	// Certificate templates.
-	data := sshutil.CreateTemplateData(sshutil.UserCert, claims.Email, iden.Usernames)
-	if v, err := unsafeParseSigned(token); err == nil {
-		data.SetToken(v)
-	}
-	// Add custom extensions added in the identity function.
-	for k, v := range iden.Permissions.Extensions {
-		data.AddExtension(k, v)
-	}
-	// Add custom critical options added in the identity function.
-	for k, v := range iden.Permissions.CriticalOptions {
-		data.AddCriticalOption(k, v)
+		// Certificate templates.
+		data = sshutil.CreateTemplateData(sshutil.UserCert, claims.Email, iden.Usernames)
+		if v, err := unsafeParseSigned(token); err == nil {
+			data.SetToken(v)
+		}
+		// Add custom extensions added in the identity function.
+		for k, v := range iden.Permissions.Extensions {
+			data.AddExtension(k, v)
+		}
+		// Add custom critical options added in the identity function.
+		for k, v := range iden.Permissions.CriticalOptions {
+			data.AddCriticalOption(k, v)
+		}
 	}
 
 	// Use the default template unless no-templates are configured and email is
@@ -428,8 +441,7 @@ func (o *OIDC) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption
 		})
 	} else {
 		signOptions = append(signOptions, sshCertOptionsValidator(SignSSHOptions{
-			CertType:   SSHUserCert,
-			Principals: iden.Usernames,
+			CertType: SSHUserCert,
 		}))
 	}
 
@@ -445,6 +457,8 @@ func (o *OIDC) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption
 		&sshCertDefaultValidator{},
 		// Ensure that all principal names are allowed
 		newSSHNamePolicyValidator(o.ctl.getPolicy().getSSHHost(), o.ctl.getPolicy().getSSHUser()),
+		// Call webhooks
+		o.ctl.newWebhookController(data, linkedca.Webhook_SSH),
 	), nil
 }
 
@@ -464,7 +478,7 @@ func (o *OIDC) AuthorizeSSHRevoke(ctx context.Context, token string) error {
 }
 
 func getAndDecode(uri string, v interface{}) error {
-	resp, err := http.Get(uri) // nolint:gosec // openid-configuration uri
+	resp, err := http.Get(uri) //nolint:gosec // openid-configuration uri
 	if err != nil {
 		return errors.Wrapf(err, "failed to connect to %s", uri)
 	}

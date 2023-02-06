@@ -247,8 +247,8 @@ func TestOIDC_authorizeToken(t *testing.T) {
 				return
 			}
 			if err != nil {
-				sc, ok := err.(render.StatusCodedError)
-				assert.Fatal(t, ok, "error does not implement StatusCodedError interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 				assert.Nil(t, got)
 			} else {
@@ -318,12 +318,12 @@ func TestOIDC_AuthorizeSign(t *testing.T) {
 				return
 			}
 			if err != nil {
-				sc, ok := err.(render.StatusCodedError)
-				assert.Fatal(t, ok, "error does not implement StatusCodedError interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 				assert.Nil(t, got)
 			} else if assert.NotNil(t, got) {
-				assert.Equals(t, 7, len(got))
+				assert.Equals(t, 8, len(got))
 				for _, o := range got {
 					switch v := o.(type) {
 					case *OIDC:
@@ -343,6 +343,8 @@ func TestOIDC_AuthorizeSign(t *testing.T) {
 						assert.Equals(t, string(v), "name@smallstep.com")
 					case *x509NamePolicyValidator:
 						assert.Equals(t, nil, v.policyEngine)
+					case *WebhookController:
+						assert.Len(t, 0, v.webhooks)
 					default:
 						assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 					}
@@ -406,8 +408,8 @@ func TestOIDC_AuthorizeRevoke(t *testing.T) {
 				t.Errorf("OIDC.Authorize() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			} else if err != nil {
-				sc, ok := err.(render.StatusCodedError)
-				assert.Fatal(t, ok, "error does not implement StatusCodedError interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 			}
 		})
@@ -452,8 +454,8 @@ func TestOIDC_AuthorizeRenew(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("OIDC.AuthorizeRenew() error = %v, wantErr %v", err, tt.wantErr)
 			} else if err != nil {
-				sc, ok := err.(render.StatusCodedError)
-				assert.Fatal(t, ok, "error does not implement StatusCodedError interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 			}
 		})
@@ -523,7 +525,12 @@ func TestOIDC_AuthorizeSSHSign(t *testing.T) {
 	okAdmin, err := generateOIDCToken("subject", "the-issuer", p3.ClientID, "root@example.com", "", time.Now(), &keys.Keys[0])
 	assert.FatalError(t, err)
 	// Empty email
-	failEmail, err := generateToken("subject", "the-issuer", p3.ClientID, "", []string{}, time.Now(), &keys.Keys[0])
+	emptyEmail, err := generateToken("subject", "the-issuer", p1.ClientID, "", []string{}, time.Now(), &keys.Keys[0])
+	expectemptyEmailOptions := &SignSSHOptions{
+		CertType:   "user",
+		Principals: []string{},
+		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(p1.ctl.Claimer.DefaultUserSSHCertDuration())),
+	}
 	assert.FatalError(t, err)
 
 	key, err := generateJSONWebKey()
@@ -535,7 +542,7 @@ func TestOIDC_AuthorizeSSHSign(t *testing.T) {
 	pub := key.Public().Key
 	rsa2048, err := rsa.GenerateKey(rand.Reader, 2048)
 	assert.FatalError(t, err)
-	// nolint:gosec // tests minimum size of the key
+	//nolint:gosec // tests minimum size of the key
 	rsa1024, err := rsa.GenerateKey(rand.Reader, 1024)
 	assert.FatalError(t, err)
 
@@ -571,7 +578,11 @@ func TestOIDC_AuthorizeSSHSign(t *testing.T) {
 		{"ok", p1, args{t1, SignSSHOptions{}, pub}, expectedUserOptions, http.StatusOK, false, false},
 		{"ok-rsa2048", p1, args{t1, SignSSHOptions{}, rsa2048.Public()}, expectedUserOptions, http.StatusOK, false, false},
 		{"ok-user", p1, args{t1, SignSSHOptions{CertType: "user"}, pub}, expectedUserOptions, http.StatusOK, false, false},
+		{"ok-empty-email", p1, args{emptyEmail, SignSSHOptions{CertType: "user"}, pub}, expectemptyEmailOptions, http.StatusOK, false, false},
 		{"ok-principals", p1, args{t1, SignSSHOptions{Principals: []string{"name"}}, pub},
+			&SignSSHOptions{CertType: "user", Principals: []string{"name", "name@smallstep.com"},
+				ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(userDuration))}, http.StatusOK, false, false},
+		{"ok-principals-ignore-passed", p1, args{t1, SignSSHOptions{Principals: []string{"root"}}, pub},
 			&SignSSHOptions{CertType: "user", Principals: []string{"name", "name@smallstep.com"},
 				ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(userDuration))}, http.StatusOK, false, false},
 		{"ok-principals-getIdentity", p4, args{okGetIdentityToken, SignSSHOptions{Principals: []string{"mariano"}}, pub},
@@ -592,8 +603,6 @@ func TestOIDC_AuthorizeSSHSign(t *testing.T) {
 				ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(userDuration))}, http.StatusOK, false, false},
 		{"fail-rsa1024", p1, args{t1, SignSSHOptions{}, rsa1024.Public()}, expectedUserOptions, http.StatusOK, false, true},
 		{"fail-user-host", p1, args{t1, SignSSHOptions{CertType: "host"}, pub}, nil, http.StatusOK, false, true},
-		{"fail-user-principals", p1, args{t1, SignSSHOptions{Principals: []string{"root"}}, pub}, nil, http.StatusOK, false, true},
-		{"fail-email", p3, args{failEmail, SignSSHOptions{}, pub}, nil, http.StatusUnauthorized, true, false},
 		{"fail-getIdentity", p5, args{failGetIdentityToken, SignSSHOptions{}, pub}, nil, http.StatusInternalServerError, true, false},
 		{"fail-sshCA-disabled", p6, args{"foo", SignSSHOptions{}, pub}, nil, http.StatusUnauthorized, true, false},
 		// Missing parametrs
@@ -609,8 +618,8 @@ func TestOIDC_AuthorizeSSHSign(t *testing.T) {
 				return
 			}
 			if err != nil {
-				sc, ok := err.(render.StatusCodedError)
-				assert.Fatal(t, ok, "error does not implement StatusCodedError interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 				assert.Nil(t, got)
 			} else if assert.NotNil(t, got) {
@@ -677,8 +686,8 @@ func TestOIDC_AuthorizeSSHRevoke(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("OIDC.AuthorizeSSHRevoke() error = %v, wantErr %v", err, tt.wantErr)
 			} else if err != nil {
-				sc, ok := err.(render.StatusCodedError)
-				assert.Fatal(t, ok, "error does not implement StatusCodedError interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 			}
 		})

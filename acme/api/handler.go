@@ -205,7 +205,7 @@ type Directory struct {
 	NewOrder   string `json:"newOrder"`
 	RevokeCert string `json:"revokeCert"`
 	KeyChange  string `json:"keyChange"`
-	Meta       Meta   `json:"meta"`
+	Meta       *Meta  `json:"meta,omitempty"`
 }
 
 // ToLog enables response logging for the Directory type.
@@ -228,16 +228,47 @@ func GetDirectory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	linker := acme.MustLinkerFromContext(ctx)
+
 	render.JSON(w, &Directory{
 		NewNonce:   linker.GetLink(ctx, acme.NewNonceLinkType),
 		NewAccount: linker.GetLink(ctx, acme.NewAccountLinkType),
 		NewOrder:   linker.GetLink(ctx, acme.NewOrderLinkType),
 		RevokeCert: linker.GetLink(ctx, acme.RevokeCertLinkType),
 		KeyChange:  linker.GetLink(ctx, acme.KeyChangeLinkType),
-		Meta: Meta{
-			ExternalAccountRequired: acmeProv.RequireEAB,
-		},
+		Meta:       createMetaObject(acmeProv),
 	})
+}
+
+// createMetaObject creates a Meta object if the ACME provisioner
+// has one or more properties that are written in the ACME directory output.
+// It returns nil if none of the properties are set.
+func createMetaObject(p *provisioner.ACME) *Meta {
+	if shouldAddMetaObject(p) {
+		return &Meta{
+			TermsOfService:          p.TermsOfService,
+			Website:                 p.Website,
+			CaaIdentities:           p.CaaIdentities,
+			ExternalAccountRequired: p.RequireEAB,
+		}
+	}
+	return nil
+}
+
+// shouldAddMetaObject returns whether or not the ACME provisioner
+// has properties configured that must be added to the ACME directory object.
+func shouldAddMetaObject(p *provisioner.ACME) bool {
+	switch {
+	case p.TermsOfService != "":
+		return true
+	case p.Website != "":
+		return true
+	case len(p.CaaIdentities) > 0:
+		return true
+	case p.RequireEAB:
+		return true
+	default:
+		return false
+	}
 }
 
 // NotImplemented returns a 501 and is generally a placeholder for functionality which
@@ -289,19 +320,18 @@ func GetChallenge(w http.ResponseWriter, r *http.Request) {
 		render.Error(w, err)
 		return
 	}
-	// Just verify that the payload was set, since we're not strictly adhering
-	// to ACME V2 spec for reasons specified below.
-	_, err = payloadFromContext(ctx)
+
+	payload, err := payloadFromContext(ctx)
 	if err != nil {
 		render.Error(w, err)
 		return
 	}
 
-	// NOTE: We should be checking ^^^ that the request is either a POST-as-GET, or
-	// that the payload is an empty JSON block ({}). However, older ACME clients
-	// still send a vestigial body (rather than an empty JSON block) and
-	// strict enforcement would render these clients broken. For the time being
-	// we'll just ignore the body.
+	// NOTE: We should be checking that the request is either a POST-as-GET, or
+	// that for all challenges except for device-attest-01, the payload is an
+	// empty JSON block ({}). However, older ACME clients still send a vestigial
+	// body (rather than an empty JSON block) and strict enforcement would
+	// render these clients broken.
 
 	azID := chi.URLParam(r, "authzID")
 	ch, err := db.GetChallenge(ctx, chi.URLParam(r, "chID"), azID)
@@ -320,7 +350,7 @@ func GetChallenge(w http.ResponseWriter, r *http.Request) {
 		render.Error(w, err)
 		return
 	}
-	if err = ch.Validate(ctx, db, jwk); err != nil {
+	if err = ch.Validate(ctx, db, jwk, payload.value); err != nil {
 		render.Error(w, acme.WrapErrorISE(err, "error validating challenge"))
 		return
 	}
@@ -364,6 +394,6 @@ func GetCertificate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	api.LogCertificate(w, cert.Leaf)
-	w.Header().Set("Content-Type", "application/pem-certificate-chain; charset=utf-8")
+	w.Header().Set("Content-Type", "application/pem-certificate-chain")
 	w.Write(certBytes)
 }

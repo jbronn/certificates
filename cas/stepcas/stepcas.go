@@ -43,7 +43,7 @@ func New(ctx context.Context, opts apiv1.Options) (*StepCAS, error) {
 	}
 
 	// Create client.
-	client, err := ca.NewClient(opts.CertificateAuthority, ca.WithRootSHA256(opts.CertificateAuthorityFingerprint))
+	client, err := ca.NewClient(opts.CertificateAuthority, ca.WithRootSHA256(opts.CertificateAuthorityFingerprint)) //nolint:contextcheck // deeply nested context
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +52,7 @@ func New(ctx context.Context, opts apiv1.Options) (*StepCAS, error) {
 	// Create configured issuer unless we only want to use GetCertificateAuthority.
 	// This avoid the request for the password if not provided.
 	if !opts.IsCAGetter {
-		if iss, err = newStepIssuer(caURL, client, opts.CertificateIssuer); err != nil {
+		if iss, err = newStepIssuer(ctx, caURL, client, opts.CertificateIssuer); err != nil {
 			return nil, err
 		}
 	}
@@ -101,7 +101,25 @@ func (s *StepCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*apiv1
 // RenewCertificate will always return a non-implemented error as mTLS renewals
 // are not supported yet.
 func (s *StepCAS) RenewCertificate(req *apiv1.RenewCertificateRequest) (*apiv1.RenewCertificateResponse, error) {
-	return nil, apiv1.ErrNotImplemented{Message: "stepCAS does not support mTLS renewals"}
+	if req.Token == "" {
+		return nil, apiv1.ValidationError{Message: "renewCertificateRequest `token` cannot be empty"}
+	}
+
+	resp, err := s.client.RenewWithToken(req.Token)
+	if err != nil {
+		return nil, err
+	}
+
+	var chain []*x509.Certificate
+	cert := resp.CertChainPEM[0].Certificate
+	for _, c := range resp.CertChainPEM[1:] {
+		chain = append(chain, c.Certificate)
+	}
+
+	return &apiv1.RenewCertificateResponse{
+		Certificate:      cert,
+		CertificateChain: chain,
+	}, nil
 }
 
 // RevokeCertificate revokes a certificate.

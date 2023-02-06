@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/url"
 	"reflect"
@@ -247,14 +249,14 @@ func TestOrder_UpdateStatus(t *testing.T) {
 			tc := run(t)
 			if err := tc.o.UpdateStatus(context.Background(), tc.db); err != nil {
 				if assert.NotNil(t, tc.err) {
-					switch k := err.(type) {
-					case *Error:
+					var k *Error
+					if errors.As(err, &k) {
 						assert.Equals(t, k.Type, tc.err.Type)
 						assert.Equals(t, k.Detail, tc.err.Detail)
 						assert.Equals(t, k.Status, tc.err.Status)
 						assert.Equals(t, k.Err.Error(), tc.err.Err.Error())
 						assert.Equals(t, k.Detail, tc.err.Detail)
-					default:
+					} else {
 						assert.FatalError(t, errors.New("unexpected error type"))
 					}
 				}
@@ -384,6 +386,41 @@ func TestOrder_Finalize(t *testing.T) {
 			return test{
 				o:   o,
 				err: NewErrorISE("unrecognized order status: %s", o.Status),
+			}
+		},
+		"fail/non-matching-permanent-identifier-common-name": func(t *testing.T) test {
+			now := clock.Now()
+			o := &Order{
+				ID:               "oID",
+				AccountID:        "accID",
+				Status:           StatusReady,
+				ExpiresAt:        now.Add(5 * time.Minute),
+				AuthorizationIDs: []string{"a", "b"},
+				Identifiers: []Identifier{
+					{Type: "permanent-identifier", Value: "a-permanent-identifier"},
+				},
+			}
+			csr := &x509.CertificateRequest{
+				Subject: pkix.Name{
+					CommonName: "a-different-identifier",
+				},
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 8, 3},
+						Value: []byte("a-permanent-identifier"),
+					},
+				},
+			}
+			return test{
+				o:   o,
+				csr: csr,
+				err: &Error{
+					Type:   "urn:ietf:params:acme:error:badCSR",
+					Detail: "The CSR is unacceptable",
+					Status: 400,
+					Err: fmt.Errorf("CSR Subject Common Name does not match identifiers exactly: "+
+						"CSR Subject Common Name = %s, Order Permanent Identifier = %s", csr.Subject.CommonName, "a-permanent-identifier"),
+				},
 			}
 		},
 		"fail/error-provisioner-auth": func(t *testing.T) test {
@@ -617,6 +654,165 @@ func TestOrder_Finalize(t *testing.T) {
 				err: NewErrorISE("error updating order oID: force"),
 			}
 		},
+		"ok/permanent-identifier": func(t *testing.T) test {
+			now := clock.Now()
+			o := &Order{
+				ID:               "oID",
+				AccountID:        "accID",
+				Status:           StatusReady,
+				ExpiresAt:        now.Add(5 * time.Minute),
+				AuthorizationIDs: []string{"a", "b"},
+				Identifiers: []Identifier{
+					{Type: "permanent-identifier", Value: "a-permanent-identifier"},
+				},
+			}
+			csr := &x509.CertificateRequest{
+				Subject: pkix.Name{
+					CommonName: "a-permanent-identifier",
+				},
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 8, 3},
+						Value: []byte("a-permanent-identifier"),
+					},
+				},
+			}
+
+			leaf := &x509.Certificate{
+				Subject: pkix.Name{CommonName: "a-permanent-identifier"},
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 8, 3},
+						Value: []byte("a-permanent-identifier"),
+					},
+				},
+			}
+			inter := &x509.Certificate{Subject: pkix.Name{CommonName: "inter"}}
+			root := &x509.Certificate{Subject: pkix.Name{CommonName: "root"}}
+
+			return test{
+				o:   o,
+				csr: csr,
+				prov: &MockProvisioner{
+					MauthorizeSign: func(ctx context.Context, token string) ([]provisioner.SignOption, error) {
+						assert.Equals(t, token, "")
+						return nil, nil
+					},
+					MgetOptions: func() *provisioner.Options {
+						return nil
+					},
+				},
+				ca: &mockSignAuth{
+					sign: func(_csr *x509.CertificateRequest, signOpts provisioner.SignOptions, extraOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
+						assert.Equals(t, _csr, csr)
+						return []*x509.Certificate{leaf, inter, root}, nil
+					},
+				},
+				db: &MockDB{
+					MockCreateCertificate: func(ctx context.Context, cert *Certificate) error {
+						cert.ID = "certID"
+						assert.Equals(t, cert.AccountID, o.AccountID)
+						assert.Equals(t, cert.OrderID, o.ID)
+						assert.Equals(t, cert.Leaf, leaf)
+						assert.Equals(t, cert.Intermediates, []*x509.Certificate{inter, root})
+						return nil
+					},
+					MockUpdateOrder: func(ctx context.Context, updo *Order) error {
+						assert.Equals(t, updo.CertificateID, "certID")
+						assert.Equals(t, updo.Status, StatusValid)
+						assert.Equals(t, updo.ID, o.ID)
+						assert.Equals(t, updo.AccountID, o.AccountID)
+						assert.Equals(t, updo.ExpiresAt, o.ExpiresAt)
+						assert.Equals(t, updo.AuthorizationIDs, o.AuthorizationIDs)
+						assert.Equals(t, updo.Identifiers, o.Identifiers)
+						return nil
+					},
+				},
+			}
+		},
+		"ok/permanent-identifier-only": func(t *testing.T) test {
+			now := clock.Now()
+			o := &Order{
+				ID:               "oID",
+				AccountID:        "accID",
+				Status:           StatusReady,
+				ExpiresAt:        now.Add(5 * time.Minute),
+				AuthorizationIDs: []string{"a", "b"},
+				Identifiers: []Identifier{
+					{Type: "dns", Value: "foo.internal"},
+					{Type: "permanent-identifier", Value: "a-permanent-identifier"},
+				},
+			}
+			csr := &x509.CertificateRequest{
+				Subject: pkix.Name{
+					CommonName: "a-permanent-identifier",
+				},
+				DNSNames: []string{"foo.internal"},
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 8, 3},
+						Value: []byte("a-permanent-identifier"),
+					},
+				},
+			}
+
+			leaf := &x509.Certificate{
+				Subject: pkix.Name{CommonName: "a-permanent-identifier"},
+				ExtraExtensions: []pkix.Extension{
+					{
+						Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 8, 3},
+						Value: []byte("a-permanent-identifier"),
+					},
+				},
+			}
+			inter := &x509.Certificate{Subject: pkix.Name{CommonName: "inter"}}
+			root := &x509.Certificate{Subject: pkix.Name{CommonName: "root"}}
+
+			return test{
+				o:   o,
+				csr: csr,
+				prov: &MockProvisioner{
+					MauthorizeSign: func(ctx context.Context, token string) ([]provisioner.SignOption, error) {
+						assert.Equals(t, token, "")
+						return nil, nil
+					},
+					MgetOptions: func() *provisioner.Options {
+						return nil
+					},
+				},
+				// TODO(hs): we should work on making the mocks more realistic. Ideally, we should get rid of
+				// the mock entirely, relying on an instances of provisioner, authority and DB (possibly hardest), so
+				// that behavior of the tests is what an actual CA would do. We could gradually phase them out by
+				// using the mocking functions as a wrapper for actual test helpers generated per test case or per
+				// function that's tested.
+				ca: &mockSignAuth{
+					sign: func(_csr *x509.CertificateRequest, signOpts provisioner.SignOptions, extraOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
+						assert.Equals(t, _csr, csr)
+						return []*x509.Certificate{leaf, inter, root}, nil
+					},
+				},
+				db: &MockDB{
+					MockCreateCertificate: func(ctx context.Context, cert *Certificate) error {
+						cert.ID = "certID"
+						assert.Equals(t, cert.AccountID, o.AccountID)
+						assert.Equals(t, cert.OrderID, o.ID)
+						assert.Equals(t, cert.Leaf, leaf)
+						assert.Equals(t, cert.Intermediates, []*x509.Certificate{inter, root})
+						return nil
+					},
+					MockUpdateOrder: func(ctx context.Context, updo *Order) error {
+						assert.Equals(t, updo.CertificateID, "certID")
+						assert.Equals(t, updo.Status, StatusValid)
+						assert.Equals(t, updo.ID, o.ID)
+						assert.Equals(t, updo.AccountID, o.AccountID)
+						assert.Equals(t, updo.ExpiresAt, o.ExpiresAt)
+						assert.Equals(t, updo.AuthorizationIDs, o.AuthorizationIDs)
+						assert.Equals(t, updo.Identifiers, o.Identifiers)
+						return nil
+					},
+				},
+			}
+		},
 		"ok/new-cert-dns": func(t *testing.T) test {
 			now := clock.Now()
 			o := &Order{
@@ -812,14 +1008,14 @@ func TestOrder_Finalize(t *testing.T) {
 			tc := run(t)
 			if err := tc.o.Finalize(context.Background(), tc.db, tc.csr, tc.ca, tc.prov); err != nil {
 				if assert.NotNil(t, tc.err) {
-					switch k := err.(type) {
-					case *Error:
+					var k *Error
+					if errors.As(err, &k) {
 						assert.Equals(t, k.Type, tc.err.Type)
 						assert.Equals(t, k.Detail, tc.err.Detail)
 						assert.Equals(t, k.Status, tc.err.Status)
 						assert.Equals(t, k.Err.Error(), tc.err.Err.Error())
 						assert.Equals(t, k.Detail, tc.err.Detail)
-					default:
+					} else {
 						assert.FatalError(t, errors.New("unexpected error type"))
 					}
 				}
@@ -1474,14 +1670,14 @@ func TestOrder_sans(t *testing.T) {
 					t.Errorf("Order.sans() = %v, want error; got none", got)
 					return
 				}
-				switch k := err.(type) {
-				case *Error:
+				var k *Error
+				if errors.As(err, &k) {
 					assert.Equals(t, k.Type, tt.err.Type)
 					assert.Equals(t, k.Detail, tt.err.Detail)
 					assert.Equals(t, k.Status, tt.err.Status)
 					assert.Equals(t, k.Err.Error(), tt.err.Err.Error())
 					assert.Equals(t, k.Detail, tt.err.Detail)
-				default:
+				} else {
 					assert.FatalError(t, errors.New("unexpected error type"))
 				}
 				return

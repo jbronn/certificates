@@ -860,13 +860,14 @@ func TestHandler_validateExternalAccountBinding(t *testing.T) {
 			if wantErr {
 				assert.NotNil(t, err)
 				assert.Type(t, &acme.Error{}, err)
-				ae, _ := err.(*acme.Error)
-				assert.Equals(t, ae.Type, tc.err.Type)
-				assert.Equals(t, ae.Status, tc.err.Status)
-				assert.HasPrefix(t, ae.Err.Error(), tc.err.Err.Error())
-				assert.Equals(t, ae.Detail, tc.err.Detail)
-				assert.Equals(t, ae.Identifier, tc.err.Identifier)
-				assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
+				var ae *acme.Error
+				if assert.True(t, errors.As(err, &ae)) {
+					assert.Equals(t, ae.Type, tc.err.Type)
+					assert.Equals(t, ae.Status, tc.err.Status)
+					assert.HasPrefix(t, ae.Err.Error(), tc.err.Err.Error())
+					assert.Equals(t, ae.Detail, tc.err.Detail)
+					assert.Equals(t, ae.Subproblems, tc.err.Subproblems)
+				}
 			} else {
 				if got == nil {
 					assert.Nil(t, tc.eak)
@@ -1143,7 +1144,6 @@ func Test_validateEABJWS(t *testing.T) {
 				assert.Equals(t, tc.err.Status, err.Status)
 				assert.HasPrefix(t, err.Err.Error(), tc.err.Err.Error())
 				assert.Equals(t, tc.err.Detail, err.Detail)
-				assert.Equals(t, tc.err.Identifier, err.Identifier)
 				assert.Equals(t, tc.err.Subproblems, err.Subproblems)
 			} else {
 				assert.Nil(t, err)

@@ -21,6 +21,9 @@ const (
 	IP IdentifierType = "ip"
 	// DNS is the ACME dns identifier type
 	DNS IdentifierType = "dns"
+	// PermanentIdentifier is the ACME permanent-identifier identifier type
+	// defined in https://datatracker.ietf.org/doc/html/draft-bweeks-acme-device-attest-00
+	PermanentIdentifier IdentifierType = "permanent-identifier"
 )
 
 // Identifier encodes the type that an order pertains to.
@@ -124,6 +127,11 @@ func (o *Order) UpdateStatus(ctx context.Context, db DB) error {
 
 // Finalize signs a certificate if the necessary conditions for Order completion
 // have been met.
+//
+// TODO(mariano): Here or in the challenge validation we should perform some
+// external validation using the identifier value and the attestation data. From
+// a validation service we can get the list of SANs to set in the final
+// certificate.
 func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateRequest, auth CertificateAuthority, p Provisioner) error {
 	if err := o.UpdateStatus(ctx, db); err != nil {
 		return err
@@ -145,10 +153,48 @@ func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateReques
 	// canonicalize the CSR to allow for comparison
 	csr = canonicalize(csr)
 
-	// retrieve the requested SANs for the Order
-	sans, err := o.sans(csr)
-	if err != nil {
-		return err
+	// Template data
+	data := x509util.NewTemplateData()
+	data.SetCommonName(csr.Subject.CommonName)
+
+	// Custom sign options passed to authority.Sign
+	var extraOptions []provisioner.SignOption
+
+	// TODO: support for multiple identifiers?
+	var permanentIdentifier string
+	for i := range o.Identifiers {
+		if o.Identifiers[i].Type == PermanentIdentifier {
+			permanentIdentifier = o.Identifiers[i].Value
+			// the first (and only) Permanent Identifier that gets added to the certificate
+			// should be equal to the Subject Common Name if it's set. If not equal, the CSR
+			// is rejected, because the Common Name hasn't been challenged in that case. This
+			// could result in unauthorized access if a relying system relies on the Common
+			// Name in its authorization logic.
+			if csr.Subject.CommonName != "" && csr.Subject.CommonName != permanentIdentifier {
+				return NewError(ErrorBadCSRType, "CSR Subject Common Name does not match identifiers exactly: "+
+					"CSR Subject Common Name = %s, Order Permanent Identifier = %s", csr.Subject.CommonName, permanentIdentifier)
+			}
+			break
+		}
+	}
+
+	var defaultTemplate string
+	if permanentIdentifier != "" {
+		defaultTemplate = x509util.DefaultAttestedLeafTemplate
+		data.SetSubjectAlternativeNames(x509util.SubjectAlternativeName{
+			Type:  x509util.PermanentIdentifierType,
+			Value: permanentIdentifier,
+		})
+		extraOptions = append(extraOptions, provisioner.AttestationData{
+			PermanentIdentifier: permanentIdentifier,
+		})
+	} else {
+		defaultTemplate = x509util.DefaultLeafTemplate
+		sans, err := o.sans(csr)
+		if err != nil {
+			return err
+		}
+		data.SetSubjectAlternativeNames(sans...)
 	}
 
 	// Get authorizations from the ACME provisioner.
@@ -157,17 +203,23 @@ func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateReques
 	if err != nil {
 		return WrapErrorISE(err, "error retrieving authorization options from ACME provisioner")
 	}
+	// Unlike most of the provisioners, ACME's AuthorizeSign method doesn't
+	// define the templates, and the template data used in WebHooks is not
+	// available.
+	for _, signOp := range signOps {
+		if wc, ok := signOp.(*provisioner.WebhookController); ok {
+			wc.TemplateData = data
+		}
+	}
 
-	// Template data
-	data := x509util.NewTemplateData()
-	data.SetCommonName(csr.Subject.CommonName)
-	data.Set(x509util.SANsKey, sans)
-
-	templateOptions, err := provisioner.TemplateOptions(p.GetOptions(), data)
+	templateOptions, err := provisioner.CustomTemplateOptions(p.GetOptions(), data, defaultTemplate)
 	if err != nil {
 		return WrapErrorISE(err, "error creating template options from ACME provisioner")
 	}
+
+	// Build extra signing options.
 	signOps = append(signOps, templateOptions)
+	signOps = append(signOps, extraOptions...)
 
 	// Sign a new certificate.
 	certChain, err := auth.Sign(csr, provisioner.SignOptions{
@@ -197,9 +249,7 @@ func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateReques
 }
 
 func (o *Order) sans(csr *x509.CertificateRequest) ([]x509util.SubjectAlternativeName, error) {
-
 	var sans []x509util.SubjectAlternativeName
-
 	if len(csr.EmailAddresses) > 0 || len(csr.URIs) > 0 {
 		return sans, NewError(ErrorBadCSRType, "Only DNS names and IP addresses are allowed")
 	}
@@ -207,7 +257,8 @@ func (o *Order) sans(csr *x509.CertificateRequest) ([]x509util.SubjectAlternativ
 	// order the DNS names and IP addresses, so that they can be compared against the canonicalized CSR
 	orderNames := make([]string, numberOfIdentifierType(DNS, o.Identifiers))
 	orderIPs := make([]net.IP, numberOfIdentifierType(IP, o.Identifiers))
-	indexDNS, indexIP := 0, 0
+	orderPIDs := make([]string, numberOfIdentifierType(PermanentIdentifier, o.Identifiers))
+	indexDNS, indexIP, indexPID := 0, 0, 0
 	for _, n := range o.Identifiers {
 		switch n.Type {
 		case DNS:
@@ -216,6 +267,9 @@ func (o *Order) sans(csr *x509.CertificateRequest) ([]x509util.SubjectAlternativ
 		case IP:
 			orderIPs[indexIP] = net.ParseIP(n.Value) // NOTE: this assumes are all valid IPs at this time; or will result in nil entries
 			indexIP++
+		case PermanentIdentifier:
+			orderPIDs[indexPID] = n.Value
+			indexPID++
 		default:
 			return sans, NewErrorISE("unsupported identifier type in order: %s", n.Type)
 		}
@@ -287,7 +341,6 @@ func numberOfIdentifierType(typ IdentifierType, ids []Identifier) int {
 // addresses or DNS names slice, depending on whether it can be parsed as an IP
 // or not. This might result in an additional SAN in the final certificate.
 func canonicalize(csr *x509.CertificateRequest) (canonicalized *x509.CertificateRequest) {
-
 	// for clarity only; we're operating on the same object by pointer
 	canonicalized = csr
 

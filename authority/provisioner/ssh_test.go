@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"crypto"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -20,7 +21,7 @@ func validateSSHCertificate(cert *ssh.Certificate, opts *SignSSHOptions) error {
 		return fmt.Errorf("certificate signature is nil")
 	case cert.SignatureKey == nil:
 		return fmt.Errorf("certificate signature is nil")
-	case !reflect.DeepEqual(cert.ValidPrincipals, opts.Principals):
+	case !reflect.DeepEqual(cert.ValidPrincipals, opts.Principals) && (len(opts.Principals) > 0 || len(cert.ValidPrincipals) > 0):
 		return fmt.Errorf("certificate principals are not equal, want %v, got %v", opts.Principals, cert.ValidPrincipals)
 	case cert.CertType != ssh.UserCert && cert.CertType != ssh.HostCert:
 		return fmt.Errorf("certificate type %v is not valid", cert.CertType)
@@ -68,6 +69,8 @@ func signSSHCertificate(key crypto.PublicKey, opts SignSSHOptions, signOpts []Si
 			if err := o.Valid(opts); err != nil {
 				return nil, err
 			}
+		// call webhooks
+		case *WebhookController:
 		default:
 			return nil, fmt.Errorf("signSSH: invalid extra option type %T", o)
 		}
@@ -84,9 +87,10 @@ func signSSHCertificate(key crypto.PublicKey, opts SignSSHOptions, signOpts []Si
 	// Create certificate from template.
 	certificate, err := sshutil.NewCertificate(cr, certOptions...)
 	if err != nil {
-		if _, ok := err.(*sshutil.TemplateError); ok {
-			return nil, errs.NewErr(http.StatusBadRequest, err,
-				errs.WithMessage(err.Error()),
+		var templErr *sshutil.TemplateError
+		if errors.As(err, &templErr) {
+			return nil, errs.NewErr(http.StatusBadRequest, templErr,
+				errs.WithMessage(templErr.Error()),
 				errs.WithKeyVal("signOptions", signOpts),
 			)
 		}

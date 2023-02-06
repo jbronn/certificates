@@ -1,6 +1,7 @@
 package stepcas
 
 import (
+	"context"
 	"net/url"
 	"reflect"
 	"testing"
@@ -15,11 +16,11 @@ import (
 type mockErrIssuer struct{}
 
 func (m mockErrIssuer) SignToken(subject string, sans []string, info *raInfo) (string, error) {
-	return "", apiv1.ErrNotImplemented{}
+	return "", apiv1.NotImplementedError{}
 }
 
 func (m mockErrIssuer) RevokeToken(subject string) (string, error) {
-	return "", apiv1.ErrNotImplemented{}
+	return "", apiv1.NotImplementedError{}
 }
 
 func (m mockErrIssuer) Lifetime(d time.Duration) time.Duration {
@@ -29,7 +30,7 @@ func (m mockErrIssuer) Lifetime(d time.Duration) time.Duration {
 type mockErrSigner struct{}
 
 func (s *mockErrSigner) Sign(payload []byte) (*jose.JSONWebSignature, error) {
-	return nil, apiv1.ErrNotImplemented{}
+	return nil, apiv1.NotImplementedError{}
 }
 
 func (s *mockErrSigner) Options() jose.SignerOptions {
@@ -118,7 +119,7 @@ func Test_newStepIssuer(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := newStepIssuer(tt.args.caURL, tt.args.client, tt.args.iss)
+			got, err := newStepIssuer(context.TODO(), tt.args.caURL, tt.args.client, tt.args.iss)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("newStepIssuer() error = %v, wantErr %v", err, tt.wantErr)
 				return
